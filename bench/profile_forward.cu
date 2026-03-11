@@ -90,70 +90,166 @@ int main(int argc, char** argv) {
                           state.x_norm, cfg.n_embed, cfg.rms_norm_eps);
     });
 
-    // QKV GEMV (1024 → 6144, Q5_K)
+    // Helper: compute weight bytes for a given type and element count
+    auto weight_bytes = [](int nelem, GGMLType type) -> double {
+        int blk_size = 256;
+        double bytes_per_blk;
+        switch (type) {
+            case GGMLType::Q4_K: bytes_per_blk = 146.0; break;
+            case GGMLType::Q5_K: bytes_per_blk = 146.0; break; // actually 176 for Q5_K
+            case GGMLType::Q6_K: bytes_per_blk = 210.0; break;
+            case GGMLType::Q8_0: bytes_per_blk = 34.0; blk_size = 32; break;
+            default: bytes_per_blk = 146.0; break;
+        }
+        return (double)nelem / blk_size * bytes_per_blk;
+    };
+
+    // QKV GEMV (1024 → 6144, Q5_K) — dp4a path
     {
         const auto& w = model->layers[0].deltanet;
-        double bytes = (double)w.attn_qkv.shape[0] * w.attn_qkv.shape[1] / 256 * 146.0;
-        float ms = bench("QKV GEMV (1024→6144):", 100, [&]() {
-            gwen_gemv(w.attn_qkv.device_data, state.x_norm, state.qkv,
+        double bytes = weight_bytes(w.attn_qkv.shape[0] * w.attn_qkv.shape[1], w.attn_qkv.type);
+        float ms = bench("QKV GEMV dp4a:", 100, [&]() {
+            gwen_quantize_q8_1(state.x_norm, state.x_q8_a, w.attn_qkv.shape[0]);
+            gwen_gemv_dp4a(w.attn_qkv.device_data, state.x_q8_a, state.qkv,
                       w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type);
         });
         printf("    → %.1f GB/s (%.1f%% of 896 GB/s)\n", bytes / ms / 1e6, bytes / ms / 1e6 / 896 * 100);
     }
 
-    // Gate GEMV (1024 → 2048, Q5_K)
+    // Gate GEMV (1024 → 2048, Q5_K) — dp4a, reuses x_q8_a
     {
         const auto& w = model->layers[0].deltanet;
-        bench("Gate GEMV (1024→2048):", 100, [&]() {
-            gwen_gemv(w.attn_gate.device_data, state.x_norm, state.gate_z,
+        double bytes = weight_bytes(w.attn_gate.shape[0] * w.attn_gate.shape[1], w.attn_gate.type);
+        float ms = bench("Gate GEMV dp4a:", 100, [&]() {
+            gwen_gemv_dp4a(w.attn_gate.device_data, state.x_q8_a, state.gate_z,
                       w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type);
         });
+        printf("    → %.1f GB/s (%.1f%% of 896 GB/s)\n", bytes / ms / 1e6, bytes / ms / 1e6 / 896 * 100);
     }
 
-    // FFN gate+up GEMVs (1024 → 3584, Q4_K)
+    // FFN gate+up GEMVs (1024 → 3584, Q4_K) — dp4a
     {
         const auto& w = model->layers[0].deltanet;
-        double bytes = (double)w.ffn_gate.shape[0] * w.ffn_gate.shape[1] / 256 * 146.0 * 2; // two GEMVs
-        float ms = bench("FFN gate+up (2x GEMV):", 100, [&]() {
-            gwen_gemv(w.ffn_gate.device_data, state.x_norm, state.ffn_gate,
+        double bytes = weight_bytes(w.ffn_gate.shape[0] * w.ffn_gate.shape[1], w.ffn_gate.type) * 2;
+        float ms = bench("FFN gate+up dp4a:", 100, [&]() {
+            gwen_quantize_q8_1(state.x_norm, state.x_q8_a, w.ffn_gate.shape[0]);
+            gwen_gemv_dp4a(w.ffn_gate.device_data, state.x_q8_a, state.ffn_gate,
                       w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type);
-            gwen_gemv(w.ffn_up.device_data, state.x_norm, state.ffn_up,
+            gwen_gemv_dp4a(w.ffn_up.device_data, state.x_q8_a, state.ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type);
         });
         printf("    → %.1f GB/s total\n", bytes / ms / 1e6);
     }
 
-    // FFN down GEMV (3584 → 1024, Q4_K)
+    // FFN down GEMV (3584 → 1024, Q4_K) — dp4a
     {
         const auto& w = model->layers[0].deltanet;
-        double bytes = (double)w.ffn_down.shape[0] * w.ffn_down.shape[1] / 256 * 146.0;
-        float ms = bench("FFN down GEMV:", 100, [&]() {
-            gwen_gemv(w.ffn_down.device_data, state.ffn_out, state.x,
+        double bytes = weight_bytes(w.ffn_down.shape[0] * w.ffn_down.shape[1], w.ffn_down.type);
+        float ms = bench("FFN down dp4a:", 100, [&]() {
+            gwen_quantize_q8_1(state.ffn_out, state.x_q8_b, w.ffn_down.shape[0]);
+            gwen_gemv_dp4a(w.ffn_down.device_data, state.x_q8_b, state.x,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type);
         });
         printf("    → %.1f GB/s (%.1f%% of 896 GB/s)\n", bytes / ms / 1e6, bytes / ms / 1e6 / 896 * 100);
     }
 
-    // SSM output GEMV (2048 → 1024, Q5_K)
+    // SSM output GEMV (2048 → 1024, Q5_K) — dp4a
     {
         const auto& w = model->layers[0].deltanet;
-        bench("SSM out GEMV (2048→1024):", 100, [&]() {
-            gwen_gemv(w.ssm_out.device_data, state.gated_out, state.x,
+        double bytes = weight_bytes(w.ssm_out.shape[0] * w.ssm_out.shape[1], w.ssm_out.type);
+        float ms = bench("SSM out dp4a:", 100, [&]() {
+            gwen_quantize_q8_1(state.gated_out, state.x_q8_b, w.ssm_out.shape[0]);
+            gwen_gemv_dp4a(w.ssm_out.device_data, state.x_q8_b, state.x,
                       w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type);
         });
+        printf("    → %.1f GB/s (%.1f%% of 896 GB/s)\n", bytes / ms / 1e6, bytes / ms / 1e6 / 896 * 100);
     }
 
-    // LM head GEMV (1024 → 248320, Q6_K)
+    // LM head GEMV (1024 → 248320, Q6_K) — dp4a
     {
-        double bytes = (double)cfg.n_vocab * cfg.n_embed / 256 * 210.0;
-        float ms = bench("LM head GEMV:", 20, [&]() {
+        double bytes = weight_bytes(cfg.n_vocab * cfg.n_embed, model->token_embd.type);
+        float ms = bench("LM head dp4a:", 20, [&]() {
+            gwen_quantize_q8_1(state.x_norm, state.x_q8_a, cfg.n_embed);
+            gwen_gemv_dp4a(model->token_embd.device_data, state.x_q8_a, state.logits_h,
+                      cfg.n_vocab, cfg.n_embed, model->token_embd.type);
+        });
+        printf("    → %.1f GB/s (%.1f%% of 896 GB/s)\n", bytes / ms / 1e6, bytes / ms / 1e6 / 896 * 100);
+    }
+
+    // Also benchmark legacy LM head for comparison
+    {
+        double bytes = weight_bytes(cfg.n_vocab * cfg.n_embed, model->token_embd.type);
+        float ms = bench("LM head legacy:", 20, [&]() {
             gwen_gemv(model->token_embd.device_data, state.x_norm, state.logits_h,
                       cfg.n_vocab, cfg.n_embed, model->token_embd.type);
         });
         printf("    → %.1f GB/s (%.1f%% of 896 GB/s)\n", bytes / ms / 1e6, bytes / ms / 1e6 / 896 * 100);
     }
 
-    // DeltaNet recurrence — timing estimated from full forward minus other components
+    // --- All-layers GEMV-only timing (to measure non-GEMV overhead) ---
+    {
+        float ms = bench("All 24 layers GEMV:", 20, [&]() {
+            for (uint32_t li = 0; li < cfg.n_layers; li++) {
+                const auto& layer = model->layers[li];
+                if (!layer.is_full_attention) {
+                    const auto& w = layer.deltanet;
+                    gwen_quantize_q8_1(state.x_norm, state.x_q8_a, cfg.n_embed);
+                    gwen_gemv_dp4a(w.attn_qkv.device_data, state.x_q8_a, state.qkv,
+                              w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type);
+                    gwen_gemv_dp4a(w.attn_gate.device_data, state.x_q8_a, state.gate_z,
+                              w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type);
+                    gwen_quantize_q8_1(state.gated_out, state.x_q8_b, cfg.ssm_inner_size);
+                    gwen_gemv_dp4a(w.ssm_out.device_data, state.x_q8_b, state.x,
+                              w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type);
+                    gwen_quantize_q8_1(state.x_norm, state.x_q8_a, cfg.n_embed);
+                    gwen_gemv_dp4a(w.ffn_gate.device_data, state.x_q8_a, state.ffn_gate,
+                              w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type);
+                    gwen_gemv_dp4a(w.ffn_up.device_data, state.x_q8_a, state.ffn_up,
+                              w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type);
+                    gwen_quantize_q8_1(state.ffn_out, state.x_q8_b, cfg.n_ff);
+                    gwen_gemv_dp4a(w.ffn_down.device_data, state.x_q8_b, state.x,
+                              w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type);
+                } else {
+                    const auto& w = layer.full_attn;
+                    gwen_quantize_q8_1(state.x_norm, state.x_q8_a, cfg.n_embed);
+                    gwen_gemv_dp4a(w.attn_q.device_data, state.x_q8_a, state.qkv,
+                              w.attn_q.shape[1], w.attn_q.shape[0], w.attn_q.type);
+                    gwen_gemv_dp4a(w.attn_k.device_data, state.x_q8_a, state.fa_k,
+                              w.attn_k.shape[1], w.attn_k.shape[0], w.attn_k.type);
+                    gwen_gemv_dp4a(w.attn_v.device_data, state.x_q8_a, state.fa_v,
+                              w.attn_v.shape[1], w.attn_v.shape[0], w.attn_v.type);
+                    gwen_quantize_q8_1(state.gated_out, state.x_q8_b, cfg.n_head * cfg.head_dim);
+                    gwen_gemv_dp4a(w.attn_output.device_data, state.x_q8_b, state.x,
+                              w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type);
+                    gwen_quantize_q8_1(state.x_norm, state.x_q8_a, cfg.n_embed);
+                    gwen_gemv_dp4a(w.ffn_gate.device_data, state.x_q8_a, state.ffn_gate,
+                              w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type);
+                    gwen_gemv_dp4a(w.ffn_up.device_data, state.x_q8_a, state.ffn_up,
+                              w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type);
+                    gwen_quantize_q8_1(state.ffn_out, state.x_q8_b, cfg.n_ff);
+                    gwen_gemv_dp4a(w.ffn_down.device_data, state.x_q8_b, state.x,
+                              w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type);
+                }
+            }
+            // LM head
+            gwen_quantize_q8_1(state.x_norm, state.x_q8_a, cfg.n_embed);
+            gwen_gemv_dp4a(model->token_embd.device_data, state.x_q8_a, state.logits_h,
+                      cfg.n_vocab, cfg.n_embed, model->token_embd.type);
+        });
+        printf("    Non-GEMV overhead: %.3f ms (%.1f%%)\n", avg_ms - ms, (avg_ms - ms) / avg_ms * 100);
+    }
+
+    // DeltaNet recurrence (18 calls × this)
+    {
+        auto& dn = state.deltanet_states[0];
+        float ms = bench("DeltaNet recurrence:", 100, [&]() {
+            gwen_deltanet_decode(dn.S, state.qkv, state.qkv + cfg.ssm_inner_size,
+                                 state.qkv + 2 * cfg.ssm_inner_size,
+                                 state.d_alpha, state.d_beta, state.attn_out,
+                                 cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+        });
+        printf("    × 18 layers = %.3f ms\n", ms * 18);
+    }
 
     // SwiGLU
     bench("SwiGLU (3584):", 1000, [&]() {
@@ -176,8 +272,8 @@ int main(int argc, char** argv) {
     });
 
     // Theoretical
-    double weight_bytes = 497.4 * 1024 * 1024;
-    double theoretical_ms = weight_bytes / (896.0 * 1e9) * 1000.0;
+    double total_weight_bytes = 497.4 * 1024 * 1024;
+    double theoretical_ms = total_weight_bytes / (896.0 * 1e9) * 1000.0;
     printf("\n--- Summary ---\n");
     printf("  Theoretical min:   %.3f ms (%.0f tok/s) at 896 GB/s\n", theoretical_ms, 1000.0 / theoretical_ms);
     printf("  Actual average:    %.3f ms (%.0f tok/s)\n", avg_ms, 1000.0 / avg_ms);

@@ -57,10 +57,13 @@ void gwen_quantize_q8_1(const half* x, void* x_q8, int n, cudaStream_t stream) {
 // 16 threads per Q4_K block, each thread uses dp4a for 4-element SIMD dot products.
 // Input x is pre-quantized to Q8_1 format.
 
-static constexpr int NWARPS = 4;
 static constexpr int QK_K = 256;  // elements per quantization super-block
 
-__global__ void __launch_bounds__(NWARPS * 32)
+// Templated on NW (number of warps): 2 for in≤1024, 4 for larger
+// NW=2: blocks_per_iter=4, perfect for blocks_per_row=4 (in=1024)
+// NW=4: blocks_per_iter=8, good for blocks_per_row=8+ (in≥2048)
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
 kernel_gemv_q4_k_dp4a(const block_q4_k* __restrict__ W,
                        const block_q8_1* __restrict__ x_q8,
                        half* __restrict__ y,
@@ -68,54 +71,40 @@ kernel_gemv_q4_k_dp4a(const block_q4_k* __restrict__ W,
     const int row = blockIdx.x;
     if (row >= out_features) return;
 
-    const int tid = threadIdx.x + threadIdx.y * 32;  // 0..127
+    const int tid = threadIdx.x + threadIdx.y * 32;
 
-    // Q4_K: QI=32 int positions per block, VDR=2 positions per thread
-    // 16 threads per Q4_K block, 8 Q4_K blocks per iteration
     constexpr int QI = 32;
     constexpr int VDR = 2;
-    constexpr int BLOCKS_PER_ITER = VDR * NWARPS * 32 / QI;  // = 8
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;  // NW=2→4, NW=4→8
 
     float sumf = 0.0f;
 
     for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
-        const int iqs = (tid * VDR) % QI;  // 0, 2, 4, ..., 30
+        const int iqs = (tid * VDR) % QI;
 
         const block_q4_k& blk = W[row * blocks_per_row + kbx];
-
-        // Which pair of Q8_1 sub-blocks (each Q4_K block = 8 Q8_1 blocks)
-        // bq8_offset: 0, 2, 4, or 6
         const int bq8_offset = 2 * ((iqs / 2) / 4);
 
-        // Vectorized load: 2 x int32 = 8 bytes = 16 nibbles from Q4_K qs
         const int* q4 = reinterpret_cast<const int*>(blk.qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
-        int v0 = q4[0];   // 8 nibbles from first 16-byte half
-        int v1 = q4[4];   // 8 nibbles from second 16-byte half
+        int v0 = q4[0];
+        int v1 = q4[4];
 
-        // Extract scales and mins for the two sub-blocks
         float d = __half2float(blk.d);
         float dmin = __half2float(blk.dmin);
-
-        float sumf_d = 0.0f;
-        float sumf_m = 0.0f;
+        float sumf_d = 0.0f, sumf_m = 0.0f;
 
         #pragma unroll
         for (int i = 0; i < 2; i++) {
-            // Extract low (i=0) or high (i=1) nibbles
             int v0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
             int v1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
 
-            // Get Q8_1 block for this sub-block
             const block_q8_1& bq8 = x_q8[kbx * (QK_K / 32) + bq8_offset + i];
             const int* u = reinterpret_cast<const int*>(bq8.qs) + ((iqs / 2) % 4);
             float d8 = __low2float(bq8.ds);
 
-            // dp4a: 4 x (int8 * int8) dot products per instruction
             int dot1 = __dp4a(v1i, u[4], __dp4a(v0i, u[0], 0));
-            // Sum trick: dot of {1,1,1,1} with Q8_1 values for min subtraction
             int dot2 = __dp4a(0x01010101, u[4], __dp4a(0x01010101, u[0], 0));
 
-            // Get scale and min for sub-block (bq8_offset + i)
             int sb = bq8_offset + i;
             int sc, m;
             if (sb < 4) {
@@ -133,24 +122,20 @@ kernel_gemv_q4_k_dp4a(const block_q4_k* __restrict__ W,
         sumf += d * sumf_d - dmin * sumf_m;
     }
 
-    // Reduction: warps 1-3 write to shared memory, warp 0 accumulates and reduces
-    __shared__ float tmp_shared[NWARPS - 1][32];
+    // Reduction: warps 1..NW-1 write to shared, warp 0 accumulates
+    __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32];
 
-    if (threadIdx.y > 0) {
+    if (threadIdx.y > 0)
         tmp_shared[threadIdx.y - 1][threadIdx.x] = sumf;
-    }
     __syncthreads();
 
     if (threadIdx.y == 0) {
         #pragma unroll
-        for (int w = 0; w < NWARPS - 1; w++)
+        for (int w = 0; w < NW - 1; w++)
             sumf += tmp_shared[w][threadIdx.x];
-
-        // Warp reduction
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
-
         if (threadIdx.x == 0)
             y[row] = __float2half(sumf);
     }
@@ -160,7 +145,8 @@ kernel_gemv_q4_k_dp4a(const block_q4_k* __restrict__ W,
 // dp4a-accelerated Q5_K GEMV
 // ============================================================
 
-__global__ void __launch_bounds__(NWARPS * 32)
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
 kernel_gemv_q5_k_dp4a(const block_q5_k* __restrict__ W,
                        const block_q8_1* __restrict__ x_q8,
                        half* __restrict__ y,
@@ -172,7 +158,7 @@ kernel_gemv_q5_k_dp4a(const block_q5_k* __restrict__ W,
 
     constexpr int QI = 32;
     constexpr int VDR = 2;
-    constexpr int BLOCKS_PER_ITER = VDR * NWARPS * 32 / QI;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;
 
     float sumf = 0.0f;
 
@@ -233,14 +219,14 @@ kernel_gemv_q5_k_dp4a(const block_q5_k* __restrict__ W,
         sumf += d * sumf_d - dmin * sumf_m;
     }
 
-    __shared__ float tmp_shared[NWARPS - 1][32];
+    __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32];
     if (threadIdx.y > 0)
         tmp_shared[threadIdx.y - 1][threadIdx.x] = sumf;
     __syncthreads();
 
     if (threadIdx.y == 0) {
         #pragma unroll
-        for (int w = 0; w < NWARPS - 1; w++)
+        for (int w = 0; w < NW - 1; w++)
             sumf += tmp_shared[w][threadIdx.x];
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -262,7 +248,8 @@ static __device__ __forceinline__ int get_int_b2(const void* x, int i32) {
     return x16[2 * i32] | (x16[2 * i32 + 1] << 16);
 }
 
-__global__ void __launch_bounds__(NWARPS * 32)
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
 kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
                        const block_q8_1* __restrict__ x_q8,
                        half* __restrict__ y,
@@ -273,11 +260,10 @@ kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
     const int tid = threadIdx.x + threadIdx.y * 32;
 
     // Q6_K: QI=32 int positions, VDR=1, QR=2
-    // 32 threads per Q6_K block, 4 Q6_K blocks per iteration
     constexpr int QI = 32;
     constexpr int VDR = 1;
-    constexpr int QI8_1 = 8;  // int32s per Q8_1 block
-    constexpr int BLOCKS_PER_ITER = VDR * NWARPS * 32 / QI;  // = 4
+    constexpr int QI8_1 = 8;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;  // NW=2→2, NW=4→4
 
     float sumf = 0.0f;
 
@@ -321,14 +307,14 @@ kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
     }
 
     // Reduction
-    __shared__ float tmp_shared[NWARPS - 1][32];
+    __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32];
     if (threadIdx.y > 0)
         tmp_shared[threadIdx.y - 1][threadIdx.x] = sumf;
     __syncthreads();
 
     if (threadIdx.y == 0) {
         #pragma unroll
-        for (int w = 0; w < NWARPS - 1; w++)
+        for (int w = 0; w < NW - 1; w++)
             sumf += tmp_shared[w][threadIdx.x];
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -604,27 +590,35 @@ void gwen_gemv(const void* W, const half* x, half* y,
 void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
                     int out_features, int in_features, GGMLType type, cudaStream_t stream) {
     int blocks_per_row = in_features / QK_K;
-    dim3 block(32, NWARPS);  // 128 threads: 32 lanes × 4 warps
+    // Adaptive warp count: NW=2 for blocks_per_row≤4 (in≤1024), NW=4 for larger
+    bool small = (blocks_per_row <= 4);
+    auto bq8 = static_cast<const block_q8_1*>(x_q8);
 
     switch (type) {
-        case GGMLType::Q4_K:
-            kernel_gemv_q4_k_dp4a<<<out_features, block, 0, stream>>>(
-                static_cast<const block_q4_k*>(W),
-                static_cast<const block_q8_1*>(x_q8),
-                y, out_features, blocks_per_row);
+        case GGMLType::Q4_K: {
+            auto Wp = static_cast<const block_q4_k*>(W);
+            if (small)
+                kernel_gemv_q4_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+            else
+                kernel_gemv_q4_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
             break;
-        case GGMLType::Q5_K:
-            kernel_gemv_q5_k_dp4a<<<out_features, block, 0, stream>>>(
-                static_cast<const block_q5_k*>(W),
-                static_cast<const block_q8_1*>(x_q8),
-                y, out_features, blocks_per_row);
+        }
+        case GGMLType::Q5_K: {
+            auto Wp = static_cast<const block_q5_k*>(W);
+            if (small)
+                kernel_gemv_q5_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+            else
+                kernel_gemv_q5_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
             break;
-        case GGMLType::Q6_K:
-            kernel_gemv_q6_k_dp4a<<<out_features, block, 0, stream>>>(
-                static_cast<const block_q6_k*>(W),
-                static_cast<const block_q8_1*>(x_q8),
-                y, out_features, blocks_per_row);
+        }
+        case GGMLType::Q6_K: {
+            auto Wp = static_cast<const block_q6_k*>(W);
+            if (small)
+                kernel_gemv_q6_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+            else
+                kernel_gemv_q6_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
             break;
+        }
         default:
             GWEN_CHECK(false, "Unsupported dp4a GEMV type (Q4_K/Q5_K/Q6_K only)");
     }

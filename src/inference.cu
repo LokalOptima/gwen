@@ -22,6 +22,11 @@ namespace gwen {
 // S is [d_k, d_v] = [128, 128], stored in FP32 for numerical stability
 // gate = ssm_a * softplus(alpha_proj + dt_bias), already computed
 // beta = sigmoid(beta_proj), already computed
+// Optimized 2-pass DeltaNet recurrence:
+// Pass 1: Fused decay + S^T@k (read S once, write decayed, accumulate sk)
+// Pass 2: Fused update + S^T@q (read/write S once, accumulate output)
+// Only 1 sync needed (after loading k,q to shared memory)
+// Each thread handles one column j through all dk rows — columns are independent.
 __global__ void __launch_bounds__(128)
 kernel_deltanet_decode(
     float* __restrict__ S,           // [n_heads, d_k, d_v] recurrent state
@@ -29,64 +34,55 @@ kernel_deltanet_decode(
     const half* __restrict__ k_in,   // [n_heads * d_k] key vectors (L2-normalized)
     const half* __restrict__ v_in,   // [n_heads * d_v] value vectors
     const float* __restrict__ gate,  // [n_heads] gate = ssm_a * softplus(alpha_proj + dt_bias)
-    const float* __restrict__ beta,  // [n_heads] sigmoid(beta_proj)
+    const float* __restrict__ beta_in,  // [n_heads] sigmoid(beta_proj)
     half* __restrict__ output,       // [n_heads * d_v] output
     int n_heads, int dk, int dv)
 {
     int head = blockIdx.x;
     if (head >= n_heads) return;
-    int tid = threadIdx.x;  // 0..127
+    int j = threadIdx.x;  // 0..127, one thread per column
 
     float decay = expf(gate[head]);
-    float b = beta[head];
+    float b = beta_in[head];
 
     float* S_head = S + head * dk * dv;
-    const half* q = q_in + head * dk;
-    const half* k = k_in + head * dk;
-    const half* v = v_in + head * dv;
-    half* out = output + head * dv;
 
-    int total = dk * dv;  // 128 * 128 = 16384
-
-    // Step 1: Decay state — S *= exp(gate)
-    for (int idx = tid; idx < total; idx += blockDim.x) {
-        S_head[idx] *= decay;
-    }
-
+    // Load k and q into shared memory (128 floats each = 512 bytes)
+    __shared__ float sh_k[128];
+    __shared__ float sh_q[128];
+    sh_k[j] = __half2float(k_in[head * dk + j]);
+    sh_q[j] = __half2float(q_in[head * dk + j]);
     __syncthreads();
 
-    // Step 2: Compute sk = S^T @ k (dv-dimensional)
-    // sk[j] = sum_i S[i*dv+j] * k[i]
-    __shared__ float sk[128];  // dv = 128
-    for (int j = tid; j < dv; j += blockDim.x) {
-        float acc = 0.0f;
-        for (int i = 0; i < dk; i++) {
-            acc += S_head[i * dv + j] * __half2float(k[i]);
-        }
-        sk[j] = acc;
+    // Pass 1: Decay S and compute sk[j] = sum_i (decay * S[i][j]) * k[i]
+    float sk_j = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; i++) {
+        float val = S_head[i * 128 + j] * decay;
+        S_head[i * 128 + j] = val;
+        sk_j += val * sh_k[i];
     }
 
-    __syncthreads();
+    // No sync needed — each thread works on its own column j
 
-    // Step 3+4: Compute delta d = (v - sk) * beta, and update S += outer(k, d)
-    for (int idx = tid; idx < total; idx += blockDim.x) {
-        int row = idx / dv;  // k dimension
-        int col = idx % dv;  // v dimension
-        float d_col = (__half2float(v[col]) - sk[col]) * b;
-        S_head[idx] += __half2float(k[row]) * d_col;
+    // Pass 2: Update S and compute o[j] = sum_i S_updated[i][j] * q[i]
+    float d_j = (__half2float(v_in[head * dv + j]) - sk_j) * b;
+    float o_j = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; i++) {
+        float updated = S_head[i * 128 + j] + sh_k[i] * d_j;
+        S_head[i * 128 + j] = updated;
+        o_j += updated * sh_q[i];
     }
 
-    __syncthreads();
+    output[head * dv + j] = __float2half(o_j);
+}
 
-    // Step 5: Compute output o = S^T @ q
-    // o[j] = sum_i S[i*dv+j] * q[i]
-    for (int j = tid; j < dv; j += blockDim.x) {
-        float acc = 0.0f;
-        for (int i = 0; i < dk; i++) {
-            acc += S_head[i * dv + j] * __half2float(q[i]);
-        }
-        out[j] = __float2half(acc);
-    }
+void gwen_deltanet_decode(float* S, const half* q, const half* k, const half* v,
+                          const float* alpha, const float* beta, half* output,
+                          int n_heads, int dk, int dv, cudaStream_t stream) {
+    kernel_deltanet_decode<<<n_heads, 128, 0, stream>>>(S, q, k, v, alpha, beta, output, n_heads, dk, dv);
+    GWEN_CHECK_CUDA(cudaGetLastError());
 }
 
 // ============================================================

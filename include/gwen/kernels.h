@@ -159,6 +159,13 @@ void gwen_l2_normalize(const half* x, half* y, int n_vecs, int dim,
                        float extra_scale = 1.0f, cudaStream_t stream = 0);
 
 // ============================================================
+// DeltaNet recurrence (exposed for profiling)
+// ============================================================
+void gwen_deltanet_decode(float* S, const half* q, const half* k, const half* v,
+                          const float* alpha, const float* beta, half* output,
+                          int n_heads, int dk, int dv, cudaStream_t stream = 0);
+
+// ============================================================
 // GEMM (for prefill — batch of tokens)
 // ============================================================
 
