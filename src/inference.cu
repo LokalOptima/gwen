@@ -228,20 +228,22 @@ kernel_compute_gate_beta(
 __global__ void __launch_bounds__(32)
 kernel_gqa_attention_decode(
     const half* __restrict__ q,        // [n_head, head_dim]
-    const half* __restrict__ k_cache,  // [seq_len, n_kv_heads, head_dim]
-    const half* __restrict__ v_cache,  // [seq_len, n_kv_heads, head_dim]
+    const half* __restrict__ k_cache,  // [max_seq, n_kv_heads, head_dim]
+    const half* __restrict__ v_cache,  // [max_seq, n_kv_heads, head_dim]
     half* __restrict__ output,         // [n_head, head_dim]
-    float* __restrict__ scores_buf,    // [n_head, max_seq] scratch
-    int n_head, int n_kv_heads, int head_dim, int seq_len, float scale)
+    float* __restrict__ scores_buf,    // [n_head, max_seq] scratch (fixed stride)
+    const int* __restrict__ d_pos,     // device pointer to current position
+    int n_head, int n_kv_heads, int head_dim, int max_seq, float scale)
 {
-    int qh = blockIdx.x;  // query head index
+    int qh = blockIdx.x;
     if (qh >= n_head) return;
     int lane = threadIdx.x;
 
-    int kv_head = qh / (n_head / n_kv_heads);  // GQA mapping
+    int seq_len = *d_pos + 1;
+    int kv_head = qh / (n_head / n_kv_heads);
 
     const half* q_head = q + qh * head_dim;
-    float* scores = scores_buf + qh * seq_len;
+    float* scores = scores_buf + qh * max_seq;  // fixed stride
 
     // Step 1: Compute attention scores: score[t] = q @ k_cache[t] * scale
     for (int t = 0; t < seq_len; t++) {
@@ -331,6 +333,25 @@ kernel_argmax(const float* __restrict__ logits, int* __restrict__ result, int n)
 }
 
 // ============================================================
+// KV cache store kernel (reads pos from device memory for graph capture)
+// ============================================================
+__global__ void __launch_bounds__(256)
+kernel_kv_cache_store(
+    half* __restrict__ k_cache,        // [max_seq, kv_dim]
+    half* __restrict__ v_cache,        // [max_seq, kv_dim]
+    const half* __restrict__ k_src,    // [kv_dim]
+    const half* __restrict__ v_src,    // [kv_dim]
+    const int* __restrict__ d_pos,     // device pointer to position
+    int kv_dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= kv_dim) return;
+    int p = *d_pos;
+    k_cache[(size_t)p * kv_dim + idx] = k_src[idx];
+    v_cache[(size_t)p * kv_dim + idx] = v_src[idx];
+}
+
+// ============================================================
 // Deinterleave Q + gate: [Q_h0, gate_h0, Q_h1, gate_h1, ...] → [Q_all, gate_all]
 // ============================================================
 __global__ void __launch_bounds__(256)
@@ -404,8 +425,15 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     d_alpha = static_cast<float*>(a(cfg.ssm_n_heads * sizeof(float)));
     d_beta  = static_cast<float*>(a(cfg.ssm_n_heads * sizeof(float)));
 
-    // Pre-allocated argmax result
+    // Pre-allocated argmax result and graph-compatible device scalars
     d_argmax_token = static_cast<int*>(a(sizeof(int)));
+    // d_token_id and d_pos are adjacent so we can copy both in one call
+    d_token_id = static_cast<int*>(a(2 * sizeof(int)));
+    d_pos = d_token_id + 1;
+    max_seq_alloc = max_seq;
+
+    // Create non-blocking stream for graph capture
+    GWEN_CHECK_CUDA(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
 
     // DeltaNet states (18 layers)
     for (uint32_t i = 0; i < cfg.n_layers; i++) {
@@ -452,70 +480,53 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
 }
 
 // ============================================================
-// Forward pass — single token decode (optimized)
+// Forward pass body — all GPU work (CUDA graph capturable)
 // ============================================================
-// Buffer convention (no pointer swaps):
-//   buf_a: hidden state at layer start and end
-//   buf_b: alternate buffer for GEMV output before residual add
-//   x_norm: RMSNorm output
-// After each complete layer, result is always in buf_a.
+// Reads token_id from d_token_id and pos from d_pos (device memory).
+// Buffer convention: buf_a holds hidden state at layer start/end.
 
-int InferenceState::forward(Model& model, int token_id) {
+void InferenceState::forward_body(Model& model, cudaStream_t s) {
     const auto& cfg = model.config;
     const float q_scale = 1.0f / sqrtf((float)cfg.ssm_state_size);
 
-    // Ensure deterministic buffer assignment
-    x = buf_a;
-    residual = buf_b;
-
-    // 1. Embedding lookup → buf_a
+    // 1. Embedding lookup → buf_a (reads token_id from device memory)
     gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
-                      token_id, buf_a, cfg.n_embed);
+                      d_token_id, buf_a, cfg.n_embed, s);
 
     int dn_state_idx = 0;
     int kv_cache_idx = 0;
 
     // 2. Process each layer
-    // Invariant: at loop start, hidden state is always in buf_a
     for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
         const auto& layer = model.layers[layer_idx];
 
         if (!layer.is_full_attention) {
-            // ===== DeltaNet Layer =====
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
 
-            // Pre-attention RMSNorm: buf_a → x_norm
             gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps);
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            // QKV projection: x_norm [1024] → qkv [6144]
             gwen_gemv(w.attn_qkv.device_data, x_norm, qkv,
-                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type);
-
-            // Gate projection: x_norm [1024] → gate_z [2048]
+                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type, s);
             gwen_gemv(w.attn_gate.device_data, x_norm, gate_z,
-                      w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type);
+                      w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type, s);
 
-            // Fused Conv1D + SiLU on QKV
             int qkv_dim = cfg.ssm_inner_size * 3;
             int conv_blocks = (qkv_dim + 255) / 256;
-            kernel_conv1d_silu<<<conv_blocks, 256>>>(
+            kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
                 qkv, qkv, state.conv_state,
                 static_cast<const float*>(w.ssm_conv1d.device_data),
                 qkv_dim, cfg.ssm_conv_kernel);
 
-            // Q/K/V aliased into qkv buffer
             half* q = qkv;
             half* k = qkv + cfg.ssm_inner_size;
             half* v = qkv + 2 * cfg.ssm_inner_size;
 
-            // L2-normalize Q (with fused 1/sqrt(d_k) scaling) and K
-            gwen_l2_normalize(q, q, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale);
-            gwen_l2_normalize(k, k, cfg.ssm_n_heads, cfg.ssm_state_size);
+            gwen_l2_normalize(q, q, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
+            gwen_l2_normalize(k, k, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
 
-            // Compute gate and beta
-            kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32>>>(
+            kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
                 x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
@@ -523,149 +534,141 @@ int InferenceState::forward(Model& model, int token_id) {
                 d_alpha, d_beta,
                 cfg.n_embed, cfg.ssm_n_heads);
 
-            // DeltaNet recurrence (delta rule)
-            kernel_deltanet_decode<<<cfg.ssm_n_heads, 128>>>(
+            kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
                 state.S, q, k, v, d_alpha, d_beta,
                 attn_out, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
 
-            // Gated RMSNorm: output = RMSNorm(attn_out) * SiLU(gate_z)
-            kernel_gated_rmsnorm<<<cfg.ssm_n_heads, 32>>>(
+            kernel_gated_rmsnorm<<<cfg.ssm_n_heads, 32, 0, s>>>(
                 attn_out,
                 static_cast<const float*>(w.ssm_norm.device_data),
                 gate_z, gated_out,
                 cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
 
-            // Output projection: [2048] → buf_b
             gwen_gemv(w.ssm_out.device_data, gated_out, buf_b,
-                      w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type);
+                      w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type, s);
+            gwen_add_inplace(buf_b, buf_a, cfg.n_embed, s);
 
-            // Residual add: buf_b += buf_a → result in buf_b
-            gwen_add_inplace(buf_b, buf_a, cfg.n_embed);
-
-            // Post-attention RMSNorm: buf_b → x_norm
             gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps);
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            // SwiGLU FFN
             gwen_gemv(w.ffn_gate.device_data, x_norm, ffn_gate,
-                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type);
+                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
             gwen_gemv(w.ffn_up.device_data, x_norm, ffn_up,
-                      w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type);
-            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff);
+                      w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
+            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
 
-            // FFN down → buf_a
             gwen_gemv(w.ffn_down.device_data, ffn_out, buf_a,
-                      w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type);
-
-            // Residual add: buf_a += buf_b → result in buf_a
-            gwen_add_inplace(buf_a, buf_b, cfg.n_embed);
+                      w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
+            gwen_add_inplace(buf_a, buf_b, cfg.n_embed, s);
 
         } else {
-            // ===== Full Attention Layer =====
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            // Pre-attention RMSNorm: buf_a → x_norm
             gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps);
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            // Q+gate projection: [1024] → [4096] (interleaved) — write to qkv as temp
             gwen_gemv(w.attn_q.device_data, x_norm, qkv,
-                      w.attn_q.shape[1], w.attn_q.shape[0], w.attn_q.type);
+                      w.attn_q.shape[1], w.attn_q.shape[0], w.attn_q.type, s);
 
-            // Deinterleave: qkv (interleaved) → fa_q (Q) + gated_out (gate)
             {
                 int attn_dim = cfg.n_head * cfg.head_dim;
                 int deint_blocks = (attn_dim + 255) / 256;
-                kernel_deinterleave_qgate<<<deint_blocks, 256>>>(
+                kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
                     qkv, fa_q, gated_out,
                     cfg.n_head, cfg.head_dim);
             }
 
-            // K projection: [1024] → [512]
             gwen_gemv(w.attn_k.device_data, x_norm, fa_k,
-                      w.attn_k.shape[1], w.attn_k.shape[0], w.attn_k.type);
-
-            // V projection: [1024] → [512]
+                      w.attn_k.shape[1], w.attn_k.shape[0], w.attn_k.type, s);
             gwen_gemv(w.attn_v.device_data, x_norm, fa_v,
-                      w.attn_v.shape[1], w.attn_v.shape[0], w.attn_v.type);
+                      w.attn_v.shape[1], w.attn_v.shape[0], w.attn_v.type, s);
 
-            // Per-head Q and K RMSNorm (batched)
             gwen_rmsnorm_batched_f32w(fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
-                                      fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps);
+                                      fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
             gwen_rmsnorm_batched_f32w(fa_k, static_cast<const float*>(w.attn_k_norm.device_data),
-                                      fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps);
+                                      fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
 
-            // RoPE on Q and K
             gwen_rope(fa_q, fa_k,
                       cfg.n_head, cfg.n_head_kv, cfg.head_dim,
-                      pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim);
+                      d_pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim, s);
 
-            // Store K and V in cache (async to avoid runtime overhead)
-            size_t kv_row_bytes = cfg.n_head_kv * cfg.head_dim * sizeof(half);
-            GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                cache.k_cache + (size_t)pos * cfg.n_head_kv * cfg.head_dim,
-                fa_k, kv_row_bytes, cudaMemcpyDeviceToDevice, 0));
-            GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                cache.v_cache + (size_t)pos * cfg.n_head_kv * cfg.head_dim,
-                fa_v, kv_row_bytes, cudaMemcpyDeviceToDevice, 0));
-
-            // GQA Attention decode
-            float scale = 1.0f / sqrtf((float)cfg.head_dim);
-            int seq_len = pos + 1;
-
-            kernel_gqa_attention_decode<<<cfg.n_head, 32>>>(
-                fa_q, cache.k_cache, cache.v_cache,
-                attn_out, attn_scores,
-                cfg.n_head, cfg.n_head_kv, cfg.head_dim, seq_len, scale);
-
-            // Gated attention: output = attn_result * sigmoid(gate)
             {
-                int attn_dim = cfg.n_head * cfg.head_dim;
-                gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim);
+                int kv_dim = cfg.n_head_kv * cfg.head_dim;
+                int kv_blocks = (kv_dim + 255) / 256;
+                kernel_kv_cache_store<<<kv_blocks, 256, 0, s>>>(
+                    cache.k_cache, cache.v_cache, fa_k, fa_v, d_pos, kv_dim);
             }
 
-            // Output projection: [2048] → buf_b
+            float scale = 1.0f / sqrtf((float)cfg.head_dim);
+            kernel_gqa_attention_decode<<<cfg.n_head, 32, 0, s>>>(
+                fa_q, cache.k_cache, cache.v_cache,
+                attn_out, attn_scores, d_pos,
+                cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
+
+            {
+                int attn_dim = cfg.n_head * cfg.head_dim;
+                gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
+            }
+
             gwen_gemv(w.attn_output.device_data, gated_out, buf_b,
-                      w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type);
+                      w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type, s);
+            gwen_add_inplace(buf_b, buf_a, cfg.n_embed, s);
 
-            // Residual add: buf_b += buf_a → result in buf_b
-            gwen_add_inplace(buf_b, buf_a, cfg.n_embed);
-
-            // Post-attention RMSNorm + FFN
             gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps);
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
             gwen_gemv(w.ffn_gate.device_data, x_norm, ffn_gate,
-                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type);
+                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
             gwen_gemv(w.ffn_up.device_data, x_norm, ffn_up,
-                      w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type);
-            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff);
+                      w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
+            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
 
-            // FFN down → buf_a
             gwen_gemv(w.ffn_down.device_data, ffn_out, buf_a,
-                      w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type);
-
-            // Residual add: buf_a += buf_b → result in buf_a
-            gwen_add_inplace(buf_a, buf_b, cfg.n_embed);
+                      w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
+            gwen_add_inplace(buf_a, buf_b, cfg.n_embed, s);
         }
     }
 
-    // 3. Final RMSNorm: buf_a → x_norm
+    // 3. Final RMSNorm + LM Head + argmax
     gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
-                      x_norm, cfg.n_embed, cfg.rms_norm_eps);
+                      x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-    // 4. LM Head GEMV: x_norm [1024] → logits [248320]
     gwen_gemv(model.token_embd.device_data, x_norm, logits_h,
-              cfg.n_vocab, cfg.n_embed, model.token_embd.type);
+              cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
 
-    // 5. Convert logits to FP32 for sampling
     int logit_blocks = (cfg.n_vocab + 255) / 256;
-    kernel_half_to_float<<<logit_blocks, 256>>>(logits_h, logits_f, cfg.n_vocab);
+    kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
 
-    // 6. Greedy decode (argmax) — pre-allocated buffer
-    kernel_argmax<<<1, 256>>>(logits_f, d_argmax_token, cfg.n_vocab);
+    kernel_argmax<<<1, 256, 0, s>>>(logits_f, d_argmax_token, cfg.n_vocab);
+}
 
+// ============================================================
+// Forward pass — CUDA graph capture + replay
+// ============================================================
+
+int InferenceState::forward(Model& model, int token_id) {
+    // Write token_id and pos to device memory in one copy (adjacent layout)
+    int params[2] = {token_id, pos};
+    GWEN_CHECK_CUDA(cudaMemcpy(d_token_id, params, 2 * sizeof(int), cudaMemcpyHostToDevice));
+
+    if (!graph_captured) {
+        // First call: capture the entire forward pass as a CUDA graph
+        cudaGraph_t graph;
+
+        GWEN_CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal));
+        forward_body(model, compute_stream);
+        GWEN_CHECK_CUDA(cudaStreamEndCapture(compute_stream, &graph));
+        GWEN_CHECK_CUDA(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        GWEN_CHECK_CUDA(cudaGraphDestroy(graph));
+        graph_captured = true;
+    }
+
+    // Replay the graph
+    GWEN_CHECK_CUDA(cudaGraphLaunch(graph_exec, compute_stream));
+
+    // Sync and get result
+    GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
     int next_token;
     GWEN_CHECK_CUDA(cudaMemcpy(&next_token, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
 

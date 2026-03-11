@@ -3,6 +3,7 @@
 #include "gwen/common.h"
 #include "gwen/model.h"
 #include "gwen/memory.h"
+#include <cuda_runtime.h>
 
 namespace gwen {
 
@@ -64,10 +65,21 @@ struct InferenceState {
     float* d_beta = nullptr;     // [ssm_n_heads]
 
     int* d_argmax_token = nullptr; // pre-allocated argmax result
-    int pos = 0;                  // current position in sequence
+    int* d_pos = nullptr;          // device-side position (for CUDA graph)
+    int* d_token_id = nullptr;     // device-side token ID (for CUDA graph)
+    int pos = 0;                   // current position in sequence
+    int max_seq_alloc = 0;         // max sequence length allocated
+
+    // CUDA Graph state
+    cudaStream_t compute_stream = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    bool graph_captured = false;
 
     // Allocate all buffers
     void allocate(const ModelConfig& cfg, CudaAllocator& alloc, int max_seq = 4096);
+
+    // Run the forward pass (all GPU work on given stream)
+    void forward_body(Model& model, cudaStream_t stream);
 
     // Run one forward pass (single token decode)
     int forward(Model& model, int token_id);

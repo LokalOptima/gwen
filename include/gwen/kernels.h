@@ -117,9 +117,10 @@ void gwen_causal_softmax(const float* x, half* y, int n_heads, int seq_len,
 // q: [n_heads, head_dim], k: [n_kv_heads, head_dim]
 // sections: [s0, s1, s2, s3] — how many pairs per axis
 // Only first rope_dim dims of head_dim are rotated
+// d_pos: device pointer to position (for CUDA graph compatibility)
 void gwen_rope(half* q, half* k,
                int n_heads, int n_kv_heads, int head_dim,
-               int pos, float theta,
+               const int* d_pos, float theta,
                const int* sections, int rope_dim,
                cudaStream_t stream = 0);
 
@@ -129,8 +130,9 @@ void gwen_rope(half* q, half* k,
 
 // Look up token embedding: y = embedding_table[token_id]
 // table: quantized embedding [n_vocab, dim]
+// d_token_id: device pointer to token ID (for CUDA graph compatibility)
 void gwen_embed_lookup(const void* table, GGMLType table_type,
-                       int token_id, half* y, int dim,
+                       const int* d_token_id, half* y, int dim,
                        cudaStream_t stream = 0);
 
 // ============================================================

@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     // Embedding
     bench("Embedding lookup:", 1000, [&]() {
         gwen_embed_lookup(model->token_embd.device_data, model->token_embd.type,
-                          321, state.x, cfg.n_embed);
+                          state.d_token_id, state.x, cfg.n_embed);
     });
 
     // RMSNorm (1024 dim)
