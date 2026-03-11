@@ -128,17 +128,7 @@ struct InferenceState {
     int forward_mtp(Model& model, int token_id);
     void forward_mtp_body(Model& model, cudaStream_t stream);
 
-    // Verification forward: process 2 tokens [accepted, draft] in a batch.
-    // Returns prediction at position 0 (to verify draft) and prediction at position 1 (bonus).
-    // Also saves hidden state at both positions for MTP use.
-    // Checkpoints DeltaNet state after token 0 for rollback on rejection.
-    struct VerifyResult {
-        int pred_0;      // target prediction after token 0 (correct next token)
-        int pred_1;      // target prediction after token 1 (bonus if accepted)
-    };
-    VerifyResult forward_verify(Model& model, int token_0, int token_1);
-
-    // Save/restore DeltaNet state for speculative decode rollback
+    // Save/restore DeltaNet state (kept for future multi-draft speculation)
     void save_deltanet_checkpoint(cudaStream_t stream);
     void restore_deltanet_checkpoint(cudaStream_t stream);
 

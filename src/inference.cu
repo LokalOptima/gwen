@@ -1557,334 +1557,37 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
 }
 
 int InferenceState::forward_mtp(Model& model, int token_id) {
-    // MTP uses its own position counter (separate KV cache from main model)
-    // RoPE uses mtp_pos so relative positions are correct within MTP's context
     int mtp_params[2] = {token_id, mtp_pos};
     GWEN_CHECK_CUDA(cudaMemcpy(d_mtp_token, mtp_params, 2 * sizeof(int), cudaMemcpyHostToDevice));
 
-    // Run directly without CUDA graph for debugging
-    forward_mtp_body(model, compute_stream);
+    if (!mtp_graph_captured) {
+        cudaGraph_t graph;
+        GWEN_CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal));
+        forward_mtp_body(model, compute_stream);
+        GWEN_CHECK_CUDA(cudaStreamEndCapture(compute_stream, &graph));
+        GWEN_CHECK_CUDA(cudaGraphInstantiate(&mtp_graph_exec, graph, nullptr, nullptr, 0));
+        GWEN_CHECK_CUDA(cudaGraphDestroy(graph));
+        mtp_graph_captured = true;
+    }
+
+    GWEN_CHECK_CUDA(cudaGraphLaunch(mtp_graph_exec, compute_stream));
     GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
     int draft_token;
     GWEN_CHECK_CUDA(cudaMemcpy(&draft_token, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
-
-    mtp_pos++;  // Advance MTP's own KV cache position
+    mtp_pos++;
     return draft_token;
-}
-
-// ============================================================
-// Verification Forward Pass (2-token batch for speculative decode)
-// ============================================================
-// Processes [token_0, token_1] through the full model.
-// Returns predictions at both positions.
-// Checkpoints DeltaNet state after token_0 for rollback on rejection.
-
-InferenceState::VerifyResult InferenceState::forward_verify(Model& model, int token_0, int token_1) {
-    // Sequential verify: uses optimized dp4a decode path (faster than batch GEMM for N=2
-    // since Q4_K reads 4× less VRAM than FP16 GEMM, and we're bandwidth-bound)
-    int pred_0 = forward(model, token_0);
-    save_deltanet_checkpoint(compute_stream);
-    int pred_1 = forward(model, token_1);
-    return {pred_0, pred_1};
-
-    // Batch verify path below (currently unused — needs batched dp4a kernel to be faster)
-    const auto& cfg = model.config;
-    const float q_scale = 1.0f / sqrtf((float)cfg.ssm_state_size);
-    cudaStream_t s = compute_stream;
-    int N = 2;
-
-    // Upload token IDs
-    int tokens[2] = {token_0, token_1};
-    int* d_token_ids;
-    GWEN_CHECK_CUDA(cudaMalloc(&d_token_ids, N * sizeof(int)));
-    GWEN_CHECK_CUDA(cudaMemcpy(d_token_ids, tokens, N * sizeof(int), cudaMemcpyHostToDevice));
-
-    // 1. Batch embedding lookup → prefill_x [2, 1024]
-    {
-        dim3 grid(1, N);
-        kernel_embed_lookup_batch_q6k<<<grid, 256, 0, s>>>(
-            model.token_embd.device_data, d_token_ids, prefill_x, cfg.n_embed, N);
-    }
-
-    half* pf_a = prefill_x;
-    half* pf_b = prefill_out;
-    half* pf_norm = prefill_norm;
-
-    int dn_state_idx = 0;
-    int kv_cache_idx = 0;
-
-    // 2. Process each layer (same as prefill, but with state checkpoint after token 0)
-    for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
-        const auto& layer = model.layers[layer_idx];
-
-        if (!layer.is_full_attention) {
-            const auto& w = layer.deltanet;
-            auto& state = deltanet_states[dn_state_idx++];
-
-            // Batch RMSNorm
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
-                pf_a, static_cast<const float*>(w.attn_norm.device_data),
-                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
-
-            // Batch GEMM projections
-            int qkv_dim_full = cfg.ssm_inner_size * 3;
-            gwen_gemm(w.attn_qkv.device_data, w.attn_qkv.type, prefill_temp_w,
-                      pf_norm, prefill_proj_qkv,
-                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
-            gwen_gemm(w.attn_gate.device_data, w.attn_gate.type, prefill_temp_w,
-                      pf_norm, prefill_proj_gate,
-                      w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
-
-            // Sequential per-token DeltaNet recurrence (matches prefill path exactly)
-            int cur_dn_idx = dn_state_idx - 1;  // index of current DeltaNet layer
-            for (int t = 0; t < N; t++) {
-                half* x_t = pf_norm + (size_t)t * cfg.n_embed;
-                half* qkv_t = prefill_proj_qkv + (size_t)t * qkv_dim_full;
-                half* gate_t = prefill_proj_gate + (size_t)t * cfg.ssm_inner_size;
-
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(qkv, qkv_t, qkv_dim_full * sizeof(half), cudaMemcpyDeviceToDevice, s));
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(gate_z, gate_t, cfg.ssm_inner_size * sizeof(half), cudaMemcpyDeviceToDevice, s));
-
-                int conv_blocks = (qkv_dim_full + 255) / 256;
-                kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
-                    qkv, qkv, state.conv_state,
-                    static_cast<const float*>(w.ssm_conv1d.device_data),
-                    qkv_dim_full, cfg.ssm_conv_kernel);
-
-                half* q = qkv;
-                half* k = qkv + cfg.ssm_inner_size;
-                half* v = qkv + 2 * cfg.ssm_inner_size;
-                gwen_l2_normalize(q, q, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
-                gwen_l2_normalize(k, k, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
-
-                kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
-                    x_t,
-                    w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                    static_cast<const float*>(w.ssm_a.device_data),
-                    static_cast<const float*>(w.ssm_dt_bias.device_data),
-                    d_alpha, d_beta,
-                    cfg.n_embed, cfg.ssm_n_heads);
-
-                kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                    state.S, q, k, v, d_alpha, d_beta,
-                    attn_out, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
-
-                // Unfused gated RMSNorm → FP16 output (for batch GEMM)
-                kernel_gated_rmsnorm<<<cfg.ssm_n_heads, 32, 0, s>>>(
-                    attn_out,
-                    static_cast<const float*>(w.ssm_norm.device_data),
-                    gate_z, gated_out,
-                    cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
-
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                    prefill_proj_gate + (size_t)t * cfg.ssm_inner_size,
-                    gated_out, cfg.ssm_inner_size * sizeof(half),
-                    cudaMemcpyDeviceToDevice, s));
-
-                // Checkpoint THIS layer's DeltaNet state after processing token 0
-                if (t == 0) {
-                    size_t S_bytes = (size_t)state.n_heads * state.state_size * state.state_size * sizeof(float);
-                    size_t conv_bytes = (size_t)(state.conv_kernel - 1) * state.qkv_dim * sizeof(float);
-                    GWEN_CHECK_CUDA(cudaMemcpyAsync(dn_S_checkpoint[cur_dn_idx], state.S, S_bytes,
-                                                      cudaMemcpyDeviceToDevice, s));
-                    GWEN_CHECK_CUDA(cudaMemcpyAsync(dn_conv_checkpoint[cur_dn_idx], state.conv_state, conv_bytes,
-                                                      cudaMemcpyDeviceToDevice, s));
-                }
-            }
-
-            // Batch output projection + residual add
-            gwen_gemm(w.ssm_out.device_data, w.ssm_out.type, prefill_temp_w,
-                      prefill_proj_gate, pf_b,
-                      w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
-            {
-                int total = N * cfg.n_embed;
-                int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
-            }
-
-            // Batch post-attention RMSNorm
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
-                pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
-
-            // Batch FFN
-            gwen_gemm(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_gate,
-                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_up,
-                      w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
-            {
-                int total = N * cfg.n_ff;
-                int blocks = (total + 255) / 256;
-                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
-                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
-            }
-            gwen_gemm(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
-                      prefill_ffn_out, pf_a,
-                      w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
-            {
-                int total = N * cfg.n_embed;
-                int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
-            }
-
-        } else {
-            const auto& w = layer.full_attn;
-            auto& cache = kv_caches[kv_cache_idx++];
-
-            // Batch RMSNorm
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
-                pf_a, static_cast<const float*>(w.attn_norm.device_data),
-                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
-
-            int attn_dim = cfg.n_head * cfg.head_dim;
-            int kv_dim = cfg.n_head_kv * cfg.head_dim;
-            int q_proj_dim = w.attn_q.shape[1];
-
-            // Batch Q, K, V projections
-            gwen_gemm(w.attn_q.device_data, w.attn_q.type, prefill_temp_w,
-                      pf_norm, prefill_proj_qkv, q_proj_dim, w.attn_q.shape[0], N, s);
-            gwen_gemm(w.attn_k.device_data, w.attn_k.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_gate, kv_dim, w.attn_k.shape[0], N, s);
-            gwen_gemm(w.attn_v.device_data, w.attn_v.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_up, kv_dim, w.attn_v.shape[0], N, s);
-
-            // Per-token attention (sequential due to KV cache causality)
-            for (int t = 0; t < N; t++) {
-                int cur_pos = pos + t;
-
-                int deint_blocks = (attn_dim + 255) / 256;
-                kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
-                    prefill_proj_qkv + (size_t)t * q_proj_dim,
-                    fa_q, gated_out, cfg.n_head, cfg.head_dim);
-
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_k, prefill_ffn_gate + (size_t)t * kv_dim,
-                    kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_v, prefill_ffn_up + (size_t)t * kv_dim,
-                    kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
-
-                gwen_rmsnorm_batched_f32w(fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
-                                          fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
-                gwen_rmsnorm_batched_f32w(fa_k, static_cast<const float*>(w.attn_k_norm.device_data),
-                                          fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
-
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(d_pos, &cur_pos, sizeof(int), cudaMemcpyHostToDevice, s));
-
-                gwen_rope(fa_q, fa_k,
-                          cfg.n_head, cfg.n_head_kv, cfg.head_dim,
-                          d_pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim, s);
-
-                int kv_blocks = (kv_dim + 255) / 256;
-                kernel_kv_cache_store<<<kv_blocks, 256, 0, s>>>(
-                    cache.k_cache, cache.v_cache, fa_k, fa_v, d_pos, kv_dim);
-
-                float scale = 1.0f / sqrtf((float)cfg.head_dim);
-                kernel_gqa_attention_decode<<<cfg.n_head, 256, 0, s>>>(
-                    fa_q, cache.k_cache, cache.v_cache,
-                    attn_out, attn_scores, d_pos,
-                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
-
-                gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
-
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                    prefill_proj_gate + (size_t)t * cfg.ssm_inner_size,
-                    gated_out, attn_dim * sizeof(half),
-                    cudaMemcpyDeviceToDevice, s));
-            }
-
-            // Batch output projection
-            gwen_gemm(w.attn_output.device_data, w.attn_output.type, prefill_temp_w,
-                      prefill_proj_gate, pf_b,
-                      w.attn_output.shape[1], w.attn_output.shape[0], N, s);
-
-            {
-                int total = N * cfg.n_embed;
-                int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
-            }
-
-            // Batch post-attention RMSNorm
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
-                pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
-
-            // Batch FFN
-            gwen_gemm(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_gate, w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_up, w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
-
-            {
-                int total = N * cfg.n_ff;
-                int blocks = (total + 255) / 256;
-                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
-                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
-            }
-
-            gwen_gemm(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
-                      prefill_ffn_out, pf_a, w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
-
-            {
-                int total = N * cfg.n_embed;
-                int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
-            }
-        }
-    }
-
-    // 3. LM head on BOTH positions
-    VerifyResult result;
-
-    // Position 0: pf_a[0]
-    half* hidden_0 = pf_a;
-    gwen_rmsnorm_f32w(hidden_0, static_cast<const float*>(model.output_norm.device_data),
-                      x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-    gwen_gemv(model.token_embd.device_data, x_norm, logits_h,
-              cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
-    {
-        int logit_blocks = (cfg.n_vocab + 255) / 256;
-        kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
-        kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
-        kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
-    }
-    GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
-    GWEN_CHECK_CUDA(cudaMemcpy(&result.pred_0, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Save hidden state from position 0 for potential MTP use on reject
-    GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, hidden_0, cfg.n_embed * sizeof(half),
-                                      cudaMemcpyDeviceToDevice, s));
-
-    // Position 1: pf_a[1]
-    half* hidden_1 = pf_a + cfg.n_embed;
-    gwen_rmsnorm_f32w(hidden_1, static_cast<const float*>(model.output_norm.device_data),
-                      x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-    gwen_gemv(model.token_embd.device_data, x_norm, logits_h,
-              cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
-    {
-        int logit_blocks = (cfg.n_vocab + 255) / 256;
-        kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
-        kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
-        kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
-    }
-    GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
-    GWEN_CHECK_CUDA(cudaMemcpy(&result.pred_1, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Overwrite mtp_hidden with position 1's hidden state (for MTP after accept)
-    // On reject, we'll re-extract from position 0 after restore+forward
-    GWEN_CHECK_CUDA(cudaMemcpy(mtp_hidden, hidden_1, cfg.n_embed * sizeof(half),
-                                cudaMemcpyDeviceToDevice));
-
-    pos += N;
-
-    GWEN_CHECK_CUDA(cudaFree(d_token_ids));
-    return result;
 }
 
 // ============================================================
 // Speculative Generation with MTP
 // ============================================================
+// Loop structure: each cycle does forward(last_emitted) to verify the draft,
+// then forward(accepted_token) to get a bonus. No checkpointing needed.
+//
+// Accept: forward(last) → pred==draft → emit draft → forward(draft) → emit bonus → MTP(bonus)
+// Reject: forward(last) → pred≠draft → emit pred → forward(pred) → emit bonus → MTP(bonus)
+// Both paths: 2 forward + 1 MTP → 2 output tokens (cost is acceptance-rate-independent)
 
 std::vector<int> InferenceState::generate_speculative(Model& model,
                                                        const std::vector<int>& prompt_tokens,
@@ -1913,18 +1616,11 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
     printf("TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
            prompt_tokens.size() / (ttft_ms / 1000.0));
 
-    // After prefill, mtp_hidden has the hidden state from the last prefill token.
-    // We need to also run the first decode step normally to get hidden state for MTP.
-    // The prefill path already set mtp_hidden (via forward_body or forward_prefill's last GEMV).
-    // But actually, the prefill path doesn't go through forward_body for the last token...
-    // It copies last_hidden to buf_a. We need to ensure mtp_hidden is set.
-    // For safety, run the first decode step with forward() which saves mtp_hidden.
+    // First decode step: process the prefill prediction to set mtp_hidden
     if (output_tokens.size() < (size_t)n_predict) {
         int next = forward(model, output_tokens.back());
         output_tokens.push_back(next);
-        if (next == (int)model.config.eos_token_id) {
-            return output_tokens;
-        }
+        if (next == (int)model.config.eos_token_id) return output_tokens;
     }
 
     // Generate first MTP draft
@@ -1932,48 +1628,39 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
     total_mtp++;
 
     // Speculative decode loop
+    // Invariant: output_tokens.back() has been emitted but NOT yet processed by forward().
+    //            draft = MTP's prediction for what comes after the next processed token.
+    //            mtp_hidden is set from the most recent forward() call.
     while ((int)output_tokens.size() < n_predict) {
         int last_token = output_tokens.back();
 
-        // Verify: batch-process [last_token, draft]
-        auto result = forward_verify(model, last_token, draft);
+        // Step 1: Process last_token through target model (CUDA graph replay)
+        int pred = forward(model, last_token);
+        // mtp_hidden is now set to hidden state after last_token
 
-        if (result.pred_0 == draft) {
-            // Draft accepted! Emit draft and bonus token
+        // Step 2: Check if MTP draft matches target prediction
+        if (pred == draft) {
             output_tokens.push_back(draft);
-            output_tokens.push_back(result.pred_1);
             accepted++;
-
-            if (result.pred_1 == (int)model.config.eos_token_id) break;
-
-            // mtp_hidden now has hidden state from position 1 (after draft)
-            // Generate next draft from the bonus token
-            draft = forward_mtp(model, result.pred_1);
-            total_mtp++;
         } else {
-            // Draft rejected. pred_0 is the correct next token after last_token.
-            output_tokens.push_back(result.pred_0);
+            output_tokens.push_back(pred);
             rejected++;
-
-            if (result.pred_0 == (int)model.config.eos_token_id) break;
-
-            // Restore DeltaNet state to after last_token (before draft was processed)
-            restore_deltanet_checkpoint(compute_stream);
-            pos -= 1;  // verify advanced by 2, only 1 token accepted
-
-            // Process pred_0 through model to advance state + get next prediction
-            int next = forward(model, result.pred_0);
-            // mtp_hidden is now set to hidden state after pred_0
-
-            // Push next (model's prediction after pred_0, not yet processed)
-            output_tokens.push_back(next);
-
-            if (next == (int)model.config.eos_token_id) break;
-
-            // Generate draft for what comes after next
-            draft = forward_mtp(model, next);
-            total_mtp++;
         }
+
+        int emitted = output_tokens.back();
+        if (emitted == (int)model.config.eos_token_id) break;
+        if ((int)output_tokens.size() >= n_predict) break;
+
+        // Step 3: Process the emitted token to get bonus + advance state
+        int bonus = forward(model, emitted);
+        output_tokens.push_back(bonus);
+
+        if (bonus == (int)model.config.eos_token_id) break;
+
+        // Step 4: Generate next draft from bonus token
+        // mtp_hidden was set by forward(emitted) above
+        draft = forward_mtp(model, bonus);
+        total_mtp++;
     }
 
     // Trim to n_predict if we overshot
