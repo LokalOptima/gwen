@@ -27,17 +27,16 @@ struct KVCache {
 
 // Complete inference state
 struct InferenceState {
-    // Scratch buffers (reused across layers)
+    // Scratch buffers (reused across layers) — x and residual are pointer-swapped
     half* x = nullptr;          // [n_embed] current hidden state
     half* x_norm = nullptr;     // [n_embed] after RMSNorm
     half* residual = nullptr;   // [n_embed] residual connection
+    half* buf_a = nullptr;      // backing storage (one of x/residual points here)
+    half* buf_b = nullptr;      // backing storage (the other of x/residual points here)
 
     // DeltaNet scratch
-    half* qkv = nullptr;        // [3 * ssm_inner] = [6144]
+    half* qkv = nullptr;        // [3 * ssm_inner] = [6144] — Q/K/V aliased into this
     half* gate_z = nullptr;     // [ssm_inner] = [2048]
-    half* q = nullptr;          // [ssm_inner] = [2048]
-    half* k = nullptr;          // [ssm_inner] = [2048]
-    half* v = nullptr;          // [ssm_inner] = [2048]
     half* attn_out = nullptr;   // [ssm_inner] = [2048]
     half* gated_out = nullptr;  // [ssm_inner] = [2048]
 
@@ -46,7 +45,6 @@ struct InferenceState {
     half* fa_k = nullptr;       // [n_kv_heads * head_dim] = [512]
     half* fa_v = nullptr;       // [n_kv_heads * head_dim] = [512]
     float* attn_scores = nullptr; // [n_head, max_seq] attention scores (FP32)
-    half* attn_probs = nullptr;  // [n_head, max_seq] after softmax
 
     // FFN scratch
     half* ffn_gate = nullptr;   // [n_ff] = [3584]
@@ -65,6 +63,7 @@ struct InferenceState {
     float* d_alpha = nullptr;    // [ssm_n_heads]
     float* d_beta = nullptr;     // [ssm_n_heads]
 
+    int* d_argmax_token = nullptr; // pre-allocated argmax result
     int pos = 0;                  // current position in sequence
 
     // Allocate all buffers

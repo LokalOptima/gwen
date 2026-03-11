@@ -62,6 +62,11 @@ void gwen_rmsnorm(const half* x, const half* weight, half* y,
 void gwen_rmsnorm_f32w(const half* x, const float* weight, half* y,
                        int dim, float eps, cudaStream_t stream = 0);
 
+// Batched RMSNorm: normalize n_vecs vectors of length dim
+// x: [n_vecs, dim], y: [n_vecs, dim], weight: [dim] (shared across vectors)
+void gwen_rmsnorm_batched_f32w(const half* x, const float* weight, half* y,
+                               int n_vecs, int dim, float eps, cudaStream_t stream = 0);
+
 // ============================================================
 // Activations
 // ============================================================
@@ -129,9 +134,10 @@ void gwen_embed_lookup(const void* table, GGMLType table_type,
 // L2 Normalization
 // ============================================================
 
-// L2-normalize vectors: y = x / ||x||_2
+// L2-normalize vectors: y = (x / ||x||_2) * extra_scale
 // x: [n_vecs, dim], y: [n_vecs, dim]
+// extra_scale folds in e.g. 1/sqrt(d_k) for DeltaNet Q scaling
 void gwen_l2_normalize(const half* x, half* y, int n_vecs, int dim,
-                       cudaStream_t stream = 0);
+                       float extra_scale = 1.0f, cudaStream_t stream = 0);
 
 } // namespace gwen

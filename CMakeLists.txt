@@ -7,9 +7,7 @@ set(CMAKE_CUDA_ARCHITECTURES 120)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # CUDA flags — hyper-optimized for RTX 5070 Ti (SM_120)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-relaxed-constexpr")
-# Note: --use_fast_math trades accuracy for speed. Enable after correctness is verified.
-# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-relaxed-constexpr --use_fast_math")
 
 # CUTLASS (header-only)
 if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/cutlass/include)
@@ -61,4 +59,11 @@ endif()
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_layers.cu)
     add_executable(test_layers tests/test_layers.cu)
     target_link_libraries(test_layers gwen_core)
+endif()
+
+# --- Profiler ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/bench/profile_forward.cu)
+    add_executable(profile_forward bench/profile_forward.cu)
+    target_link_libraries(profile_forward gwen_core)
+    set_target_properties(profile_forward PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()

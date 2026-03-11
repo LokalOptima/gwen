@@ -145,7 +145,7 @@ void gwen_embed_lookup(const void* table, GGMLType table_type,
 // ============================================================
 __global__ void __launch_bounds__(32)
 kernel_l2_normalize(const half* __restrict__ x, half* __restrict__ y,
-                    int n_vecs, int dim) {
+                    int n_vecs, int dim, float extra_scale) {
     int vec_idx = blockIdx.x;
     if (vec_idx >= n_vecs) return;
     int lane = threadIdx.x;
@@ -163,7 +163,7 @@ kernel_l2_normalize(const half* __restrict__ x, half* __restrict__ y,
         sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
     }
 
-    float inv_norm = rsqrtf(sum_sq + 1e-12f);
+    float inv_norm = rsqrtf(sum_sq + 1e-12f) * extra_scale;
 
     for (int i = lane; i < dim; i += 32) {
         yv[i] = __float2half(__half2float(xv[i]) * inv_norm);
@@ -171,8 +171,8 @@ kernel_l2_normalize(const half* __restrict__ x, half* __restrict__ y,
 }
 
 void gwen_l2_normalize(const half* x, half* y, int n_vecs, int dim,
-                       cudaStream_t stream) {
-    kernel_l2_normalize<<<n_vecs, 32, 0, stream>>>(x, y, n_vecs, dim);
+                       float extra_scale, cudaStream_t stream) {
+    kernel_l2_normalize<<<n_vecs, 32, 0, stream>>>(x, y, n_vecs, dim, extra_scale);
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 
