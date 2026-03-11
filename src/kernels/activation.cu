@@ -86,6 +86,21 @@ kernel_add_inplace(half* __restrict__ x, const half* __restrict__ residual, int 
 }
 
 // ============================================================
+// Fused sigmoid-mul: y = a * sigmoid(b)
+// ============================================================
+__global__ void __launch_bounds__(256)
+kernel_sigmoid_mul(const half* __restrict__ a, const half* __restrict__ b,
+                   half* __restrict__ y, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float va = __half2float(a[idx]);
+        float vb = __half2float(b[idx]);
+        float sig = 1.0f / (1.0f + expf(-vb));
+        y[idx] = __float2half(va * sig);
+    }
+}
+
+// ============================================================
 // Launch wrappers
 // ============================================================
 
@@ -128,6 +143,12 @@ void gwen_add(const half* a, const half* b, half* y, int n, cudaStream_t stream)
 void gwen_add_inplace(half* x, const half* residual, int n, cudaStream_t stream) {
     int blocks = (n + 255) / 256;
     kernel_add_inplace<<<blocks, 256, 0, stream>>>(x, residual, n);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+void gwen_sigmoid_mul(const half* a, const half* b, half* y, int n, cudaStream_t stream) {
+    int blocks = (n + 255) / 256;
+    kernel_sigmoid_mul<<<blocks, 256, 0, stream>>>(a, b, y, n);
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 

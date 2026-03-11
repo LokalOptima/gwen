@@ -89,24 +89,21 @@ kernel_deltanet_decode(
 }
 
 // ============================================================
-// Conv1D with rolling state
+// Fused Conv1D + SiLU with rolling state
 // ============================================================
-// Applies 1D convolution with kernel_size=4 on the QKV features
-// State stores the last (kernel_size-1)=3 values
+// Applies 1D convolution with kernel_size=4, then SiLU activation
 __global__ void __launch_bounds__(256)
-kernel_conv1d(
+kernel_conv1d_silu(
     half* __restrict__ output,           // [dim] output (may alias input)
     const half* __restrict__ input,      // [dim] current input
     float* __restrict__ conv_state,      // [kernel_size-1, dim] rolling state
-    const float* __restrict__ weight,    // [kernel_size, dim] conv weights (stored as [kernel, dim])
+    const float* __restrict__ weight,    // [kernel_size, dim] conv weights
     int dim, int kernel_size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= dim) return;
 
-    // GGUF stores conv weight as [dim, kernel_size] — weight[feature][kernel_pos]
-    // Convolution: output[i] = sum_{k=0}^{K-1} weight[i, k] * input_at_time(t-K+1+k, i)
-    float x_val = __half2float(input[idx]);  // Save input BEFORE output write (may alias)
+    float x_val = __half2float(input[idx]);
 
     float acc = 0.0f;
     for (int k = 0; k < kernel_size - 1; k++) {
@@ -114,9 +111,11 @@ kernel_conv1d(
     }
     acc += weight[idx * kernel_size + (kernel_size - 1)] * x_val;
 
-    output[idx] = __float2half(acc);
+    // Fused SiLU: x * sigmoid(x)
+    float silu = acc / (1.0f + expf(-acc));
+    output[idx] = __float2half(silu);
 
-    // Shift state: state[0] = state[1], state[1] = state[2], state[2] = original input
+    // Shift state
     for (int k = 0; k < kernel_size - 2; k++) {
         conv_state[k * dim + idx] = conv_state[(k + 1) * dim + idx];
     }
@@ -409,7 +408,6 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     d_argmax_token = static_cast<int*>(a(sizeof(int)));
 
     // DeltaNet states (18 layers)
-    int dn_idx = 0;
     for (uint32_t i = 0; i < cfg.n_layers; i++) {
         if (!cfg.is_full_attention_layer(i)) {
             DeltaNetState state;
@@ -499,16 +497,13 @@ int InferenceState::forward(Model& model, int token_id) {
             gwen_gemv(w.attn_gate.device_data, x_norm, gate_z,
                       w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type);
 
-            // Conv1D on QKV
+            // Fused Conv1D + SiLU on QKV
             int qkv_dim = cfg.ssm_inner_size * 3;
             int conv_blocks = (qkv_dim + 255) / 256;
-            kernel_conv1d<<<conv_blocks, 256>>>(
+            kernel_conv1d_silu<<<conv_blocks, 256>>>(
                 qkv, qkv, state.conv_state,
                 static_cast<const float*>(w.ssm_conv1d.device_data),
                 qkv_dim, cfg.ssm_conv_kernel);
-
-            // SiLU activation on QKV
-            gwen_silu_inplace(qkv, qkv_dim);
 
             // Q/K/V aliased into qkv buffer
             half* q = qkv;
@@ -606,14 +601,14 @@ int InferenceState::forward(Model& model, int token_id) {
                       cfg.n_head, cfg.n_head_kv, cfg.head_dim,
                       pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim);
 
-            // Store K and V in cache
+            // Store K and V in cache (async to avoid runtime overhead)
             size_t kv_row_bytes = cfg.n_head_kv * cfg.head_dim * sizeof(half);
-            GWEN_CHECK_CUDA(cudaMemcpy(
+            GWEN_CHECK_CUDA(cudaMemcpyAsync(
                 cache.k_cache + (size_t)pos * cfg.n_head_kv * cfg.head_dim,
-                fa_k, kv_row_bytes, cudaMemcpyDeviceToDevice));
-            GWEN_CHECK_CUDA(cudaMemcpy(
+                fa_k, kv_row_bytes, cudaMemcpyDeviceToDevice, 0));
+            GWEN_CHECK_CUDA(cudaMemcpyAsync(
                 cache.v_cache + (size_t)pos * cfg.n_head_kv * cfg.head_dim,
-                fa_v, kv_row_bytes, cudaMemcpyDeviceToDevice));
+                fa_v, kv_row_bytes, cudaMemcpyDeviceToDevice, 0));
 
             // GQA Attention decode
             float scale = 1.0f / sqrtf((float)cfg.head_dim);
@@ -627,8 +622,7 @@ int InferenceState::forward(Model& model, int token_id) {
             // Gated attention: output = attn_result * sigmoid(gate)
             {
                 int attn_dim = cfg.n_head * cfg.head_dim;
-                gwen_sigmoid(gated_out, gated_out, attn_dim);
-                gwen_mul(attn_out, gated_out, gated_out, attn_dim);
+                gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim);
             }
 
             // Output projection: [2048] → buf_b

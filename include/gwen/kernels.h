@@ -86,6 +86,9 @@ void gwen_sigmoid(const half* x, half* y, int n, cudaStream_t stream = 0);
 // Element-wise multiply: y = a * b
 void gwen_mul(const half* a, const half* b, half* y, int n, cudaStream_t stream = 0);
 
+// Fused sigmoid-mul: y = a * sigmoid(b)
+void gwen_sigmoid_mul(const half* a, const half* b, half* y, int n, cudaStream_t stream = 0);
+
 // Element-wise add: y = a + b
 void gwen_add(const half* a, const half* b, half* y, int n, cudaStream_t stream = 0);
 
