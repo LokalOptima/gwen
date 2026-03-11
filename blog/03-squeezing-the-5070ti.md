@@ -118,24 +118,68 @@ gwen_rmsnorm_batched_f32w(fa_k, weight, fa_k, 2, 256, eps);
 
 All `debug_print_half`, `debug_print_float`, early logit probes, and per-layer `cudaDeviceSynchronize()` calls were removed. Each sync point forces the CPU to wait for the GPU, killing pipeline parallelism. The debug code also performed full GEMV operations at every layer for "early logit probes" — that's 24 extra GEMV calls per first token.
 
-## Results
+## Results (Round 1: Kernel Fusion)
 
 | Metric | Before | After | Change |
 |--------|--------|-------|--------|
-| Decode speed | 184 tok/s | 215 tok/s | +17% |
-| Forward pass | 5.4 ms | 4.66 ms | -14% |
-| Kernel launches | ~500 | ~350 | -30% |
-| Bandwidth efficiency | 11% | 12.5% | +14% |
+| Decode speed | 184 tok/s | 217 tok/s | +18% |
+| Forward pass | 5.4 ms | 4.61 ms | -15% |
+| Kernel launches | ~500 | ~395 | -21% |
+| Bandwidth efficiency | 11% | 12.6% | +15% |
+
+### 7. CUDA Graph Capture
+
+The ~395 remaining kernel launches still cost ~2ms in scheduling overhead. CUDA Graphs pre-record the entire kernel execution plan and replay it with a single API call, eliminating per-kernel launch overhead.
+
+The challenge: full attention layers have position-dependent parameters (RoPE position, KV cache write offset, attention sequence length). A captured graph bakes in kernel arguments, so these can't change between replays.
+
+Solution: **device-side indirection**. Instead of passing `pos` and `token_id` as kernel value parameters, I pass device pointers (`d_pos`, `d_token_id`). Before each graph replay, a single H2D memcpy writes the new values. The kernels read from these pointers at execution time.
+
+Kernels that needed modification:
+- `kernel_embed_lookup_q6k`: reads `*d_token_id` instead of value param
+- `kernel_rope`: reads `*d_pos` for frequency computation
+- `kernel_gqa_attention_decode`: reads `*d_pos` for sequence length
+- New `kernel_kv_cache_store`: replaces `cudaMemcpyAsync` for graph-compatible KV cache writes
+
+```cpp
+// Graph capture (once, on first token)
+cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal);
+forward_body(model, compute_stream);  // all ~419 kernels on one stream
+cudaStreamEndCapture(compute_stream, &graph);
+cudaGraphInstantiate(&graph_exec, graph, ...);
+
+// Per token: just update params and replay
+int params[2] = {token_id, pos};
+cudaMemcpy(d_token_id, params, 8, H2D);  // single copy (adjacent layout)
+cudaGraphLaunch(graph_exec, compute_stream);
+cudaStreamSynchronize(compute_stream);
+```
+
+### 8. Additional Fusions
+
+- **Fused Conv1D + SiLU**: Combined convolution and SiLU activation into `kernel_conv1d_silu` (18 launches saved)
+- **Fused sigmoid + multiply**: Combined `gwen_sigmoid` + `gwen_mul` into `gwen_sigmoid_mul` for attention gating (6 launches saved)
+
+## Results (Round 2: CUDA Graph + Extra Fusions)
+
+| Metric | Round 1 | Round 2 | Change |
+|--------|---------|---------|--------|
+| Decode speed | 217 tok/s | **251 tok/s** | +16% |
+| Forward pass | 4.61 ms | **3.98 ms** | -14% |
+| Launch overhead | ~2.0 ms | ~0.3 ms | -85% |
+| Bandwidth efficiency | 12.6% | **14.6%** | +16% |
+
+Total improvement from baseline: **184 → 251 tok/s (+36%)**.
 
 ## What's Left on the Table
 
-The remaining gap to theoretical (215 vs 1700 tok/s) is dominated by:
+The remaining gap to theoretical (251 vs 1700 tok/s) is dominated by:
 
-1. **Kernel launch overhead** (~2 ms): Each of ~350 kernel launches costs 5-7 μs in scheduling overhead. CUDA Graphs could eliminate most of this, but the full attention layers have position-dependent parameters (KV cache offsets, sequence length) that complicate graph capture.
+1. **GEMV bandwidth underutilization** (18-35% of peak): For small weight matrices like 1024→2048, the 256-thread block processes only 4 Q4_K blocks per row — not enough work to hide memory latency. Solutions: multi-row processing or completely different approach (persistent kernels).
 
-2. **GEMV bandwidth underutilization** (18-35% of peak): For small weight matrices like 1024→2048, the 256-thread block processes only 4 Q4_K blocks per row — not enough work to hide memory latency. Solutions: multi-row processing, shared memory caching of the input vector, or a completely different approach (persistent kernels).
+2. **LM head dominates compute** (0.66 ms = 17% of total): At 317 GB/s, the 248K-row GEMV uses only 35% of the 896 GB/s bandwidth. The Q6_K dequantization path has complex byte extraction that bottlenecks on ALU, not memory.
 
-3. **LM head dominates compute** (0.66 ms = 14% of total): At 317 GB/s, the 248K-row GEMV uses only 35% of the 896 GB/s bandwidth. The Q6_K dequantization path has complex byte extraction that bottlenecks on ALU, not memory.
+3. **H2D sync overhead**: Each token requires a synchronous cudaMemcpy for pos/token_id and a stream sync to read back the argmax result. This adds ~0.1-0.2ms overhead.
 
 ## What's Next
 
