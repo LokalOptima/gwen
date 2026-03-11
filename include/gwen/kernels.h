@@ -145,4 +145,20 @@ void gwen_embed_lookup(const void* table, GGMLType table_type,
 void gwen_l2_normalize(const half* x, half* y, int n_vecs, int dim,
                        float extra_scale = 1.0f, cudaStream_t stream = 0);
 
+// ============================================================
+// GEMM (for prefill — batch of tokens)
+// ============================================================
+
+// Initialize cuBLAS (called once)
+void gwen_cublas_init(cudaStream_t stream = 0);
+void gwen_cublas_destroy();
+
+// Dequant + cuBLAS HGEMM: y[seq_len, out] = x[seq_len, in] * W^T[in, out]
+// temp_w: scratch for dequantized FP16 weights [out_features * in_features]
+void gwen_gemm(const void* W_quant, GGMLType type,
+               half* temp_w,
+               const half* x, half* y,
+               int out_features, int in_features, int seq_len,
+               cudaStream_t stream = 0);
+
 } // namespace gwen

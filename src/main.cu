@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
     printf("\nAllocating inference state...\n");
     InferenceState state;
     state.allocate(model->config, allocator);
+    state.allocate_prefill(model->config, allocator, 4096);
     printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 
     // Generate

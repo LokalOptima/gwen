@@ -78,11 +78,26 @@ struct InferenceState {
     // Allocate all buffers
     void allocate(const ModelConfig& cfg, CudaAllocator& alloc, int max_seq = 4096);
 
+    // Prefill scratch buffers
+    half* prefill_x = nullptr;       // [max_prefill, n_embed] input embeddings
+    half* prefill_out = nullptr;     // [max_prefill, n_embed] layer output
+    half* prefill_norm = nullptr;    // [max_prefill, n_embed] after norm
+    half* prefill_temp_w = nullptr;  // scratch for dequantized weights
+    half* prefill_ffn_gate = nullptr; // [max_prefill, n_ff]
+    half* prefill_ffn_up = nullptr;   // [max_prefill, n_ff]
+    half* prefill_ffn_out = nullptr;  // [max_prefill, n_ff]
+    int max_prefill = 0;
+
+    void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens);
+
     // Run the forward pass (all GPU work on given stream)
     void forward_body(Model& model, cudaStream_t stream);
 
     // Run one forward pass (single token decode)
     int forward(Model& model, int token_id);
+
+    // Process all prompt tokens at once (prefill), return last token's prediction
+    int forward_prefill(Model& model, const std::vector<int>& tokens);
 
     // Generate tokens
     std::vector<int> generate(Model& model, const std::vector<int>& prompt_tokens,

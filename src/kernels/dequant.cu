@@ -58,18 +58,15 @@ kernel_dequant_q4_k(const block_q4_k* __restrict__ src, half* __restrict__ dst, 
     float scale = d * sc_lo;
     float min = dmin * m_lo;
 
-    // Extract 4-bit quantized value
-    // qs has 128 bytes = 256 nibbles
-    // First 128 elements in low nibbles of qs[0..63], next 128 in high nibbles
-    uint8_t q_byte;
-    int q_val;
-    if (tid < 128) {
-        q_byte = blk.qs[tid / 2];
-        q_val = (tid % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-    } else {
-        q_byte = blk.qs[(tid - 128) / 2 + 64];
-        q_val = ((tid - 128) % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-    }
+    // Extract 4-bit quantized value (ggml interleaved layout)
+    // Layout: groups of 64 elements, each group = 32 low nibbles + 32 high nibbles
+    // from 32 consecutive bytes
+    int group = tid / 64;         // 0..3
+    int within = tid % 64;
+    int is_high = within / 32;    // 0 or 1
+    int pos = within % 32;        // 0..31
+    int qs_byte_idx = group * 32 + pos;
+    int q_val = is_high ? (blk.qs[qs_byte_idx] >> 4) : (blk.qs[qs_byte_idx] & 0xF);
 
     float result = scale * q_val - min;
     dst[block_idx * 256 + tid] = __float2half(result);
@@ -105,16 +102,13 @@ kernel_dequant_q5_k(const block_q5_k* __restrict__ src, half* __restrict__ dst, 
     float scale = d * sc_lo;
     float min = dmin * m_lo;
 
-    // Extract 4 low bits (same layout as Q4_K)
-    uint8_t q_byte;
-    int q_lo;
-    if (tid < 128) {
-        q_byte = blk.qs[tid / 2];
-        q_lo = (tid % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-    } else {
-        q_byte = blk.qs[(tid - 128) / 2 + 64];
-        q_lo = ((tid - 128) % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-    }
+    // Extract 4 low bits (ggml interleaved layout, same as Q4_K)
+    int group = tid / 64;
+    int within = tid % 64;
+    int is_high = within / 32;
+    int pos = within % 32;
+    int qs_byte_idx = group * 32 + pos;
+    int q_lo = is_high ? (blk.qs[qs_byte_idx] >> 4) : (blk.qs[qs_byte_idx] & 0xF);
 
     // Extract 5th bit from qh
     // qh has 32 bytes = 256 bits, one bit per element
@@ -140,29 +134,23 @@ kernel_dequant_q6_k(const block_q6_k* __restrict__ src, half* __restrict__ dst, 
 
     float d = __half2float(blk.d);
 
-    // Q6_K has 16 sub-groups of 16 elements
-    int sub_group = tid / 16;   // 0..15
-    (void)(tid % 16);
+    // Q6_K interleaved layout (ggml):
+    // 256 elements = 2 halves of 128. Each half = 4 quarters of 32.
+    int half_idx = tid / 128;        // 0 or 1
+    int j = tid % 128;
+    int quarter = j / 32;            // 0..3
+    int pos = j % 32;                // 0..31
 
-    int8_t scale = blk.scales[sub_group];
+    int ql_byte = half_idx * 64 + (quarter & 1) * 32 + pos;
+    int ql_nibble = (quarter >= 2) ? (blk.ql[ql_byte] >> 4) : (blk.ql[ql_byte] & 0xF);
 
-    // Extract 6-bit quantized value
-    // Lower 4 bits from ql[128]: 2 nibbles per byte
-    int ql_idx = tid / 2;
-    int ql_nibble;
-    if (tid % 2 == 0) {
-        ql_nibble = blk.ql[ql_idx] & 0xF;
-    } else {
-        ql_nibble = blk.ql[ql_idx] >> 4;
-    }
-
-    // Upper 2 bits from qh[64]: 4 values per byte (2 bits each)
-    int qh_idx = tid / 4;
-    int qh_shift = (tid % 4) * 2;
-    int qh_bits = (blk.qh[qh_idx] >> qh_shift) & 0x3;
+    int qh_byte = half_idx * 32 + pos;
+    int qh_shift = quarter * 2;
+    int qh_bits = (blk.qh[qh_byte] >> qh_shift) & 0x3;
 
     int q_val = ql_nibble | (qh_bits << 4);
-    // Q6_K values are signed: subtract 32 to center around 0
+    int scale_idx = half_idx * 8 + quarter * 2 + pos / 16;
+    int8_t scale = blk.scales[scale_idx];
     float result = d * scale * (q_val - 32);
     dst[block_idx * 256 + tid] = __float2half(result);
 }

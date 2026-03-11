@@ -34,6 +34,7 @@ file(GLOB_RECURSE GWEN_SOURCES
 if(GWEN_SOURCES)
     add_library(gwen_core STATIC ${GWEN_SOURCES})
     target_include_directories(gwen_core PUBLIC include)
+    target_link_libraries(gwen_core cublas)
     set_target_properties(gwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
@@ -59,6 +60,11 @@ endif()
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_layers.cu)
     add_executable(test_layers tests/test_layers.cu)
     target_link_libraries(test_layers gwen_core)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_gemm.cu)
+    add_executable(test_gemm tests/test_gemm.cu)
+    target_link_libraries(test_gemm gwen_core)
 endif()
 
 # --- Profiler ---
