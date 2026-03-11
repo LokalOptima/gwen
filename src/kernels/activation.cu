@@ -1,4 +1,5 @@
 #include "gwen/kernels.h"
+#include "gwen/ggml_quants.h"
 
 namespace gwen {
 
@@ -38,6 +39,48 @@ kernel_swiglu(const half* __restrict__ gate, const half* __restrict__ up,
         float sig = 1.0f / (1.0f + expf(-g));
         y[idx] = __float2half(g * sig * u);
     }
+}
+
+// ============================================================
+// Fused SwiGLU + Q8_1 Quantize: computes SwiGLU and quantizes directly to Q8_1
+// ============================================================
+// Each warp handles one Q8_1 block (32 elements).
+// Skips the FP16 intermediate entirely.
+__global__ void __launch_bounds__(256)
+kernel_swiglu_quantize_q8_1(const half* __restrict__ gate,
+                             const half* __restrict__ up,
+                             block_q8_1* __restrict__ y_q8,
+                             int n_blocks) {
+    int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (warp_global >= n_blocks) return;
+
+    int base = warp_global * 32 + lane;
+
+    // Compute SwiGLU in FP32
+    float g = __half2float(gate[base]);
+    float u = __half2float(up[base]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    float val = g * sig * u;
+
+    // Warp reduction for amax
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int8_t q = (int8_t)roundf(val * id);
+
+    float sum = (float)q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+
+    y_q8[warp_global].qs[lane] = q;
+    if (lane == 0)
+        y_q8[warp_global].ds = __halves2half2(__float2half(d), __float2half(sum));
 }
 
 // ============================================================
@@ -119,6 +162,14 @@ void gwen_silu_inplace(half* x, int n, cudaStream_t stream) {
 void gwen_swiglu(const half* gate, const half* up, half* y, int n, cudaStream_t stream) {
     int blocks = (n + 255) / 256;
     kernel_swiglu<<<blocks, 256, 0, stream>>>(gate, up, y, n);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+void gwen_swiglu_quantize_q8_1(const half* gate, const half* up, void* y_q8, int n, cudaStream_t stream) {
+    int n_blocks = n / 32;
+    int grid = (n_blocks + 7) / 8;  // 8 warps per thread block
+    kernel_swiglu_quantize_q8_1<<<grid, 256, 0, stream>>>(
+        gate, up, static_cast<block_q8_1*>(y_q8), n_blocks);
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 

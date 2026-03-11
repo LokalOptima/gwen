@@ -34,7 +34,7 @@ file(GLOB_RECURSE GWEN_SOURCES
 if(GWEN_SOURCES)
     add_library(gwen_core STATIC ${GWEN_SOURCES})
     target_include_directories(gwen_core PUBLIC include)
-    target_link_libraries(gwen_core cublas)
+    target_link_libraries(gwen_core)
     set_target_properties(gwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 

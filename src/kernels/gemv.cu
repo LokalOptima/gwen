@@ -67,6 +67,7 @@ __global__ void __launch_bounds__(NW * 32)
 kernel_gemv_q4_k_dp4a(const block_q4_k* __restrict__ W,
                        const block_q8_1* __restrict__ x_q8,
                        half* __restrict__ y,
+                       const half* __restrict__ residual,
                        int out_features, int blocks_per_row) {
     const int row = blockIdx.x;
     if (row >= out_features) return;
@@ -136,8 +137,12 @@ kernel_gemv_q4_k_dp4a(const block_q4_k* __restrict__ W,
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
-        if (threadIdx.x == 0)
-            y[row] = __float2half(sumf);
+        if (threadIdx.x == 0) {
+            if (residual)
+                y[row] = __float2half(sumf + __half2float(residual[row]));
+            else
+                y[row] = __float2half(sumf);
+        }
     }
 }
 
@@ -150,6 +155,7 @@ __global__ void __launch_bounds__(NW * 32)
 kernel_gemv_q5_k_dp4a(const block_q5_k* __restrict__ W,
                        const block_q8_1* __restrict__ x_q8,
                        half* __restrict__ y,
+                       const half* __restrict__ residual,
                        int out_features, int blocks_per_row) {
     const int row = blockIdx.x;
     if (row >= out_features) return;
@@ -231,8 +237,12 @@ kernel_gemv_q5_k_dp4a(const block_q5_k* __restrict__ W,
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
-        if (threadIdx.x == 0)
-            y[row] = __float2half(sumf);
+        if (threadIdx.x == 0) {
+            if (residual)
+                y[row] = __float2half(sumf + __half2float(residual[row]));
+            else
+                y[row] = __float2half(sumf);
+        }
     }
 }
 
@@ -253,6 +263,7 @@ __global__ void __launch_bounds__(NW * 32)
 kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
                        const block_q8_1* __restrict__ x_q8,
                        half* __restrict__ y,
+                       const half* __restrict__ residual,
                        int out_features, int blocks_per_row) {
     const int row = blockIdx.x;
     if (row >= out_features) return;
@@ -319,8 +330,12 @@ kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
-        if (threadIdx.x == 0)
-            y[row] = __float2half(sumf);
+        if (threadIdx.x == 0) {
+            if (residual)
+                y[row] = __float2half(sumf + __half2float(residual[row]));
+            else
+                y[row] = __float2half(sumf);
+        }
     }
 }
 
@@ -587,10 +602,10 @@ void gwen_gemv(const void* W, const half* x, half* y,
 // Launch wrappers — dp4a with Q8_1 input
 // ============================================================
 
-void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
-                    int out_features, int in_features, GGMLType type, cudaStream_t stream) {
+// Internal dispatch: residual can be nullptr (no fusion) or a valid pointer (fused add)
+static void gemv_dp4a_internal(const void* W, const void* x_q8, half* y, const half* residual,
+                               int out_features, int in_features, GGMLType type, cudaStream_t stream) {
     int blocks_per_row = in_features / QK_K;
-    // Adaptive warp count: NW=2 for blocks_per_row≤4 (in≤1024), NW=4 for larger
     bool small = (blocks_per_row <= 4);
     auto bq8 = static_cast<const block_q8_1*>(x_q8);
 
@@ -598,31 +613,41 @@ void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
         case GGMLType::Q4_K: {
             auto Wp = static_cast<const block_q4_k*>(W);
             if (small)
-                kernel_gemv_q4_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+                kernel_gemv_q4_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row);
             else
-                kernel_gemv_q4_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+                kernel_gemv_q4_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row);
             break;
         }
         case GGMLType::Q5_K: {
             auto Wp = static_cast<const block_q5_k*>(W);
             if (small)
-                kernel_gemv_q5_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+                kernel_gemv_q5_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row);
             else
-                kernel_gemv_q5_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+                kernel_gemv_q5_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row);
             break;
         }
         case GGMLType::Q6_K: {
             auto Wp = static_cast<const block_q6_k*>(W);
             if (small)
-                kernel_gemv_q6_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+                kernel_gemv_q6_k_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row);
             else
-                kernel_gemv_q6_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, out_features, blocks_per_row);
+                kernel_gemv_q6_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row);
             break;
         }
         default:
             GWEN_CHECK(false, "Unsupported dp4a GEMV type (Q4_K/Q5_K/Q6_K only)");
     }
     GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
+                    int out_features, int in_features, GGMLType type, cudaStream_t stream) {
+    gemv_dp4a_internal(W, x_q8, y, nullptr, out_features, in_features, type, stream);
+}
+
+void gwen_gemv_dp4a_residual(const void* W, const void* x_q8, half* y, const half* residual,
+                              int out_features, int in_features, GGMLType type, cudaStream_t stream) {
+    gemv_dp4a_internal(W, x_q8, y, residual, out_features, in_features, type, stream);
 }
 
 } // namespace gwen

@@ -65,6 +65,10 @@ void gwen_quantize_q8_1(const half* x, void* x_q8, int n, cudaStream_t stream = 
 void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
                     int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
 
+// dp4a GEMV with fused residual add: y = W * x + residual
+void gwen_gemv_dp4a_residual(const void* W, const void* x_q8, half* y, const half* residual,
+                              int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
+
 // ============================================================
 // RMSNorm: y = x * rsqrt(mean(x^2) + eps) * weight
 // ============================================================
@@ -74,6 +78,11 @@ void gwen_rmsnorm(const half* x, const half* weight, half* y,
 // Fused RMSNorm for F32 weights (common for norm layers stored as F32)
 void gwen_rmsnorm_f32w(const half* x, const float* weight, half* y,
                        int dim, float eps, cudaStream_t stream = 0);
+
+// Fused RMSNorm + Q8_1 quantize (with optional FP16 output)
+// y_fp16 may be nullptr if FP16 output not needed
+void gwen_rmsnorm_quantize_q8_1(const half* x, const float* weight, void* y_q8, half* y_fp16,
+                                  int dim, float eps, cudaStream_t stream = 0);
 
 // Batched RMSNorm: normalize n_vecs vectors of length dim
 // x: [n_vecs, dim], y: [n_vecs, dim], weight: [dim] (shared across vectors)
@@ -92,6 +101,9 @@ void gwen_silu_inplace(half* x, int n, cudaStream_t stream = 0);
 
 // SwiGLU: y = SiLU(gate) * up (fused)
 void gwen_swiglu(const half* gate, const half* up, half* y, int n, cudaStream_t stream = 0);
+
+// Fused SwiGLU + Q8_1 quantize: computes SwiGLU and writes Q8_1 directly (skips FP16 intermediate)
+void gwen_swiglu_quantize_q8_1(const half* gate, const half* up, void* y_q8, int n, cudaStream_t stream = 0);
 
 // Sigmoid: y = 1 / (1 + exp(-x))
 void gwen_sigmoid(const half* x, half* y, int n, cudaStream_t stream = 0);
@@ -169,11 +181,7 @@ void gwen_deltanet_decode(float* S, const half* q, const half* k, const half* v,
 // GEMM (for prefill — batch of tokens)
 // ============================================================
 
-// Initialize cuBLAS (called once)
-void gwen_cublas_init(cudaStream_t stream = 0);
-void gwen_cublas_destroy();
-
-// Dequant + cuBLAS HGEMM: y[seq_len, out] = x[seq_len, in] * W^T[in, out]
+// Dequant + CUTLASS GEMM: y[seq_len, out] = x[seq_len, in] * W^T[in, out]
 // temp_w: scratch for dequantized FP16 weights [out_features * in_features]
 void gwen_gemm(const void* W_quant, GGMLType type,
                half* temp_w,

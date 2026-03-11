@@ -158,6 +158,88 @@ kernel_gated_rmsnorm(
 }
 
 // ============================================================
+// Fused Gated RMSNorm + Q8_1 Quantize
+// ============================================================
+// 128 threads (4 warps) per head. dim_per_head=128 → 4 Q8_1 blocks per head.
+// Phase 1: All 128 threads compute per-head sum-of-squares (1 element each), cross-warp reduce
+// Phase 2: Each warp handles one Q8_1 block: apply norm*weight*SiLU(gate), quantize
+__global__ void __launch_bounds__(128)
+kernel_gated_rmsnorm_quantize_q8_1(
+    const half* __restrict__ x,        // [n_heads * dim_per_head]
+    const float* __restrict__ weight,  // [dim_per_head] (shared)
+    const half* __restrict__ gate,     // [n_heads * dim_per_head]
+    block_q8_1* __restrict__ y_q8,     // [n_heads * dim_per_head / 32] Q8_1 blocks
+    int n_heads, int dim_per_head, float eps)
+{
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int tid = threadIdx.x;  // 0..127
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int offset_base = head * dim_per_head;
+
+    // Phase 1: sum of squares (each thread handles dim_per_head/128 elements)
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim_per_head; i += 128) {
+        float val = __half2float(x[offset_base + i]);
+        sum_sq += val * val;
+    }
+
+    // Intra-warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    // Cross-warp reduction via shared memory
+    __shared__ float warp_sums[4];
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+        s_rms_inv = rsqrtf(total / dim_per_head + eps);
+    }
+    __syncthreads();
+    float rms_inv = s_rms_inv;
+
+    // Phase 2: Each warp handles one Q8_1 block
+    // dim_per_head=128 → 4 blocks, one per warp
+    int blocks_per_head = dim_per_head / 32;
+    int blk_idx = warp_id;
+    if (blk_idx >= blocks_per_head) return;
+
+    int elem_idx = offset_base + blk_idx * 32 + lane;
+    int local_idx = blk_idx * 32 + lane;
+
+    float x_val = __half2float(x[elem_idx]) * rms_inv;
+    float w = weight[local_idx];
+    float g = __half2float(gate[elem_idx]);
+    float silu_g = g / (1.0f + expf(-g));
+    float val = x_val * w * silu_g;
+
+    // Quantize
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int8_t q = (int8_t)roundf(val * id);
+
+    float sum = (float)q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+
+    int out_blk = head * blocks_per_head + blk_idx;
+    y_q8[out_blk].qs[lane] = q;
+    if (lane == 0)
+        y_q8[out_blk].ds = __halves2half2(__float2half(d), __float2half(sum));
+}
+
+// ============================================================
 // Gate/Beta computation for DeltaNet
 // ============================================================
 // gate_i = ssm_a_i * softplus(alpha_proj_i + dt_bias_i)
@@ -539,11 +621,9 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
 
-            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-
-            // Quantize x_norm to Q8_1, then dp4a GEMV for QKV + gate (same input)
-            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // Fused RMSNorm + Q8_1 quantize (also writes FP16 x_norm for gate/beta computation)
+            gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             gwen_gemv_dp4a(w.attn_qkv.device_data, x_q8_a, qkv,
                       w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type, s);
             gwen_gemv_dp4a(w.attn_gate.device_data, x_q8_a, gate_z,
@@ -575,44 +655,34 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                 state.S, q, k, v, d_alpha, d_beta,
                 attn_out, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
 
-            kernel_gated_rmsnorm<<<cfg.ssm_n_heads, 32, 0, s>>>(
+            // Fused gated RMSNorm + Q8_1 quantize
+            kernel_gated_rmsnorm_quantize_q8_1<<<cfg.ssm_n_heads, 128, 0, s>>>(
                 attn_out,
                 static_cast<const float*>(w.ssm_norm.device_data),
-                gate_z, gated_out,
+                gate_z, static_cast<block_q8_1*>(x_q8_b),
                 cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
-
-            // Quantize gated_out for output projection
-            gwen_quantize_q8_1(gated_out, x_q8_b, cfg.ssm_inner_size, s);
-            gwen_gemv_dp4a(w.ssm_out.device_data, x_q8_b, buf_b,
+            gwen_gemv_dp4a_residual(w.ssm_out.device_data, x_q8_b, buf_b, buf_a,
                       w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type, s);
-            gwen_add_inplace(buf_b, buf_a, cfg.n_embed, s);
 
-            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-
-            // Quantize x_norm for FFN gate + up (same input)
-            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // Fused RMSNorm + Q8_1 quantize (no FP16 output needed)
+            gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
             gwen_gemv_dp4a(w.ffn_gate.device_data, x_q8_a, ffn_gate,
                       w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
             gwen_gemv_dp4a(w.ffn_up.device_data, x_q8_a, ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
-            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
-
-            // Quantize ffn_out for down projection
-            gwen_quantize_q8_1(ffn_out, x_q8_b, cfg.n_ff, s);
-            gwen_gemv_dp4a(w.ffn_down.device_data, x_q8_b, buf_a,
+            // Fused SwiGLU + Q8_1 quantize (skips FP16 intermediate)
+            gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
+            gwen_gemv_dp4a_residual(w.ffn_down.device_data, x_q8_b, buf_a, buf_b,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
-            gwen_add_inplace(buf_a, buf_b, cfg.n_embed, s);
 
         } else {
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-
-            // Quantize x_norm for Q/K/V projections (same input)
-            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // Fused RMSNorm + Q8_1 quantize (no FP16 output needed)
+            gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
             gwen_gemv_dp4a(w.attn_q.device_data, x_q8_a, qkv,
                       w.attn_q.shape[1], w.attn_q.shape[0], w.attn_q.type, s);
 
@@ -656,37 +726,28 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                 gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
             }
 
-            // Quantize gated_out for output projection
+            // Quantize gated_out for output projection (fused residual add)
             gwen_quantize_q8_1(gated_out, x_q8_b, cfg.n_head * cfg.head_dim, s);
-            gwen_gemv_dp4a(w.attn_output.device_data, x_q8_b, buf_b,
+            gwen_gemv_dp4a_residual(w.attn_output.device_data, x_q8_b, buf_b, buf_a,
                       w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type, s);
-            gwen_add_inplace(buf_b, buf_a, cfg.n_embed, s);
 
-            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-
-            // Quantize x_norm for FFN gate + up
-            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // Fused RMSNorm + Q8_1 quantize (no FP16 output needed)
+            gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
             gwen_gemv_dp4a(w.ffn_gate.device_data, x_q8_a, ffn_gate,
                       w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
             gwen_gemv_dp4a(w.ffn_up.device_data, x_q8_a, ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
-            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
-
-            // Quantize ffn_out for down projection
-            gwen_quantize_q8_1(ffn_out, x_q8_b, cfg.n_ff, s);
-            gwen_gemv_dp4a(w.ffn_down.device_data, x_q8_b, buf_a,
+            // Fused SwiGLU + Q8_1 quantize (skips FP16 intermediate)
+            gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
+            gwen_gemv_dp4a_residual(w.ffn_down.device_data, x_q8_b, buf_a, buf_b,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
-            gwen_add_inplace(buf_a, buf_b, cfg.n_embed, s);
         }
     }
 
-    // 3. Final RMSNorm + LM Head + argmax
-    gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
-                      x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-
-    // Quantize x_norm for LM head GEMV (the biggest single GEMV)
-    gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+    // 3. Fused RMSNorm + Q8_1 quantize + LM Head + argmax
+    gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(model.output_norm.device_data),
+                      x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
     gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
               cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
 

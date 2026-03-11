@@ -81,6 +81,5 @@ int main(int argc, char** argv) {
     printf("\n%s\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
 
     cudaFree(d_x); cudaFree(d_y_gemv); cudaFree(d_y_gemm); cudaFree(d_temp_w);
-    gwen_cublas_destroy();
     return all_pass ? 0 : 1;
 }
