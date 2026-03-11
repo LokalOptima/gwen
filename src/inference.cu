@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 
 namespace gwen {
 
@@ -1121,6 +1122,8 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
                                            int n_predict, bool greedy, float temperature) {
     std::vector<int> output_tokens;
 
+    auto t_start = std::chrono::high_resolution_clock::now();
+
     // Prefill: process all prompt tokens at once
     if (max_prefill > 0 && (int)prompt_tokens.size() <= max_prefill) {
         int next = forward_prefill(model, prompt_tokens);
@@ -1134,6 +1137,12 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
             }
         }
     }
+
+    GWEN_CHECK_CUDA(cudaDeviceSynchronize());
+    auto t_prefill = std::chrono::high_resolution_clock::now();
+    double ttft_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
+    printf("TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
+           prompt_tokens.size() / (ttft_ms / 1000.0));
 
     // Decode loop
     for (int i = 1; i < n_predict; i++) {
