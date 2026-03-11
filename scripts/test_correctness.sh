@@ -65,7 +65,7 @@ for prompt in "${PROMPTS[@]}"; do
     if [ -x "$LLAMA_GENERATE" ]; then
         # Get llama.cpp tokens
         LLAMA_TOKENS=$(LD_LIBRARY_PATH=./third_party/llama.cpp/build/bin \
-            timeout 30 "$LLAMA_GENERATE" 2>&1 \
+            timeout 30 "$LLAMA_GENERATE" "$prompt" 2>&1 \
             | grep -P '^\s*\[\d+\]' | head -30 | grep -oP 'token=\K[0-9]+' | tr '\n' ' ' || echo "")
 
         # Get GWEN tokens

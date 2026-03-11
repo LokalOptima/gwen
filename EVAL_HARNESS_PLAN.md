@@ -13,8 +13,8 @@ What exists, what's missing, and how to finish it outside the container.
 | `bench.sh` | Working | E2E decode benchmark vs llama.cpp |
 | `test_correctness.sh` | Working | dp4a + GEMM + token match + determinism |
 | `dump_weight_sizes.py` | Working | Exact per-tensor byte sizes from GGUF |
-| `nsys_profile.sh` | Needs host | nsys importer broken in this Docker image |
-| `ncu_profile.sh` | Needs host | Requires `CAP_SYS_ADMIN` or host `NVreg_RestrictProfilingToAdminUsers=0` |
+| `nsys_profile.sh` | Working | Use `--cuda-graph-trace=node` for graph kernel visibility |
+| `ncu_profile.sh` | Working | Use `sudo ncu` with full path, or set modprobe config |
 
 ### C++ test binaries
 
@@ -29,123 +29,67 @@ What exists, what's missing, and how to finish it outside the container.
 
 | File | Status |
 |------|--------|
-| `PERFORMANCE.md` | Complete — theoretical analysis, nsys/ncu methodology, roofline, bottleneck analysis |
+| `PERFORMANCE.md` | Complete — theoretical analysis, nsys/ncu methodology, roofline, bottleneck analysis, profiling cookbook |
 | `blog/07-kernel-fusion-cutlass.md` | Complete — documents the fusion work |
+| `blog/08-profiling-and-kernel-optimization.md` | Complete — ncu/nsys profiling results, argmax+GQA optimization |
 
 ---
 
-## What Needs To Be Done on Host
+## Completed on Host (2026-03-11)
 
-### 1. Fix nsys trace export
+### 1. nsys trace export — DONE
 
-The Docker nsys (2025.4.1) generates `.qdstrm` but can't convert to `.nsys-rep`.
-On host with working nsys:
+Working on host with nsys v2025.5.2. Key discovery: **must use `--cuda-graph-trace=node`**
+to see individual kernels inside graph replays.
 
 ```bash
-# Capture
-nsys profile --trace=cuda --output=profiles/gwen_decode \
+nsys profile --trace=cuda --cuda-graph-trace=node \
+    -o profiles/gwen_decode_v2 \
     ./build/gwen --model Qwen3.5-0.8B-Q4_K_M.gguf \
     --prompt "The meaning of life is" --n-predict 100 --greedy
 
-# Verify .nsys-rep was generated
-ls profiles/gwen_decode.nsys-rep
-
-# Get kernel stats
-nsys stats --report cuda_gpu_kern_sum profiles/gwen_decode.nsys-rep
-nsys stats --report cuda_api_sum profiles/gwen_decode.nsys-rep
+nsys stats --report cuda_gpu_kern_sum profiles/gwen_decode_v2.nsys-rep
 ```
 
-**Key things to check in nsys:**
-1. Count kernel launches per decode step (should be ~250 after fusion)
-2. Inter-kernel gaps in the timeline (visible in nsys-ui)
-3. `cudaGraphLaunch` time per replay
-4. Total CPU API overhead vs GPU kernel time
+**Results:** nsys revealed argmax (139 µs) and GQA attention (276 µs) as hidden bottlenecks,
+leading to the optimizations below.
 
-### 2. Enable ncu profiling
+### 2. ncu profiling — DONE
 
-```bash
-# On host, one-time setup:
-echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee /etc/modprobe.d/nvidia-perf.conf
-sudo modprobe -r nvidia && sudo modprobe nvidia
+Enabled via `sudo /usr/local/cuda-13.1/bin/ncu` (full path needed — sudo doesn't inherit PATH).
+Persistent config written to `/etc/modprobe.d/nvidia-perf.conf` (takes effect after reboot).
 
-# Or for Docker:
-docker run --gpus all --cap-add SYS_ADMIN ...
-```
+For kernel name filtering, use regex: `--kernel-name regex:"kernel_gemv_q4_k_dp4a"`
+(template params in kernel names prevent exact matching).
 
-Then run the ncu script or individual kernels:
+### 3. ncu investigation results
 
-```bash
-# All kernels (one decode step, ~250 launches)
-./scripts/ncu_profile.sh "" all_kernels
+#### A. LM head bandwidth — CONFIRMED 93%
+- `dram__throughput`: 93% of peak
+- 48 registers/thread (slightly above 42 target)
+- Near-optimal, no changes needed
 
-# Just the LM head GEMV (the single most important kernel)
-./scripts/ncu_profile.sh "kernel_gemv_q6_k_dp4a" lm_head
+#### B. Small GEMV diagnosis — ROOT CAUSE FOUND
+- DRAM throughput: 37-55% of peak
+- **Root cause: poor DRAM sector utilization**
+  - `block_q4_k` = 144 bytes (Array-of-Structures format)
+  - Threads access `qs[0]` and `qs[4]` with 16-byte stride within each 144-byte block
+  - Only **9.2 of 32 bytes** per DRAM sector contain useful data
+  - This is a fundamental layout issue, not occupancy or register pressure
+- **Fix: structure-of-arrays weight relayout** — group all `qs` bytes contiguously
+  across blocks so warp threads access consecutive memory
+- Estimated improvement: 37-55% → 70-80% BW → ~0.50ms savings → 700+ tok/s
 
-# DeltaNet recurrence
-./scripts/ncu_profile.sh "kernel_deltanet_decode" deltanet
+#### C. Fused kernels — CONFIRMED BENEFICIAL
+- All fused kernels faster than unfused counterparts
+- Primary benefit: fewer CUDA graph nodes → less dispatch overhead
+- Individual kernel compute time: 1-3 µs (negligible)
 
-# The fused kernels (verify they're efficient)
-./scripts/ncu_profile.sh "kernel_rmsnorm_quantize_q8_1" fused_rmsnorm
-./scripts/ncu_profile.sh "kernel_swiglu_quantize_q8_1" fused_swiglu
-./scripts/ncu_profile.sh "kernel_gated_rmsnorm_quantize_q8_1" fused_gated_rmsnorm
-```
-
-### 3. Specific ncu investigations to run
-
-#### A. Verify LM head bandwidth (should be ~93%)
-
-```bash
-ncu --kernel-name "kernel_gemv_q6_k_dp4a" --set full \
-    --launch-skip 300 --launch-count 1 \
-    ./build/gwen --model Qwen3.5-0.8B-Q4_K_M.gguf \
-    --prompt "test" --n-predict 5 --greedy
-```
-
-Check:
-- `dram__bytes_read.sum` should be ~208 MB (LM head weight)
-- `dram__throughput.avg_pct_of_peak_sustained_elapsed` should be >85%
-- `sm__warps_active.avg_pct_of_peak_sustained_active` (occupancy)
-
-#### B. Diagnose why small GEMVs are slow (37% BW efficiency)
-
-The small per-layer GEMVs (1024→3584, 1024→2048) only achieve 40-55% bandwidth.
-Profile a few:
-
-```bash
-# FFN gate: 1024→3584, Q4_K, NW=2 (64 threads)
-ncu --kernel-name "kernel_gemv_q4_k_dp4a<2>" --set full \
-    --launch-skip 305 --launch-count 1 \
-    ./build/gwen ...
-```
-
-Check:
-- `smsp__warps_issue_stalled_long_scoreboard.avg` — if high, memory latency limited
-- `launch__registers_per_thread` — if >42, reduced occupancy
-- `sm__warps_active.avg_pct_of_peak_sustained_active` — target >50%
-- `dram__bytes_read.sum` vs expected (are we over-reading?)
-
-#### C. Profile the fused kernels
-
-```bash
-# Fused RMSNorm+Q8_1 — should be faster than the 2-kernel version
-ncu --kernel-name "kernel_rmsnorm_quantize_q8_1" --set full ...
-```
-
-Check:
-- Is it actually faster? Compare `gpu__time_duration` vs sum of old unfused kernels
-- Is shared memory usage reasonable?
-- Any unexpected DRAM traffic?
-
-#### D. DeltaNet recurrence — compute vs memory
-
-```bash
-ncu --kernel-name "kernel_deltanet_decode" --set full ...
-```
-
-Check:
-- `sm__throughput` vs `dram__throughput` — which is the bottleneck?
-- State matrix [128,128] FP32 = 64 KB per head — fits in L1?
-- `l1tex__throughput` — are we making good use of L1?
+#### D. DeltaNet recurrence — LATENCY-BOUND
+- Only 16 thread blocks for 70 SMs (0.23 waves — very poor SM utilization)
+- State matrix [128×128] FP32 = 64 KB per head fits well in L1
+- Not bandwidth-bound, not compute-bound — **latency-bound by sequential structure**
+- Only fix: chunkwise recurrence for prefill (doesn't help decode)
 
 ### 4. Build a proper micro-benchmark suite
 
@@ -213,14 +157,15 @@ All benchmark scripts should warn (not fail) if clocks aren't locked.
 
 ---
 
-## Priority Order
+## Priority Order (Updated)
 
-1. **Enable ncu on host** — this is the single most important thing for understanding
-   why small GEMVs are at 37% BW. It tells us exactly what's wrong.
-2. **Fix nsys** — needed for launch overhead analysis and graph replay profiling
-3. **Run ncu investigation B** (small GEMV analysis) — this drives the next optimization
-4. **Build micro-benchmark suite** — makes regression testing reliable
-5. **Set up regression baseline** — prevents performance regressions
+1. ~~Enable ncu on host~~ — DONE
+2. ~~Fix nsys~~ — DONE (use `--cuda-graph-trace=node`)
+3. ~~Run ncu investigations~~ — DONE (all 4 completed, root cause found for GEMV)
+4. **GEMV weight relayout (SoA)** — the #1 remaining optimization, root cause confirmed by ncu
+5. **Build micro-benchmark suite** — isolate kernels outside CUDA graph for clean measurement
+6. **Set up regression baseline** — baseline: 599 tok/s, 1.41ms forward
+7. **Persistent kernel** — if graph overhead (0.26ms) stays significant after other optimizations
 
 ---
 
@@ -247,5 +192,5 @@ Model: Qwen3.5-0.8B-Q4_K_M
 Theoretical decode limits:
   Weights-only:       0.582 ms → 1718 tok/s
   All-traffic:        0.627 ms → 1594 tok/s
-  Current GWEN:       1.70 ms  →  587 tok/s (forward), 493 tok/s (e2e)
+  Current GWEN:       1.41 ms  →  709 tok/s (forward), 599 tok/s (e2e)
 ```

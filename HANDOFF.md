@@ -7,83 +7,81 @@ Context for the continuation agent starting outside the Docker sandbox.
 ## Current State (2026-03-11)
 
 ### Performance
-- **493 tok/s** end-to-end decode (100 tokens), **+10.6% vs llama.cpp** (446 tok/s)
+- **599 tok/s** end-to-end decode (100 tokens), **+34.3% vs llama.cpp** (446 tok/s)
 - **30/30 exact greedy token match** vs llama.cpp across all test prompts
-- Forward pass: **1.70ms** (588 tok/s pure), CUDA graph overhead ~0.33ms
+- Forward pass: **1.41ms** (709 tok/s pure), CUDA graph overhead ~0.26ms
 - All correctness tests passing (dp4a, CUTLASS GEMM, token match, determinism)
 
 ### What Was Just Completed (this session)
-1. **4 kernel fusions** cutting ~120 kernel launches per decode step:
-   - GEMV + residual add (4 sites/layer = 96 total)
-   - SwiGLU + Q8_1 quantize (1 site/layer = 24 total)
-   - RMSNorm + Q8_1 quantize (multiple sites)
-   - Gated RMSNorm + Q8_1 quantize (DeltaNet layers)
-2. **CUTLASS GEMM** replacing cuBLAS for prefill (cuBLAS dependency fully removed)
-3. Blog post `blog/07-kernel-fusion-cutlass.md`
-4. Comprehensive docs: `PERFORMANCE.md`, `EVAL_HARNESS_PLAN.md`
-5. Scripts: `scripts/test_correctness.sh`, `scripts/nsys_profile.sh`, `scripts/ncu_profile.sh`, `scripts/dump_weight_sizes.py`
+1. **ncu/nsys profiling** enabled on host — all 4 investigations completed
+2. **Multi-block argmax**: 1-block → 256-block parallel reduction (139 μs → 3.5 μs, 40x)
+3. **Multi-warp GQA attention**: 32-thread → 256-thread (276 μs → 47 μs, 5.9x)
+4. **nsys** working with `--cuda-graph-trace=node` for per-kernel timing in graph replays
+5. Blog post `blog/08-profiling-and-kernel-optimization.md`
+6. Fixed `test_correctness.sh` — llama_generate now receives prompt argument
 
 ### Commits
 ```
 df0b869 Add evaluation harness plan for host-side profiling completion
 9de7824 Add PERFORMANCE.md analysis guide + profiling/testing scripts
 e1e1bb5 Kernel fusion + CUTLASS GEMM: 452 → 493 tok/s (+10.6% vs llama.cpp)
+(pending) Profiling + kernel optimization: 493 → 599 tok/s (+34.3% vs llama.cpp)
 ```
 
 ---
 
-## Immediate TODO (Host-Side, Requires Permissions)
+## Completed TODO Items
 
-### 1. Enable ncu profiling (HIGHEST PRIORITY)
-```bash
-# One-time host setup:
-echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee /etc/modprobe.d/nvidia-perf.conf
-sudo modprobe -r nvidia && sudo modprobe nvidia
-# Or for Docker: --cap-add SYS_ADMIN
-```
+### 1. ncu profiling — DONE
+- Enabled via `sudo ncu` (persistent config written to `/etc/modprobe.d/nvidia-perf.conf`, takes effect after reboot)
+- All 4 investigations completed (see EVAL_HARNESS_PLAN.md for results)
 
-Why: ncu is the ONLY way to understand why small GEMVs are at 37-55% bandwidth efficiency while the LM head achieves 93%. This is the #1 performance gap.
+### 2. nsys trace export — DONE
+- Working on host with nsys v2025.5.2
+- Key flag: `--cuda-graph-trace=node` (without this, graph-replayed kernels are invisible)
+- Profiles saved in `profiles/gwen_decode_v2.nsys-rep`
 
-### 2. Fix nsys trace export
-The Docker nsys (2025.4.1) generates `.qdstrm` but can't convert to `.nsys-rep`. On host with working nsys, capture a clean trace:
-```bash
-nsys profile --trace=cuda --output=profiles/gwen_decode \
-    ./build/gwen --model Qwen3.5-0.8B-Q4_K_M.gguf \
-    --prompt "The meaning of life is" --n-predict 100 --greedy
-```
+### 3. ncu investigations — DONE
+- **3A: LM head** — 93% BW confirmed, 48 regs/thread
+- **3B: Small GEMV** — 37-55% BW due to poor sector utilization (9.2/32 bytes per sector), Q4_K strided access pattern
+- **3C: Fused kernels** — confirmed faster than unfused versions
+- **3D: DeltaNet** — only 16 blocks / 70 SMs, but inherently sequential; L1 utilization good
 
-### 3. Run the ncu investigations
-See `EVAL_HARNESS_PLAN.md` Section 3 for exact commands. Priority order:
-- **3B: Small GEMV diagnosis** — why 37% BW? Check `smsp__warps_issue_stalled_long_scoreboard`, register count, occupancy
-- **3A: LM head verification** — confirm 93% BW claim
-- **3C: Fused kernel check** — verify fusions actually helped
-- **3D: DeltaNet compute vs memory** — is it hitting L1 well?
+## Immediate TODO
+
+### 1. GEMV coalescing optimization (HIGHEST PRIORITY)
+Root cause identified by ncu: `block_q4_k` is 144 bytes, threads access non-contiguous fields with 16-byte stride. Only 9.2 of 32 bytes per DRAM sector are useful.
+Fix: structure-of-arrays weight relayout. Estimated gain: small GEMVs from 37-55% to 70-80% BW → forward under 1.0 ms → 700+ tok/s.
+
+### 2. Build micro-benchmark suite
+See EVAL_HARNESS_PLAN.md §4. Isolate individual kernels outside CUDA graph for clean measurement.
+
+### 3. Automated regression testing
+See EVAL_HARNESS_PLAN.md §5. Baseline: 599 tok/s, 1.41ms forward.
 
 ---
 
 ## Key Open Questions
 
-### Q1: Why are small GEMVs at 37-55% bandwidth?
-The per-layer GEMVs (1024→3584, 1024→2048) only achieve 40-55% of peak BW.
-Hypotheses (ncu will tell us which):
-1. **Insufficient memory requests**: Too few warps to saturate GDDR7 bus (256-bit)
-2. **Register pressure**: >42 regs/thread → reduced occupancy → fewer in-flight requests
-3. **Block size mismatch**: NW=2 (64 threads) may not be enough for small matrices
-4. **L2 cache thrashing**: Multiple small GEMVs contending for cache
-5. **DRAM bank conflicts**: Q4_K interleaved layout causing non-coalesced access
-
-Action: Run ncu on `kernel_gemv_q4_k_dp4a<2>` for a 3584×1024 matrix and check the stall breakdown.
+### Q1: Why are small GEMVs at 37-55% bandwidth? — ANSWERED
+The per-layer GEMVs (1024→3584, 1024→2048) achieve 40-55% of peak BW.
+**Root cause (confirmed by ncu)**: Poor DRAM sector utilization.
+- `block_q4_k` = 144 bytes (AoS format). Threads in a warp each access a different block.
+- Access pattern: `qs[0]` and `qs[4]` with 16-byte stride within each 144-byte block.
+- Only **9.2 of 32 bytes** per DRAM sector are useful data.
+- Hypothesis #5 (non-coalesced access) was correct.
+- Fix: structure-of-arrays weight relayout to group all `qs` contiguously.
 
 ### Q2: Is there room for a multi-row GEMV?
 For small matrices, processing 2+ output rows per block increases arithmetic intensity and might fill the memory pipeline better. But it also increases shared memory usage. Worth prototyping if ncu confirms hypothesis #1.
 
 ### Q3: Persistent kernels — worth the rewrite?
 Current overhead breakdown:
-- Forward kernels: 1.70ms
-- CUDA graph replay + sync: ~0.33ms (16% overhead!)
+- Forward kernels: 1.41ms
+- CUDA graph replay + sync: ~0.26ms (16% overhead)
 - A single persistent kernel that runs the entire decode step would eliminate graph overhead
 - But it's a MAJOR rewrite (manual scheduling, barrier synchronization across SMs)
-- Potential gain: 493 → ~570 tok/s if forward stays at 1.70ms
+- Potential gain: 599 → ~700 tok/s if forward stays at 1.41ms
 
 ### Q4: Prefill CUTLASS — fused dequant+GEMM?
 Current prefill pipeline: dequant Q4_K→FP16 temp buffer → CUTLASS GEMM on FP16.
@@ -112,15 +110,15 @@ Theoretical minimum forward pass:
   All-traffic:  562.2 MB / 896 GB/s = 0.627 ms → 1594 tok/s
 
 Current:
-  Forward:      1.70 ms → 588 tok/s (36.9% of theoretical)
-  E2E decode:   2.03 ms → 493 tok/s (30.9% of theoretical)
+  Forward:      1.41 ms → 709 tok/s (44.5% of theoretical)
+  E2E decode:   1.67 ms → 599 tok/s (37.6% of theoretical)
 
-Gap breakdown (1.70ms vs 0.627ms theoretical = 1.073ms gap):
+Gap breakdown (1.41ms vs 0.627ms theoretical = 0.783ms gap):
   Small GEMV inefficiency:    ~0.50ms (at 37-55% BW vs 100%)
   LM head overhead:           ~0.02ms (already at 93%)
   DeltaNet:                   ~0.15ms (sequential recurrence)
-  Kernel launch/scheduling:   ~0.10ms (even with graph)
-  Other (norms, acts, quant): ~0.25ms (reduced by fusions)
+  GQA attention:              ~0.05ms (optimized from 0.28ms)
+  Other (norms, acts, quant): ~0.03ms (reduced by fusions + argmax fix)
 ```
 
 ---
@@ -137,6 +135,12 @@ Gap breakdown (1.70ms vs 0.627ms theoretical = 1.073ms gap):
 | `scripts/ncu_profile.sh` | ncu capture + per-kernel analysis |
 | `scripts/dump_weight_sizes.py` | Exact GGUF tensor byte sizes |
 | `blog/07-kernel-fusion-cutlass.md` | Documents the fusion + CUTLASS work |
+| `blog/08-profiling-and-kernel-optimization.md` | ncu/nsys profiling + argmax/GQA optimization |
+| `profiles/gwen_decode_v2.nsys-rep` | nsys trace with node-level CUDA graph tracing |
+| `profiles/gemv_q4k.raw.txt` | ncu full profile of Q4_K GEMV |
+| `profiles/lm_head.raw.txt` | ncu full profile of Q6_K LM head GEMV |
+| `profiles/deltanet.raw.txt` | ncu full profile of DeltaNet kernel |
+| `profiles/fused_kernels.raw.txt` | ncu full profile of fused kernels |
 | `src/kernels/gemv.cu` | dp4a GEMV (perf-critical, fused residual add) |
 | `src/kernels/activation.cu` | SwiGLU + fused SwiGLU+Q8_1 |
 | `src/kernels/rmsnorm.cu` | RMSNorm + fused RMSNorm+Q8_1 |
@@ -147,10 +151,8 @@ Gap breakdown (1.70ms vs 0.627ms theoretical = 1.073ms gap):
 
 ## Suggested Next Steps (Priority Order)
 
-1. **Enable ncu, profile small GEMVs** → understand the 37% BW problem
-2. **Enable nsys, verify kernel launch counts** → confirm fusions reduced launches
-3. **Based on ncu findings**: prototype fix (likely multi-row GEMV or occupancy tuning)
-4. **Build micro-benchmark suite** (see EVAL_HARNESS_PLAN.md §4)
-5. **Set up regression baseline** (see EVAL_HARNESS_PLAN.md §5)
-6. **Consider persistent kernel** if graph overhead stays at 0.33ms
-7. **Blog post #8** documenting profiling results and next optimization
+1. **GEMV weight relayout (SoA)** → fix the 37-55% BW coalescing problem → estimated 700+ tok/s
+2. **Build micro-benchmark suite** (see EVAL_HARNESS_PLAN.md §4)
+3. **Set up regression baseline** (see EVAL_HARNESS_PLAN.md §5) — baseline: 599 tok/s
+4. **Consider persistent kernel** if graph overhead stays at 0.26ms
+5. **DeltaNet chunkwise prefill** for faster TTFT

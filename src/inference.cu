@@ -300,11 +300,11 @@ kernel_compute_gate_beta(
 }
 
 // ============================================================
-// GQA attention decode kernel
+// GQA attention decode kernel (multi-warp)
 // ============================================================
-// For each query head, compute attention over the KV cache
-// Output [n_head, head_dim]
-__global__ void __launch_bounds__(32)
+// 8 warps (256 threads) per query head for better SM utilization
+// Warps split scoring across seq_len; all threads cover head_dim for value accumulation
+__global__ void __launch_bounds__(256)
 kernel_gqa_attention_decode(
     const half* __restrict__ q,        // [n_head, head_dim]
     const half* __restrict__ k_cache,  // [max_seq, n_kv_heads, head_dim]
@@ -316,16 +316,21 @@ kernel_gqa_attention_decode(
 {
     int qh = blockIdx.x;
     if (qh >= n_head) return;
-    int lane = threadIdx.x;
+
+    constexpr int N_WARPS = 8;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
 
     int seq_len = *d_pos + 1;
     int kv_head = qh / (n_head / n_kv_heads);
 
     const half* q_head = q + qh * head_dim;
-    float* scores = scores_buf + qh * max_seq;  // fixed stride
+    float* scores = scores_buf + qh * max_seq;
 
-    // Step 1: Compute attention scores: score[t] = q @ k_cache[t] * scale
-    for (int t = 0; t < seq_len; t++) {
+    // Step 1: Compute attention scores — warps split across time steps
+    // Each warp handles t = warp_id, warp_id+N_WARPS, warp_id+2*N_WARPS, ...
+    for (int t = warp_id; t < seq_len; t += N_WARPS) {
         const half* k_t = k_cache + (size_t)t * n_kv_heads * head_dim + kv_head * head_dim;
 
         float dot = 0.0f;
@@ -340,33 +345,55 @@ kernel_gqa_attention_decode(
     }
     __syncthreads();
 
-    // Step 2: Softmax over scores
+    // Step 2: Softmax — all 256 threads cooperate
     float max_val = -FLT_MAX;
-    for (int t = lane; t < seq_len; t += 32) {
+    for (int t = tid; t < seq_len; t += blockDim.x) {
         max_val = fmaxf(max_val, scores[t]);
     }
+    // Warp-level reduction
     for (int offset = 16; offset > 0; offset >>= 1) {
         max_val = fmaxf(max_val, __shfl_xor_sync(0xFFFFFFFF, max_val, offset));
     }
+    // Cross-warp reduction via shared memory (no cross-warp shuffles)
+    __shared__ float s_reduce[N_WARPS];
+    if (lane == 0) s_reduce[warp_id] = max_val;
+    __syncthreads();
+    if (tid == 0) {
+        float m = s_reduce[0];
+        for (int i = 1; i < N_WARPS; i++) m = fmaxf(m, s_reduce[i]);
+        s_reduce[0] = m;
+    }
+    __syncthreads();
+    max_val = s_reduce[0];
 
     float sum_exp = 0.0f;
-    for (int t = lane; t < seq_len; t += 32) {
-        scores[t] = expf(scores[t] - max_val);
-        sum_exp += scores[t];
+    for (int t = tid; t < seq_len; t += blockDim.x) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        sum_exp += e;
     }
+    // Warp-level sum
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum_exp += __shfl_xor_sync(0xFFFFFFFF, sum_exp, offset);
     }
+    if (lane == 0) s_reduce[warp_id] = sum_exp;
+    __syncthreads();
+    if (tid == 0) {
+        float s = s_reduce[0];
+        for (int i = 1; i < N_WARPS; i++) s += s_reduce[i];
+        s_reduce[0] = s;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / s_reduce[0];
 
-    float inv_sum = 1.0f / sum_exp;
-    for (int t = lane; t < seq_len; t += 32) {
+    for (int t = tid; t < seq_len; t += blockDim.x) {
         scores[t] *= inv_sum;
     }
     __syncthreads();
 
-    // Step 3: Weighted sum of values
+    // Step 3: Weighted sum of values — 256 threads directly cover head_dim=256
     half* out_head = output + qh * head_dim;
-    for (int d = lane; d < head_dim; d += 32) {
+    for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t < seq_len; t++) {
             const half* v_t = v_cache + (size_t)t * n_kv_heads * head_dim + kv_head * head_dim;
@@ -377,20 +404,31 @@ kernel_gqa_attention_decode(
 }
 
 // ============================================================
-// Argmax kernel for greedy decoding
+// Argmax kernels for greedy decoding (multi-block)
 // ============================================================
+// Phase 1: Each block finds max in its range, writes to scratch
+constexpr int ARGMAX_BLOCKS = 256;
+
 __global__ void __launch_bounds__(256)
-kernel_argmax(const float* __restrict__ logits, int* __restrict__ result, int n) {
+kernel_argmax_partial(const float* __restrict__ logits,
+                      float* __restrict__ partial_max,
+                      int* __restrict__ partial_idx,
+                      int n) {
     __shared__ float s_max[256];
     __shared__ int s_idx[256];
 
+    int bid = blockIdx.x;
     int tid = threadIdx.x;
+    int global_tid = bid * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+
     float local_max = -FLT_MAX;
     int local_idx = 0;
 
-    for (int i = tid; i < n; i += blockDim.x) {
-        if (logits[i] > local_max) {
-            local_max = logits[i];
+    for (int i = global_tid; i < n; i += stride) {
+        float v = logits[i];
+        if (v > local_max) {
+            local_max = v;
             local_idx = i;
         }
     }
@@ -399,7 +437,42 @@ kernel_argmax(const float* __restrict__ logits, int* __restrict__ result, int n)
     s_idx[tid] = local_idx;
     __syncthreads();
 
-    // Reduction
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s && s_max[tid + s] > s_max[tid]) {
+            s_max[tid] = s_max[tid + s];
+            s_idx[tid] = s_idx[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_max[bid] = s_max[0];
+        partial_idx[bid] = s_idx[0];
+    }
+}
+
+// Phase 2: Reduce partial results (ARGMAX_BLOCKS entries)
+__global__ void __launch_bounds__(256)
+kernel_argmax_reduce(const float* __restrict__ partial_max,
+                     const int* __restrict__ partial_idx,
+                     int* __restrict__ result,
+                     int n_partials) {
+    __shared__ float s_max[256];
+    __shared__ int s_idx[256];
+
+    int tid = threadIdx.x;
+    float local_max = -FLT_MAX;
+    int local_idx = 0;
+
+    if (tid < n_partials) {
+        local_max = partial_max[tid];
+        local_idx = partial_idx[tid];
+    }
+
+    s_max[tid] = local_max;
+    s_idx[tid] = local_idx;
+    __syncthreads();
+
     for (int s = 128; s > 0; s >>= 1) {
         if (tid < s && s_max[tid + s] > s_max[tid]) {
             s_max[tid] = s_max[tid + s];
@@ -513,6 +586,8 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
 
     // Pre-allocated argmax result and graph-compatible device scalars
     d_argmax_token = static_cast<int*>(a(sizeof(int)));
+    argmax_partial_max = static_cast<float*>(a(ARGMAX_BLOCKS * sizeof(float)));
+    argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
     // d_token_id and d_pos are adjacent so we can copy both in one call
     d_token_id = static_cast<int*>(a(2 * sizeof(int)));
     d_pos = d_token_id + 1;
@@ -716,7 +791,7 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             }
 
             float scale = 1.0f / sqrtf((float)cfg.head_dim);
-            kernel_gqa_attention_decode<<<cfg.n_head, 32, 0, s>>>(
+            kernel_gqa_attention_decode<<<cfg.n_head, 256, 0, s>>>(
                 fa_q, cache.k_cache, cache.v_cache,
                 attn_out, attn_scores, d_pos,
                 cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
@@ -754,7 +829,8 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
 
-    kernel_argmax<<<1, 256, 0, s>>>(logits_f, d_argmax_token, cfg.n_vocab);
+    kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
+    kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
 }
 
 // ============================================================
@@ -1113,7 +1189,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     cache.k_cache, cache.v_cache, fa_k, fa_v, d_pos, kv_dim);
 
                 float scale = 1.0f / sqrtf((float)cfg.head_dim);
-                kernel_gqa_attention_decode<<<cfg.n_head, 32, 0, s>>>(
+                kernel_gqa_attention_decode<<<cfg.n_head, 256, 0, s>>>(
                     fa_q, cache.k_cache, cache.v_cache,
                     attn_out, attn_scores, d_pos,
                     cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
@@ -1182,7 +1258,8 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
-    kernel_argmax<<<1, 256, 0, s>>>(logits_f, d_argmax_token, cfg.n_vocab);
+    kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
+    kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
 
     GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
     int next_token;

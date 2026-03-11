@@ -235,10 +235,21 @@ nsys stats --report cuda_mem_size_sum profiles/my_trace.nsys-rep
 ### Interpreting CUDA graph traces
 
 With CUDA graphs, nsys shows the graph capture as individual kernels, then each
-`cudaGraphLaunch` as a single event. To see per-kernel breakdown inside the graph,
-either:
-- Profile without the graph (modify code to call `forward_body` directly)
-- Use ncu which can profile inside graph replays
+`cudaGraphLaunch` as a single event. To see per-kernel breakdown inside the graph:
+
+**Use `--cuda-graph-trace=node`** — this is critical! Without it, graph-replayed
+kernels are invisible and you only see prefill/capture kernels.
+
+```bash
+nsys profile --trace=cuda --cuda-graph-trace=node \
+    -o profiles/gwen_decode \
+    ./build/gwen --model Qwen3.5-0.8B-Q4_K_M.gguf \
+    --prompt "The meaning of life is" --n-predict 100 --greedy
+```
+
+This flag makes nsys decompose each `cudaGraphLaunch` into its constituent kernel
+nodes, giving you per-kernel timing for every decode step — exactly what you need
+to find bottlenecks in the graph replay path.
 
 ---
 
@@ -276,11 +287,15 @@ Without these, ncu will report `ERR_NVGPUCTRPERM`.
 Or manually:
 
 ```bash
-ncu --set full \
+sudo /usr/local/cuda-13.1/bin/ncu --set full \
     --launch-skip 15 --launch-count 50 \
     --csv --log-file profiles/kernel.csv \
     ./build/gwen --model Qwen3.5-0.8B-Q4_K_M.gguf \
     --prompt "test" --n-predict 5 --greedy
+
+# NOTE: Use full path with sudo since PATH is not inherited.
+# To filter by kernel name, use regex: --kernel-name regex:"kernel_gemv_q4_k"
+# Template params in kernel names require regex matching.
 ```
 
 ### Key metrics and what they mean
@@ -533,56 +548,147 @@ FFN gate GEMM, seq=512: M=3584, N=512, K=1024
 
 ## 10. Current Status & Bottleneck Analysis
 
-*As of 2026-03-11. Re-run after any change.*
+*Updated 2026-03-11 (post-profiling optimization). Re-run after any change.*
 
 ### Measured performance
 
 ```
-Forward pass:  1.70 ms (587 tok/s pure)
-Decode e2e:    2.03 ms (493 tok/s)  [includes CUDA graph overhead]
+Forward pass:  1.41 ms (709 tok/s pure)
+Decode e2e:    1.67 ms (599 tok/s)  [includes CUDA graph overhead]
 ```
 
 ### Where does the time go?
 
 | Component | Measured | Theoretical | Efficiency | % of Forward |
 |-----------|---------|-------------|-----------|-------------|
-| LM head GEMV | 250 µs | 233 µs | 93.2% | 14.7% |
-| 24-layer GEMVs | 928 µs | 347 µs | 37.4% | 54.5% |
-| DeltaNet recurrence (×18) | 148 µs | N/A (compute) | — | 8.7% |
-| All other (norms, acts, etc.) | 376 µs | ~5 µs (BW) | — | 22.1% |
-| **Total forward** | **1702 µs** | **627 µs** | **36.8%** | 100% |
-| CUDA graph overhead | ~330 µs | 0 | — | (extra) |
+| LM head GEMV | 250 µs | 233 µs | 93.2% | 17.7% |
+| 24-layer GEMVs | 928 µs | 347 µs | 37.4% | 65.8% |
+| DeltaNet recurrence (×18) | 148 µs | N/A (compute) | — | 10.5% |
+| GQA attention (×6) | 47 µs | N/A | — | 3.3% |
+| Argmax | 3.5 µs | N/A | — | 0.2% |
+| All other (norms, acts, etc.) | 34 µs | ~5 µs (BW) | — | 2.4% |
+| **Total forward** | **1410 µs** | **627 µs** | **44.5%** | 100% |
+| CUDA graph overhead | ~260 µs | 0 | — | (extra) |
 
-### Gap analysis: where is the 63% lost bandwidth?
+### ncu profiling results (measured)
 
-1. **Kernel launch overhead (~330 µs graph replay)**: ~250 kernel nodes in the CUDA graph.
-   Each node has ~1-2 µs dispatch cost even inside a graph.
+#### Q4_K GEMV (small per-layer, e.g. FFN gate 3584×1024)
+- DRAM throughput: 37-55% of peak
+- Root cause: **poor sector utilization** — `block_q4_k` is 144 bytes (AoS).
+  Threads access `qs[0]`, `qs[4]` with 16-byte stride within each block.
+  Only **9.2 of 32 bytes** per DRAM sector are useful data.
+- Register count: varies by template param (NW=2: ~40 regs, NW=4: ~48 regs)
+- Occupancy: adequate but not the bottleneck
 
-2. **Small GEMV under-utilization (~580 µs wasted in layer GEMVs)**:
-   The 24-layer GEMVs achieve only 37% BW efficiency. The LM head (93%) proves
-   the hardware can deliver. The small GEMVs (1024→2048, 1024→3584) don't generate
-   enough memory requests to saturate the bus — too few rows, too few thread blocks.
+#### Q6_K GEMV (LM head 248320×1024)
+- DRAM throughput: **93%** of peak — confirmed by ncu
+- 48 registers/thread (slightly above 42 target, but irrelevant at this BW)
+- Near-optimal; no further optimization needed
 
-3. **Non-GEMV overhead (~370 µs)**:
-   ~250 small kernel launches for norms, activations, quantize, DeltaNet.
-   Each is a few microseconds of useful work + ~1-2 µs launch overhead.
-   This is irreducible with current architecture (separate kernels).
+#### Fused kernels (RMSNorm+Q8_1, SwiGLU+Q8_1, GatedRMSNorm+Q8_1)
+- All confirmed faster than unfused counterparts
+- Primary benefit: launch overhead reduction (fewer CUDA graph nodes)
+- Compute time is negligible (1-3 µs each)
+
+#### DeltaNet recurrence
+- Only 16 thread blocks for 70 SMs (0.23 waves)
+- Inherently sequential — each head computes S = S + beta*k⊗v - alpha*S
+- State matrix [128×128] FP32 = 64 KB per head — fits well in L1 cache
+- Not bandwidth-bound, not compute-bound — latency-bound by sequential structure
+
+### Recent optimizations (this session)
+
+| Optimization | Before | After | Speedup |
+|-------------|--------|-------|---------|
+| Multi-block argmax (1→256 blocks) | 139 µs | 3.5 µs | 40x |
+| Multi-warp GQA attention (32→256 threads) | 276 µs | 47 µs | 5.9x |
+| Total forward | 1700 µs | 1410 µs | 1.21x |
+| E2E decode | 493 tok/s | 599 tok/s | +21.5% |
+
+### Gap analysis: where is the 55% lost bandwidth?
+
+1. **Small GEMV coalescing (~580 µs wasted in layer GEMVs)**:
+   The 24-layer GEMVs achieve only 37-55% BW efficiency. Root cause confirmed by
+   ncu: Q4_K AoS layout causes scattered DRAM sector access (9.2/32 bytes useful).
+   Fix: structure-of-arrays weight relayout.
+
+2. **CUDA graph overhead (~260 µs)**: ~250 kernel nodes in the CUDA graph.
+   Each node has ~1 µs dispatch cost even inside a graph.
+
+3. **DeltaNet sequential recurrence (~148 µs)**: Inherently serial.
+   Chunkwise recurrence during prefill would help TTFT but not decode.
 
 ### What would help (ordered by expected impact)
 
 | Optimization | Expected gain | Difficulty |
 |-------------|--------------|-----------|
-| Persistent decode kernel (eliminate graph overhead) | 0.33 ms → ~0 | Very high |
-| Multi-row GEMV for small matrices | 0.93ms → ~0.7ms | Medium |
-| Fuse remaining small kernels | 0.37ms → ~0.30ms | Medium |
-| Better memory access patterns in small GEMVs | Hard to quantify | High |
+| SoA weight relayout for small GEMVs | 1.41ms → ~1.0ms (→ ~700 tok/s) | High |
+| Persistent decode kernel (eliminate graph overhead) | 1.67ms → ~1.41ms (→ ~710 tok/s) | Very high |
+| Both combined | → ~0.85ms (→ ~850 tok/s) | Very high |
 
 ### Theoretical limits
 
 | Scenario | Time | Tok/s | How |
 |----------|------|-------|-----|
-| Current GWEN | 2.03 ms | 493 | Measured |
-| Perfect CUDA graph (0 overhead) | 1.70 ms | 588 | Measured forward pass |
+| Current GWEN | 1.67 ms | 599 | Measured |
+| Perfect CUDA graph (0 overhead) | 1.41 ms | 709 | Measured forward pass |
 | Perfect BW (all kernels at 93%) | 0.67 ms | 1493 | Scale by LM head efficiency |
 | Theoretical max (weights only) | 0.58 ms | 1718 | 521 MB / 896 GB/s |
 | Theoretical max (all traffic) | 0.63 ms | 1594 | 562 MB / 896 GB/s |
+
+---
+
+## 11. Profiling Cookbook
+
+*Practical recipes for common profiling tasks, based on lessons learned.*
+
+### Recipe 1: Profile decode kernels inside CUDA graph
+```bash
+# CRITICAL: use --cuda-graph-trace=node to see individual kernels
+nsys profile --trace=cuda --cuda-graph-trace=node \
+    -o profiles/decode_trace \
+    ./build/gwen --model Qwen3.5-0.8B-Q4_K_M.gguf \
+    --prompt "The meaning of life is" --n-predict 100 --greedy
+
+# Then get per-kernel timing:
+nsys stats --report cuda_gpu_kern_sum profiles/decode_trace.nsys-rep
+```
+
+### Recipe 2: Profile a specific kernel with ncu
+```bash
+# Use regex: for template kernels, plain --kernel-name won't match
+sudo /usr/local/cuda-13.1/bin/ncu \
+    --kernel-name regex:"kernel_gemv_q4_k_dp4a" \
+    --set full \
+    --launch-skip 15 --launch-count 10 \
+    ./build/gwen --model Qwen3.5-0.8B-Q4_K_M.gguf \
+    --prompt "test" --n-predict 5 --greedy
+
+# Key metrics to check:
+#   dram__throughput.avg_pct_of_peak_sustained_elapsed → BW efficiency
+#   launch__registers_per_thread → register pressure
+#   sm__warps_active.avg_pct_of_peak_sustained_active → occupancy
+#   smsp__warps_issue_stalled_long_scoreboard → memory latency stalls
+```
+
+### Recipe 3: Verify kernel changes didn't regress performance
+```bash
+# Before change: capture baseline
+./scripts/bench.sh 100 > baseline.txt
+
+# After change: compare
+./scripts/bench.sh 100 > after.txt
+diff baseline.txt after.txt
+
+# Also verify correctness
+./scripts/test_correctness.sh
+```
+
+### Recipe 4: Check sector utilization (memory coalescing)
+```bash
+# In ncu output, look for:
+#   l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum → sectors requested
+#   l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum → bytes requested
+# Divide: bytes_per_sector = bytes / sectors
+# Ideal: 32 bytes/sector. Less = uncoalesced access.
+```

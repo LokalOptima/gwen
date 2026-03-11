@@ -12,3 +12,4 @@ A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inferenc
 5. [Final Results and Lessons Learned](05-final-results.md) — Complete benchmarks vs llama.cpp at 252 tok/s, retrospective
 6. [Beating llama.cpp](06-beating-llama-cpp.md) — dp4a GEMV, DeltaNet fusion, 252 → 452 tok/s (+79%), surpassing llama.cpp by 4%
 7. [Kernel Fusion + CUTLASS](07-kernel-fusion-cutlass.md) — Fused GEMV+residual, SwiGLU+Q8_1, RMSNorm+Q8_1, dropped cuBLAS for CUTLASS, 452 → 493 tok/s (+10.6% vs llama.cpp)
+8. [Profiling and Kernel Optimization](08-profiling-and-kernel-optimization.md) — ncu/nsys profiling, multi-block argmax (40x), multi-warp GQA (5.9x), 493 → 599 tok/s (+34.3% vs llama.cpp)
