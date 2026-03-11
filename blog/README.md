@@ -14,3 +14,4 @@ A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inferenc
 7. [Kernel Fusion + CUTLASS](07-kernel-fusion-cutlass.md) — Fused GEMV+residual, SwiGLU+Q8_1, RMSNorm+Q8_1, dropped cuBLAS for CUTLASS, 452 → 493 tok/s (+10.6% vs llama.cpp)
 8. [Profiling and Kernel Optimization](08-profiling-and-kernel-optimization.md) — ncu/nsys profiling, multi-block argmax (40x), multi-warp GQA (5.9x), 493 → 599 tok/s (+34.3% vs llama.cpp)
 9. [MTP Speculative Decoding](09-mtp-speculative-decoding.md) — Qwen3.5's built-in MTP draft head, Gemma-style RMSNorm bug, Q8_0 quantization, sequential verify bottleneck analysis
+10. [Token Frequency Distribution](10-token-frequency-distribution.md) — 1.6B-token frequency analysis of Qwen3.5's 248K vocabulary, Zipf's law, optimization opportunities
