@@ -25,7 +25,7 @@ Context for the continuation agent starting outside the Docker sandbox.
 df0b869 Add evaluation harness plan for host-side profiling completion
 9de7824 Add PERFORMANCE.md analysis guide + profiling/testing scripts
 e1e1bb5 Kernel fusion + CUTLASS GEMM: 452 → 493 tok/s (+10.6% vs llama.cpp)
-(pending) Profiling + kernel optimization: 493 → 599 tok/s (+34.3% vs llama.cpp)
+3229b4f Profiling + kernel optimization: 493 → 599 tok/s (+34.3% vs llama.cpp)
 ```
 
 ---
@@ -156,3 +156,153 @@ Gap breakdown (1.41ms vs 0.627ms theoretical = 0.783ms gap):
 3. **Set up regression baseline** (see EVAL_HARNESS_PLAN.md §5) — baseline: 599 tok/s
 4. **Consider persistent kernel** if graph overhead stays at 0.26ms
 5. **DeltaNet chunkwise prefill** for faster TTFT
+
+---
+
+## Methodology Guide: Porting Models to Custom CUDA
+
+This section captures the methodology and lessons learned from the GWEN project for future agents tackling similar model-to-CUDA porting tasks.
+
+### Phase 1: Foundation — Get Correct Output First
+
+**Start with a reference implementation.** Before writing any CUDA:
+1. Find a working implementation (llama.cpp, HuggingFace Transformers, vLLM, etc.)
+2. Extract exact tensor shapes, types, and computation graph from the reference
+3. Build a comparison harness that can diff outputs token-by-token
+
+**Key principle: correctness before performance.** Every kernel must be verified against the reference before optimizing. We use:
+- Greedy token match (30 tokens, multiple prompts) — exact match required
+- Logit-level comparison when debugging divergence
+- Determinism check (bitwise identical across runs for greedy decode)
+
+**GGUF format notes:**
+- Magic bytes: `0x46554747` (not `0x46475547`)
+- Use `gguf` Python package for parsing metadata and tensor layouts
+- Run `scripts/dump_gguf.py` to enumerate all tensors with shapes and quant types
+- Pay attention to quant type per tensor — not all tensors use the same type
+
+### Phase 2: Kernel Implementation Order
+
+Implement in dependency order, testing each kernel before moving to the next:
+
+1. **Weight loading + dequantization** — parse GGUF, handle Q4_K/Q5_K/Q6_K/Q8_0/F32
+2. **Embedding lookup** — trivial but needed for first token
+3. **RMSNorm** — simple, tests your basic CUDA setup
+4. **GEMV (matrix-vector multiply)** — the performance-critical kernel for decode
+5. **Activation functions** (SiLU/SwiGLU) — element-wise, easy
+6. **Attention mechanism** — GQA, RoPE, KV cache management
+7. **Model-specific layers** — DeltaNet recurrence, mixture of experts, etc.
+8. **Full forward pass** — wire everything together
+9. **Argmax/sampling** — greedy or temperature sampling
+
+### Phase 3: Performance Optimization Loop
+
+The optimization loop is: **measure → identify bottleneck → fix → verify correctness → repeat.**
+
+#### Step 1: Establish baseline
+```bash
+# Lock GPU clocks for reproducible measurement
+sudo nvidia-smi -lgc <max_clock>,<max_clock>
+
+# Run benchmark (multiple times, report mean/min/max)
+./scripts/bench.sh 100
+```
+
+#### Step 2: Profile with nsys (timeline view)
+```bash
+# CRITICAL: use --cuda-graph-trace=node if using CUDA graphs
+nsys profile --trace=cuda --cuda-graph-trace=node \
+    -o profiles/trace ./build/engine --model model.gguf \
+    --prompt "test" --n-predict 100 --greedy
+
+# Get per-kernel timing summary
+nsys stats --report cuda_gpu_kern_sum profiles/trace.nsys-rep
+```
+
+nsys tells you **where time is spent** but not **why**. Use it to identify which kernels dominate, then investigate those with ncu.
+
+#### Step 3: Profile with ncu (per-kernel deep dive)
+```bash
+# Must use sudo (or set NVreg_RestrictProfilingToAdminUsers=0)
+# Must use full path with sudo (PATH not inherited)
+# Must use regex for template kernel names
+sudo /usr/local/cuda-13.1/bin/ncu \
+    --kernel-name regex:"kernel_name_pattern" \
+    --set full \
+    --launch-skip 15 --launch-count 10 \
+    ./build/engine ...
+```
+
+**Key ncu metrics for bandwidth-bound kernels:**
+| Metric | What it means | Target |
+|--------|--------------|--------|
+| `dram__throughput.avg_pct_of_peak_sustained_elapsed` | % of peak DRAM BW | >70% for GEMV |
+| `launch__registers_per_thread` | Register usage | <42 for full occupancy |
+| `sm__warps_active.avg_pct_of_peak_sustained_active` | Achieved occupancy | >50% |
+| `smsp__warps_issue_stalled_long_scoreboard` | Memory latency stalls | Lower is better |
+| `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` | DRAM sectors requested | Compare to expected |
+
+**Sector utilization check** — divide `bytes_requested / sectors_requested`. If << 32 bytes/sector, you have a coalescing problem.
+
+#### Step 4: Compute theoretical limits
+```
+bytes_per_step = sum of all weight tensors + activation traffic + state R/W
+t_theoretical = bytes_per_step / peak_bandwidth
+max_tok_per_s = 1 / t_theoretical
+efficiency = t_theoretical / t_measured
+```
+
+This tells you how much headroom exists. If you're at 90%+ efficiency, diminishing returns. If 30-50%, significant room.
+
+### Common Performance Pitfalls (Lessons Learned)
+
+1. **Single-block kernels on many-SM GPUs**: A kernel launching 1 block uses 1 of 70 SMs. If it processes a large array (like 248K vocab argmax), parallelize across blocks with a two-phase reduction. Our argmax went from 139 μs → 3.5 μs (40x).
+
+2. **Under-threaded blocks**: If head_dim=256 but you launch 32 threads/block, each thread does 8x more work serially. Launching 256 threads means each does 1 element. Our GQA went from 276 μs → 47 μs (5.9x).
+
+3. **Shuffle mask deadlock**: `__shfl_xor_sync(0xFFFFFFFF, val, offset)` requires ALL 32 threads in the warp to participate. If called inside `if (tid < 8)`, only 8 threads reach it → undefined behavior / hang. Use shared memory reduction for cross-warp communication instead.
+
+4. **GGUF quantization coalescing**: Q4_K blocks are 144 bytes (AoS). When each warp thread reads a different block, DRAM sectors contain mostly irrelevant data (9.2/32 bytes useful). SoA weight relayout fixes this but requires offline preprocessing.
+
+5. **CUDA graph trace visibility**: nsys hides graph-replayed kernels by default. You MUST use `--cuda-graph-trace=node` or you'll only see prefill/capture kernels and miss the entire decode path.
+
+6. **ncu permission and path issues**: `sudo ncu` fails because PATH isn't inherited. Use `sudo /usr/local/cuda-X.Y/bin/ncu`. For kernel name filtering with template params, use `--kernel-name regex:"pattern"`.
+
+7. **Kernel fusion ROI**: Fusing small kernels (RMSNorm + quantize, SwiGLU + quantize) saves ~1-2 μs per fusion in compute, but the main benefit is reducing CUDA graph node count → less graph dispatch overhead. The indirect savings can exceed the direct savings.
+
+8. **Clock locking for benchmarks**: GPU boost clocks fluctuate 5-15%. Always `nvidia-smi -lgc max,max` before benchmarking. Unlock after: `nvidia-smi -rgc`.
+
+### Benchmark Reporting Template
+
+```
+GPU:            [model] (SM_XX)
+Driver:         [version]
+CUDA:           [version]
+Clocks:         SM [freq] MHz, Mem [freq] MHz (locked)
+Model:          [name] ([size], [quant])
+Total weights:  [bytes] ([MB])
+
+Prompt:         "[text]"
+Decode tokens:  [N]
+Warmup:         [N] iterations
+
+Decode:         [tok/s] mean, [ms]/token
+Forward pass:   [ms] mean, [ms] min, [ms] max (N=[runs])
+BW efficiency:  [%] (vs [peak] GB/s theoretical)
+vs reference:   +[%] vs [reference engine] ([ref tok/s])
+Token match:    [N]/[N] exact greedy match
+
+Breakdown:
+  GEMV (all layers + LM head)   [ms]  [%]  [BW%]
+  Attention                     [ms]  [%]
+  Recurrence                    [ms]  [%]
+  Other                         [ms]  [%]
+  Graph overhead                [ms]  (extra)
+```
+
+### Documentation Standards
+
+- **Blog posts**: One per major milestone. Document what was implemented, decisions, bugs, benchmarks. Include code snippets for key insights. Write in first person, technical but accessible.
+- **PERFORMANCE.md**: Full theoretical analysis, profiling methodology, current bottleneck analysis. Keep numbers up-to-date after each optimization.
+- **EVAL_HARNESS_PLAN.md**: Living TODO list for profiling and testing. Mark items DONE with results as they're completed.
+- **HANDOFF.md**: Agent-to-agent context. Current performance, completed work, open questions, next steps. Update after each session.
