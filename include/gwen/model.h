@@ -59,6 +59,17 @@ struct Layer {
     FullAttnLayerWeights full_attn;
 };
 
+// MTP (Multi-Token Prediction) head weights
+// Architecture: FC(concat(RMSNorm(hidden), RMSNorm(embed))) → 1 FullAttn layer → RMSNorm → shared lm_head
+struct MTPWeights {
+    WeightRef fc;                   // [n_embed, 2*n_embed] FP16 — fusion projection
+    WeightRef pre_fc_norm_embed;    // [n_embed] F32 — RMSNorm for token embeddings
+    WeightRef pre_fc_norm_hidden;   // [n_embed] F32 — RMSNorm for hidden states
+    FullAttnLayerWeights layer;     // 1 full attention transformer layer
+    WeightRef output_norm;          // [n_embed] F32 — final RMSNorm before lm_head
+    // lm_head is shared with token_embd (no dedicated weights)
+};
+
 // Complete model
 struct Model {
     ModelConfig config;
@@ -71,8 +82,16 @@ struct Model {
     // Per-layer weights
     std::vector<Layer> layers;
 
+    // MTP head (optional — loaded from separate binary file)
+    bool has_mtp = false;
+    MTPWeights mtp;
+    std::vector<std::vector<uint8_t>> mtp_host_buffers;  // host-side storage for MTP weight data
+
     // Load from GGUF file
     static std::unique_ptr<Model> load(const std::string& gguf_path);
+
+    // Load MTP weights from binary file (GWMT format)
+    void load_mtp(const std::string& mtp_path);
 
     // Upload all weights to GPU
     void upload_weights(CudaAllocator& allocator);

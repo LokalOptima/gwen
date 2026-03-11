@@ -1,4 +1,5 @@
 #include "gwen/model.h"
+#include <fstream>
 
 namespace gwen {
 
@@ -73,6 +74,118 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     return model;
 }
 
+// ============================================================
+// MTP weight loading (GWMT binary format)
+// ============================================================
+
+void Model::load_mtp(const std::string& mtp_path) {
+    std::ifstream f(mtp_path, std::ios::binary);
+    GWEN_CHECK(f.is_open(), ("Failed to open MTP file: " + mtp_path).c_str());
+
+    // Read header
+    char magic[4];
+    f.read(magic, 4);
+    GWEN_CHECK(memcmp(magic, "GWMT", 4) == 0, "Invalid MTP file magic (expected GWMT)");
+
+    uint32_t version, n_tensors;
+    f.read(reinterpret_cast<char*>(&version), 4);
+    f.read(reinterpret_cast<char*>(&n_tensors), 4);
+    GWEN_CHECK(version == 1, "Unsupported MTP file version");
+
+    printf("Loading MTP weights: %u tensors from %s\n", n_tensors, mtp_path.c_str());
+
+    // Read tensors
+    mtp_host_buffers.resize(n_tensors);
+    size_t total_bytes = 0;
+
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        // Read name
+        uint32_t name_len;
+        f.read(reinterpret_cast<char*>(&name_len), 4);
+        std::string name(name_len, '\0');
+        f.read(name.data(), name_len);
+
+        // Read dtype, ndims, shape
+        uint32_t dtype, ndims;
+        f.read(reinterpret_cast<char*>(&dtype), 4);
+        f.read(reinterpret_cast<char*>(&ndims), 4);
+        std::vector<uint64_t> shape(ndims);
+        f.read(reinterpret_cast<char*>(shape.data()), ndims * 8);
+
+        // Read data
+        uint64_t data_size;
+        f.read(reinterpret_cast<char*>(&data_size), 8);
+        mtp_host_buffers[i].resize(data_size);
+        f.read(reinterpret_cast<char*>(mtp_host_buffers[i].data()), data_size);
+
+        // Compute n_elements
+        size_t n_elements = 1;
+        for (auto s : shape) n_elements *= s;
+
+        // Build WeightRef
+        WeightRef w;
+        w.host_data = mtp_host_buffers[i].data();
+        if (dtype == 0)      w.type = GGMLType::F32;
+        else if (dtype == 1) w.type = GGMLType::F16;
+        else if (dtype == 8) w.type = GGMLType::Q8_0;
+        else GWEN_CHECK(false, "Unsupported MTP weight dtype");
+        w.n_elements = n_elements;
+        w.size_bytes = data_size;
+        w.shape = shape;
+
+        total_bytes += data_size;
+
+        // Map to MTP weight fields by name
+        if (name == "mtp.fc.weight") {
+            mtp.fc = w;
+        } else if (name == "mtp.pre_fc_norm_embedding.weight") {
+            mtp.pre_fc_norm_embed = w;
+        } else if (name == "mtp.pre_fc_norm_hidden.weight") {
+            mtp.pre_fc_norm_hidden = w;
+        } else if (name == "mtp.layers.0.self_attn.q_proj.weight") {
+            mtp.layer.attn_q = w;
+        } else if (name == "mtp.layers.0.self_attn.k_proj.weight") {
+            mtp.layer.attn_k = w;
+        } else if (name == "mtp.layers.0.self_attn.v_proj.weight") {
+            mtp.layer.attn_v = w;
+        } else if (name == "mtp.layers.0.self_attn.o_proj.weight") {
+            mtp.layer.attn_output = w;
+        } else if (name == "mtp.layers.0.self_attn.q_norm.weight") {
+            mtp.layer.attn_q_norm = w;
+        } else if (name == "mtp.layers.0.self_attn.k_norm.weight") {
+            mtp.layer.attn_k_norm = w;
+        } else if (name == "mtp.layers.0.input_layernorm.weight") {
+            mtp.layer.attn_norm = w;
+        } else if (name == "mtp.layers.0.post_attention_layernorm.weight") {
+            mtp.layer.post_attn_norm = w;
+        } else if (name == "mtp.layers.0.mlp.gate_proj.weight") {
+            mtp.layer.ffn_gate = w;
+        } else if (name == "mtp.layers.0.mlp.up_proj.weight") {
+            mtp.layer.ffn_up = w;
+        } else if (name == "mtp.layers.0.mlp.down_proj.weight") {
+            mtp.layer.ffn_down = w;
+        } else if (name == "mtp.norm.weight") {
+            mtp.output_norm = w;
+        } else {
+            printf("  Warning: unknown MTP tensor: %s\n", name.c_str());
+        }
+
+        printf("  %-50s [", name.c_str());
+        for (uint32_t d = 0; d < ndims; d++) {
+            if (d > 0) printf(", ");
+            printf("%lu", shape[d]);
+        }
+        const char* dtype_str = "???";
+        if (dtype == 0) dtype_str = "F32";
+        else if (dtype == 1) dtype_str = "F16";
+        else if (dtype == 8) dtype_str = "Q8_0";
+        printf("] %s  %.1f KB\n", dtype_str, data_size / 1024.0f);
+    }
+
+    has_mtp = true;
+    printf("MTP weights loaded: %.1f MB total\n", total_bytes / 1024.0 / 1024.0);
+}
+
 // Upload all weight tensors to GPU
 static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
     if (w.host_data && w.size_bytes > 0 && !w.on_device()) {
@@ -115,6 +228,25 @@ void Model::upload_weights(CudaAllocator& allocator) {
             upload_weight(allocator, w.ffn_up);
             upload_weight(allocator, w.ffn_down);
         }
+    }
+
+    // Upload MTP weights if loaded
+    if (has_mtp) {
+        upload_weight(allocator, mtp.fc);
+        upload_weight(allocator, mtp.pre_fc_norm_embed);
+        upload_weight(allocator, mtp.pre_fc_norm_hidden);
+        upload_weight(allocator, mtp.layer.attn_norm);
+        upload_weight(allocator, mtp.layer.attn_q);
+        upload_weight(allocator, mtp.layer.attn_k);
+        upload_weight(allocator, mtp.layer.attn_v);
+        upload_weight(allocator, mtp.layer.attn_q_norm);
+        upload_weight(allocator, mtp.layer.attn_k_norm);
+        upload_weight(allocator, mtp.layer.attn_output);
+        upload_weight(allocator, mtp.layer.post_attn_norm);
+        upload_weight(allocator, mtp.layer.ffn_gate);
+        upload_weight(allocator, mtp.layer.ffn_up);
+        upload_weight(allocator, mtp.layer.ffn_down);
+        upload_weight(allocator, mtp.output_norm);
     }
 }
 

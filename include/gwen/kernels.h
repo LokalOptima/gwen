@@ -70,6 +70,18 @@ void gwen_gemv_dp4a_residual(const void* W, const void* x_q8, half* y, const hal
                               int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
 
 // ============================================================
+// FP16 GEMV (for MTP weights stored as FP16)
+// ============================================================
+
+// y = W * x, where W is [out_features, in_features] in FP16
+void gwen_gemv_fp16(const half* W, const half* x, half* y,
+                    int out_features, int in_features, cudaStream_t stream = 0);
+
+// y = W * x + residual (fused residual add)
+void gwen_gemv_fp16_residual(const half* W, const half* x, half* y, const half* residual,
+                              int out_features, int in_features, cudaStream_t stream = 0);
+
+// ============================================================
 // RMSNorm: y = x * rsqrt(mean(x^2) + eps) * weight
 // ============================================================
 void gwen_rmsnorm(const half* x, const half* weight, half* y,

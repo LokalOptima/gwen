@@ -11,6 +11,7 @@ static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("Options:\n");
     printf("  --model PATH       Path to GGUF model file (required)\n");
+    printf("  --mtp PATH         Path to MTP weights file (enables speculative decoding)\n");
     printf("  --prompt TEXT       Prompt text\n");
     printf("  --n-predict N      Number of tokens to generate (default: 50)\n");
     printf("  --greedy           Use greedy decoding\n");
@@ -22,6 +23,7 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char** argv) {
     std::string model_path;
+    std::string mtp_path;
     std::string prompt;
     int n_predict = 50;
     bool greedy = true;  // default greedy for now
@@ -31,6 +33,7 @@ int main(int argc, char** argv) {
 
     static struct option long_options[] = {
         {"model",        required_argument, nullptr, 'm'},
+        {"mtp",          required_argument, nullptr, 'M'},
         {"prompt",       required_argument, nullptr, 'p'},
         {"n-predict",    required_argument, nullptr, 'n'},
         {"greedy",       no_argument,       nullptr, 'g'},
@@ -42,9 +45,10 @@ int main(int argc, char** argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:p:n:gblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:p:n:gblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
+            case 'M': mtp_path = optarg; break;
             case 'p': prompt = optarg; break;
             case 'n': n_predict = atoi(optarg); break;
             case 'g': greedy = true; break;
@@ -73,6 +77,11 @@ int main(int argc, char** argv) {
     auto t1 = std::chrono::high_resolution_clock::now();
     double load_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     printf("GGUF parsed in %.1f ms\n", load_ms);
+
+    // Load MTP weights if provided
+    if (!mtp_path.empty()) {
+        model->load_mtp(mtp_path);
+    }
 
     model->print_info();
 
@@ -119,13 +128,21 @@ int main(int argc, char** argv) {
     InferenceState state;
     state.allocate(model->config, allocator);
     state.allocate_prefill(model->config, allocator, 4096);
+    if (model->has_mtp) {
+        state.allocate_mtp(model->config, allocator, 4096);
+    }
     printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 
     // Generate
     printf("\nGenerating %d tokens (greedy=%s)...\n", n_predict, greedy ? "true" : "false");
     auto t4 = std::chrono::high_resolution_clock::now();
 
-    auto output_tokens = state.generate(*model, prompt_tokens, n_predict, greedy);
+    std::vector<int> output_tokens;
+    if (model->has_mtp) {
+        output_tokens = state.generate_speculative(*model, prompt_tokens, n_predict);
+    } else {
+        output_tokens = state.generate(*model, prompt_tokens, n_predict, greedy);
+    }
 
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t5 = std::chrono::high_resolution_clock::now();

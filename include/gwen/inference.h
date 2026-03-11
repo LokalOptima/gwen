@@ -98,6 +98,22 @@ struct InferenceState {
 
     void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens);
 
+    // --- MTP (Multi-Token Prediction) state ---
+    half* mtp_hidden = nullptr;     // [n_embed] saved hidden state after all layers (for MTP input)
+    half* mtp_concat = nullptr;     // [2*n_embed] concat buffer for FC input
+    KVCache mtp_kv_cache;           // KV cache for MTP's attention layer
+    int* d_mtp_token = nullptr;     // device token ID for MTP embedding lookup
+    int* d_mtp_pos = nullptr;       // device position for MTP (aliased to d_mtp_token + 1)
+    int mtp_pos = 0;                // MTP's own position counter (separate from main model)
+    cudaGraphExec_t mtp_graph_exec = nullptr;
+    bool mtp_graph_captured = false;
+
+    // DeltaNet state checkpoint buffers (for speculative decode rollback)
+    std::vector<float*> dn_S_checkpoint;     // saved S matrices (one per DeltaNet layer)
+    std::vector<float*> dn_conv_checkpoint;  // saved conv states (one per DeltaNet layer)
+
+    void allocate_mtp(const ModelConfig& cfg, CudaAllocator& alloc, int max_seq);
+
     // Run the forward pass (all GPU work on given stream)
     void forward_body(Model& model, cudaStream_t stream);
 
@@ -107,9 +123,32 @@ struct InferenceState {
     // Process all prompt tokens at once (prefill), return last token's prediction
     int forward_prefill(Model& model, const std::vector<int>& tokens);
 
-    // Generate tokens
+    // MTP forward: predict next token from saved hidden state + current token embedding
+    // Returns draft token ID. Uses mtp_hidden (set by forward_body).
+    int forward_mtp(Model& model, int token_id);
+    void forward_mtp_body(Model& model, cudaStream_t stream);
+
+    // Verification forward: process 2 tokens [accepted, draft] in a batch.
+    // Returns prediction at position 0 (to verify draft) and prediction at position 1 (bonus).
+    // Also saves hidden state at both positions for MTP use.
+    // Checkpoints DeltaNet state after token 0 for rollback on rejection.
+    struct VerifyResult {
+        int pred_0;      // target prediction after token 0 (correct next token)
+        int pred_1;      // target prediction after token 1 (bonus if accepted)
+    };
+    VerifyResult forward_verify(Model& model, int token_0, int token_1);
+
+    // Save/restore DeltaNet state for speculative decode rollback
+    void save_deltanet_checkpoint(cudaStream_t stream);
+    void restore_deltanet_checkpoint(cudaStream_t stream);
+
+    // Generate tokens (standard greedy)
     std::vector<int> generate(Model& model, const std::vector<int>& prompt_tokens,
                               int n_predict, bool greedy = true, float temperature = 1.0f);
+
+    // Generate tokens with MTP speculative decoding
+    std::vector<int> generate_speculative(Model& model, const std::vector<int>& prompt_tokens,
+                                           int n_predict);
 };
 
 } // namespace gwen
