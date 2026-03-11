@@ -9,4 +9,4 @@ A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inferenc
 2. [Taming DeltaNet on the GPU](02-taming-deltanet.md) — Implementing the Gated DeltaNet linear attention recurrence
 3. [Squeezing the 5070 Ti](03-squeezing-the-5070ti.md) — Kernel fusion, CUDA graphs, 184 → 251 tok/s decode
 4. [Prefill: Going Parallel](04-prefill-going-parallel.md) — Batched GEMM, dequant bug fix, 2x prefill speedup
-5. *Planned: Final Results and Lessons Learned*
+5. [Final Results and Lessons Learned](05-final-results.md) — Complete benchmarks vs llama.cpp, retrospective
