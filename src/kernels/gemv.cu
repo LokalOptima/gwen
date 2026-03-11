@@ -48,16 +48,14 @@ kernel_gemv_q4_k(const block_q4_k* __restrict__ W,
         float scale = d * sc_lo;
         float min_val = dmin * m_lo;
 
-        // Extract 4-bit quant
-        uint8_t q_byte;
-        int q_val;
-        if (tid < 128) {
-            q_byte = blk.qs[tid / 2];
-            q_val = (tid % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-        } else {
-            q_byte = blk.qs[(tid - 128) / 2 + 64];
-            q_val = ((tid - 128) % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-        }
+        // Extract 4-bit quant (ggml interleaved layout)
+        // Layout: groups of 64 elements, each group = 32 low nibbles + 32 high nibbles
+        int group = tid / 64;         // 0..3
+        int within = tid % 64;
+        int is_high = within / 32;    // 0 or 1
+        int pos = within % 32;        // 0..31
+        int qs_byte_idx = group * 32 + pos;
+        int q_val = is_high ? (blk.qs[qs_byte_idx] >> 4) : (blk.qs[qs_byte_idx] & 0xF);
 
         float w_val = scale * q_val - min_val;
         float x_val = __half2float(x[blk_idx * 256 + tid]);
@@ -129,21 +127,18 @@ kernel_gemv_q5_k(const block_q5_k* __restrict__ W,
         float scale = d * sc_lo;
         float min_val = dmin * m_lo;
 
-        // 4 low bits
-        uint8_t q_byte;
-        int q_lo;
-        if (tid < 128) {
-            q_byte = blk.qs[tid / 2];
-            q_lo = (tid % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-        } else {
-            q_byte = blk.qs[(tid - 128) / 2 + 64];
-            q_lo = ((tid - 128) % 2 == 0) ? (q_byte & 0xF) : (q_byte >> 4);
-        }
+        // Extract 5-bit quant (ggml interleaved layout)
+        // Layout: groups of 64 elements, each group = 32 low nibbles + 32 high nibbles
+        // qh bits are indexed per group: bit (group*2+is_high) of qh[pos]
+        int group = tid / 64;
+        int within = tid % 64;
+        int is_high = within / 32;
+        int pos = within % 32;
+        int qs_byte_idx = group * 32 + pos;
+        int q_lo = is_high ? (blk.qs[qs_byte_idx] >> 4) : (blk.qs[qs_byte_idx] & 0xF);
 
-        // 5th bit
-        int qh_byte_idx = tid / 8;
-        int qh_bit_idx = tid % 8;
-        int q_hi = (blk.qh[qh_byte_idx] >> qh_bit_idx) & 1;
+        int qh_bit = group * 2 + is_high;
+        int q_hi = (blk.qh[pos] >> qh_bit) & 1;
 
         int q_val = q_lo | (q_hi << 4);
         float w_val = scale * q_val - min_val;
@@ -192,24 +187,25 @@ kernel_gemv_q6_k(const block_q6_k* __restrict__ W,
         const auto& blk = W[row * blocks_per_row + blk_idx];
 
         float d = __half2float(blk.d);
-        int sub_group = tid / 16;
-        int8_t scale = blk.scales[sub_group];
 
-        // Lower 4 bits
-        int ql_idx = tid / 2;
-        int ql_nibble;
-        if (tid % 2 == 0) {
-            ql_nibble = blk.ql[ql_idx] & 0xF;
-        } else {
-            ql_nibble = blk.ql[ql_idx] >> 4;
-        }
+        // Q6_K interleaved layout (ggml):
+        // 256 elements = 2 halves of 128. Each half = 4 quarters of 32.
+        // ql: 128 bytes. qh: 64 bytes. scales: 16 bytes.
+        int half = tid / 128;        // 0 or 1
+        int j = tid % 128;
+        int quarter = j / 32;        // 0..3
+        int pos = j % 32;            // 0..31
 
-        // Upper 2 bits
-        int qh_idx = tid / 4;
-        int qh_shift = (tid % 4) * 2;
-        int qh_bits = (blk.qh[qh_idx] >> qh_shift) & 0x3;
+        int ql_byte = half * 64 + (quarter & 1) * 32 + pos;
+        int ql_nibble = (quarter >= 2) ? (blk.ql[ql_byte] >> 4) : (blk.ql[ql_byte] & 0xF);
+
+        int qh_byte = half * 32 + pos;
+        int qh_shift = quarter * 2;
+        int qh_bits = (blk.qh[qh_byte] >> qh_shift) & 0x3;
 
         int q_val = ql_nibble | (qh_bits << 4);
+        int scale_idx = half * 8 + quarter * 2 + pos / 16;
+        int8_t scale = blk.scales[scale_idx];
         float w_val = d * scale * (q_val - 32);
         float x_val = __half2float(x[blk_idx * 256 + tid]);
         acc += w_val * x_val;

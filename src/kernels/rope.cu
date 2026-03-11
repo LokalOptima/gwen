@@ -107,22 +107,23 @@ kernel_embed_lookup_q6k(const void* __restrict__ table, int token_id,
         memcpy(&d_half, base + 208, sizeof(half));
         float d = __half2float(d_half);
 
-        int sub_group = tid / 16;
-        int8_t scale = scales[sub_group];
+        // Q6_K interleaved layout (ggml):
+        // 256 elements = 2 halves of 128. Each half = 4 quarters of 32.
+        int half_idx = tid / 128;
+        int j = tid % 128;
+        int quarter = j / 32;
+        int pos = j % 32;
 
-        int ql_idx = tid / 2;
-        int ql_nibble;
-        if (tid % 2 == 0) {
-            ql_nibble = ql[ql_idx] & 0xF;
-        } else {
-            ql_nibble = ql[ql_idx] >> 4;
-        }
+        int ql_byte = half_idx * 64 + (quarter & 1) * 32 + pos;
+        int ql_nibble = (quarter >= 2) ? (ql[ql_byte] >> 4) : (ql[ql_byte] & 0xF);
 
-        int qh_idx = tid / 4;
-        int qh_shift = (tid % 4) * 2;
-        int qh_bits = (qh[qh_idx] >> qh_shift) & 0x3;
+        int qh_byte = half_idx * 32 + pos;
+        int qh_shift = quarter * 2;
+        int qh_bits = (qh[qh_byte] >> qh_shift) & 0x3;
 
         int q_val = ql_nibble | (qh_bits << 4);
+        int scale_idx = half_idx * 8 + quarter * 2 + pos / 16;
+        int8_t scale = scales[scale_idx];
         float result = d * scale * (q_val - 32);
         y[blk_local * 256 + tid] = __float2half(result);
     }

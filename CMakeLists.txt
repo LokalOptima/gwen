@@ -29,6 +29,8 @@ file(GLOB_RECURSE GWEN_SOURCES
     src/gguf.cu
     src/model.cu
     src/memory.cu
+    src/inference.cu
+    src/tokenizer.cu
 )
 
 if(GWEN_SOURCES)
