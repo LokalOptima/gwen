@@ -64,6 +64,10 @@ struct InferenceState {
     float* d_alpha = nullptr;    // [ssm_n_heads]
     float* d_beta = nullptr;     // [ssm_n_heads]
 
+    // dp4a GEMV scratch — Q8_1 quantized input vectors
+    void* x_q8_a = nullptr;        // Q8_1 of buf_a/x_norm (max: n_ff/32 blocks for FFN down)
+    void* x_q8_b = nullptr;        // Q8_1 of ffn_out/gated_out (max: n_ff/32 blocks)
+
     int* d_argmax_token = nullptr; // pre-allocated argmax result
     int* d_pos = nullptr;          // device-side position (for CUDA graph)
     int* d_token_id = nullptr;     // device-side token ID (for CUDA graph)

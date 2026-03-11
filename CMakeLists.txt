@@ -67,6 +67,11 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_gemm.cu)
     target_link_libraries(test_gemm gwen_core)
 endif()
 
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_dp4a.cu)
+    add_executable(test_dp4a tests/test_dp4a.cu)
+    target_link_libraries(test_dp4a gwen_core)
+endif()
+
 # --- Profiler ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/bench/profile_forward.cu)
     add_executable(profile_forward bench/profile_forward.cu)

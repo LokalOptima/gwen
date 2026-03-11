@@ -53,6 +53,19 @@ void gwen_gemv(const void* W, const half* x, half* y,
                int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
 
 // ============================================================
+// dp4a-accelerated GEMV (quantize input to Q8_1, use integer SIMD)
+// ============================================================
+
+// Quantize FP16 input vector to Q8_1 blocks for dp4a GEMV
+// x: [n] in FP16, x_q8: [n/32] block_q8_1 output
+// n must be a multiple of 32
+void gwen_quantize_q8_1(const half* x, void* x_q8, int n, cudaStream_t stream = 0);
+
+// dp4a GEMV: y = W * x, where x is pre-quantized to Q8_1
+void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
+                    int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
+
+// ============================================================
 // RMSNorm: y = x * rsqrt(mean(x^2) + eps) * weight
 // ============================================================
 void gwen_rmsnorm(const half* x, const half* weight, half* y,

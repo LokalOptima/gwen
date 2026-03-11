@@ -426,6 +426,13 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     d_alpha = static_cast<float*>(a(cfg.ssm_n_heads * sizeof(float)));
     d_beta  = static_cast<float*>(a(cfg.ssm_n_heads * sizeof(float)));
 
+    // dp4a Q8_1 scratch buffers — sized for the largest input vector
+    // Largest: n_ff=3584 (FFN down input), n_embed=1024 (most projections)
+    int max_q8_dim = std::max(cfg.n_ff, std::max(cfg.n_embed, cfg.ssm_inner_size));
+    int q8_blocks = (max_q8_dim + 31) / 32;
+    x_q8_a = a(q8_blocks * 36);  // 36 bytes per block_q8_1
+    x_q8_b = a(q8_blocks * 36);
+
     // Pre-allocated argmax result and graph-compatible device scalars
     d_argmax_token = static_cast<int*>(a(sizeof(int)));
     // d_token_id and d_pos are adjacent so we can copy both in one call
@@ -539,9 +546,11 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
                               x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            gwen_gemv(w.attn_qkv.device_data, x_norm, qkv,
+            // Quantize x_norm to Q8_1, then dp4a GEMV for QKV + gate (same input)
+            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            gwen_gemv_dp4a(w.attn_qkv.device_data, x_q8_a, qkv,
                       w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type, s);
-            gwen_gemv(w.attn_gate.device_data, x_norm, gate_z,
+            gwen_gemv_dp4a(w.attn_gate.device_data, x_q8_a, gate_z,
                       w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type, s);
 
             int qkv_dim = cfg.ssm_inner_size * 3;
@@ -576,20 +585,26 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                 gate_z, gated_out,
                 cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
 
-            gwen_gemv(w.ssm_out.device_data, gated_out, buf_b,
+            // Quantize gated_out for output projection
+            gwen_quantize_q8_1(gated_out, x_q8_b, cfg.ssm_inner_size, s);
+            gwen_gemv_dp4a(w.ssm_out.device_data, x_q8_b, buf_b,
                       w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type, s);
             gwen_add_inplace(buf_b, buf_a, cfg.n_embed, s);
 
             gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
                               x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            gwen_gemv(w.ffn_gate.device_data, x_norm, ffn_gate,
+            // Quantize x_norm for FFN gate + up (same input)
+            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            gwen_gemv_dp4a(w.ffn_gate.device_data, x_q8_a, ffn_gate,
                       w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
-            gwen_gemv(w.ffn_up.device_data, x_norm, ffn_up,
+            gwen_gemv_dp4a(w.ffn_up.device_data, x_q8_a, ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
             gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
 
-            gwen_gemv(w.ffn_down.device_data, ffn_out, buf_a,
+            // Quantize ffn_out for down projection
+            gwen_quantize_q8_1(ffn_out, x_q8_b, cfg.n_ff, s);
+            gwen_gemv_dp4a(w.ffn_down.device_data, x_q8_b, buf_a,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
             gwen_add_inplace(buf_a, buf_b, cfg.n_embed, s);
 
@@ -600,7 +615,9 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
                               x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            gwen_gemv(w.attn_q.device_data, x_norm, qkv,
+            // Quantize x_norm for Q/K/V projections (same input)
+            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            gwen_gemv_dp4a(w.attn_q.device_data, x_q8_a, qkv,
                       w.attn_q.shape[1], w.attn_q.shape[0], w.attn_q.type, s);
 
             {
@@ -611,9 +628,9 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                     cfg.n_head, cfg.head_dim);
             }
 
-            gwen_gemv(w.attn_k.device_data, x_norm, fa_k,
+            gwen_gemv_dp4a(w.attn_k.device_data, x_q8_a, fa_k,
                       w.attn_k.shape[1], w.attn_k.shape[0], w.attn_k.type, s);
-            gwen_gemv(w.attn_v.device_data, x_norm, fa_v,
+            gwen_gemv_dp4a(w.attn_v.device_data, x_q8_a, fa_v,
                       w.attn_v.shape[1], w.attn_v.shape[0], w.attn_v.type, s);
 
             gwen_rmsnorm_batched_f32w(fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
@@ -643,20 +660,26 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                 gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
             }
 
-            gwen_gemv(w.attn_output.device_data, gated_out, buf_b,
+            // Quantize gated_out for output projection
+            gwen_quantize_q8_1(gated_out, x_q8_b, cfg.n_head * cfg.head_dim, s);
+            gwen_gemv_dp4a(w.attn_output.device_data, x_q8_b, buf_b,
                       w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type, s);
             gwen_add_inplace(buf_b, buf_a, cfg.n_embed, s);
 
             gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
                               x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            gwen_gemv(w.ffn_gate.device_data, x_norm, ffn_gate,
+            // Quantize x_norm for FFN gate + up
+            gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            gwen_gemv_dp4a(w.ffn_gate.device_data, x_q8_a, ffn_gate,
                       w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
-            gwen_gemv(w.ffn_up.device_data, x_norm, ffn_up,
+            gwen_gemv_dp4a(w.ffn_up.device_data, x_q8_a, ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
             gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
 
-            gwen_gemv(w.ffn_down.device_data, ffn_out, buf_a,
+            // Quantize ffn_out for down projection
+            gwen_quantize_q8_1(ffn_out, x_q8_b, cfg.n_ff, s);
+            gwen_gemv_dp4a(w.ffn_down.device_data, x_q8_b, buf_a,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
             gwen_add_inplace(buf_a, buf_b, cfg.n_embed, s);
         }
@@ -666,7 +689,9 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
     gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
                       x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-    gwen_gemv(model.token_embd.device_data, x_norm, logits_h,
+    // Quantize x_norm for LM head GEMV (the biggest single GEMV)
+    gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+    gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
               cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;

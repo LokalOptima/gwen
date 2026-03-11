@@ -44,6 +44,14 @@ struct block_q6_k {
 };
 static_assert(sizeof(block_q6_k) == 210, "block_q6_k size mismatch");
 
+// Q8_1: 32 values per block, 36 bytes (for dp4a GEMV input quantization)
+// ds.x = delta (scale), ds.y = sum of quantized values
+struct block_q8_1 {
+    __half2 ds;           // {delta, sum}
+    int8_t qs[32];        // quantized values
+};
+static_assert(sizeof(block_q8_1) == 36, "block_q8_1 size mismatch");
+
 } // namespace gwen
 
 #pragma pack(pop)
