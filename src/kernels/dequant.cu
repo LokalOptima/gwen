@@ -110,11 +110,10 @@ kernel_dequant_q5_k(const block_q5_k* __restrict__ src, half* __restrict__ dst, 
     int qs_byte_idx = group * 32 + pos;
     int q_lo = is_high ? (blk.qs[qs_byte_idx] >> 4) : (blk.qs[qs_byte_idx] & 0xF);
 
-    // Extract 5th bit from qh
-    // qh has 32 bytes = 256 bits, one bit per element
-    int qh_byte_idx = tid / 8;
-    int qh_bit_idx = tid % 8;
-    int q_hi = (blk.qh[qh_byte_idx] >> qh_bit_idx) & 1;
+    // Extract 5th bit from qh (ggml interleaved layout)
+    // qh[pos] has 8 bits: bit (group*2 + is_high) corresponds to this element
+    int qh_bit = group * 2 + is_high;
+    int q_hi = (blk.qh[pos] >> qh_bit) & 1;
 
     int q_val = q_lo | (q_hi << 4);
     float result = scale * q_val - min;

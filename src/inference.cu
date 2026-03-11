@@ -503,6 +503,11 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     prefill_ffn_gate = static_cast<half*>(a(max_tokens * cfg.n_ff * sizeof(half)));
     prefill_ffn_up   = static_cast<half*>(a(max_tokens * cfg.n_ff * sizeof(half)));
     prefill_ffn_out  = static_cast<half*>(a(max_tokens * cfg.n_ff * sizeof(half)));
+
+    // Batch projection buffers for DeltaNet QKV/gate and full attention Q/K/V
+    size_t qkv_dim = cfg.ssm_inner_size * 3;  // 6144 (DeltaNet) — also big enough for attn Q+gate (4096)
+    prefill_proj_qkv  = static_cast<half*>(a(max_tokens * qkv_dim * sizeof(half)));
+    prefill_proj_gate = static_cast<half*>(a(max_tokens * cfg.ssm_inner_size * sizeof(half)));
 }
 
 // ============================================================
@@ -864,19 +869,26 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 pf_a, static_cast<const float*>(w.attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // Per-token sequential processing for DeltaNet layers
-            // (DeltaNet state update is inherently sequential)
+            // Batch QKV and gate projections via GEMM
+            int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
+            gwen_gemm(w.attn_qkv.device_data, w.attn_qkv.type, prefill_temp_w,
+                      pf_norm, prefill_proj_qkv,
+                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
+            gwen_gemm(w.attn_gate.device_data, w.attn_gate.type, prefill_temp_w,
+                      pf_norm, prefill_proj_gate,
+                      w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
+
+            // Per-token sequential processing for DeltaNet state ops
             for (int t = 0; t < N; t++) {
                 half* x_t = pf_norm + (size_t)t * cfg.n_embed;
+                half* qkv_t = prefill_proj_qkv + (size_t)t * qkv_dim;
+                half* gate_t = prefill_proj_gate + (size_t)t * cfg.ssm_inner_size;
 
-                // QKV and gate projections (GEMV — single token)
-                gwen_gemv(w.attn_qkv.device_data, x_t, qkv,
-                          w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type, s);
-                gwen_gemv(w.attn_gate.device_data, x_t, gate_z,
-                          w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type, s);
+                // Copy projections to working buffers for conv1d (modifies in-place)
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(qkv, qkv_t, qkv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(gate_z, gate_t, cfg.ssm_inner_size * sizeof(half), cudaMemcpyDeviceToDevice, s));
 
-                // Conv1D + SiLU
-                int qkv_dim = cfg.ssm_inner_size * 3;
+                // Conv1D + SiLU (modifies qkv in-place)
                 int conv_blocks = (qkv_dim + 255) / 256;
                 kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
                     qkv, qkv, state.conv_state,
@@ -908,10 +920,17 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     gate_z, gated_out,
                     cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
 
-                // Output projection: gated_out [2048] → pf_b[t] [1024]
-                gwen_gemv(w.ssm_out.device_data, gated_out, pf_b + (size_t)t * cfg.n_embed,
-                          w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type, s);
+                // Store gated_out to batch buffer for batched output projection
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(
+                    prefill_proj_gate + (size_t)t * cfg.ssm_inner_size,
+                    gated_out, cfg.ssm_inner_size * sizeof(half),
+                    cudaMemcpyDeviceToDevice, s));
             }
+
+            // Batch output projection: [N, 2048] → [N, 1024] → pf_b
+            gwen_gemm(w.ssm_out.device_data, w.ssm_out.type, prefill_temp_w,
+                      prefill_proj_gate, pf_b,
+                      w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
 
             // Batch residual add: pf_b += pf_a
             {
@@ -963,37 +982,49 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 pf_a, static_cast<const float*>(w.attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // Per-token: projections + attention (sequential due to KV cache dependency)
+            int attn_dim = cfg.n_head * cfg.head_dim;  // 2048
+            int kv_dim = cfg.n_head_kv * cfg.head_dim;  // 512
+            int q_proj_dim = w.attn_q.shape[1];  // 4096 (Q + gate interleaved)
+
+            // Batch Q, K, V projections via GEMM
+            gwen_gemm(w.attn_q.device_data, w.attn_q.type, prefill_temp_w,
+                      pf_norm, prefill_proj_qkv,  // [N, q_proj_dim]
+                      q_proj_dim, w.attn_q.shape[0], N, s);
+            // Reuse FFN buffers for K, V batch (they're large enough and unused here)
+            gwen_gemm(w.attn_k.device_data, w.attn_k.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_gate,  // [N, kv_dim] (512 << 3584)
+                      kv_dim, w.attn_k.shape[0], N, s);
+            gwen_gemm(w.attn_v.device_data, w.attn_v.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_up,  // [N, kv_dim]
+                      kv_dim, w.attn_v.shape[0], N, s);
+
+            // Per-token: deinterleave, norms, RoPE, attention (sequential due to KV cache)
             for (int t = 0; t < N; t++) {
-                half* x_t = pf_norm + (size_t)t * cfg.n_embed;
                 int cur_pos = pos + t;
 
-                gwen_gemv(w.attn_q.device_data, x_t, qkv,
-                          w.attn_q.shape[1], w.attn_q.shape[0], w.attn_q.type, s);
-
-                int attn_dim = cfg.n_head * cfg.head_dim;
+                // Deinterleave Q+gate from batch buffer
                 int deint_blocks = (attn_dim + 255) / 256;
                 kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
-                    qkv, fa_q, gated_out, cfg.n_head, cfg.head_dim);
+                    prefill_proj_qkv + (size_t)t * q_proj_dim,
+                    fa_q, gated_out, cfg.n_head, cfg.head_dim);
 
-                gwen_gemv(w.attn_k.device_data, x_t, fa_k,
-                          w.attn_k.shape[1], w.attn_k.shape[0], w.attn_k.type, s);
-                gwen_gemv(w.attn_v.device_data, x_t, fa_v,
-                          w.attn_v.shape[1], w.attn_v.shape[0], w.attn_v.type, s);
+                // Copy K, V from batch buffers
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_k, prefill_ffn_gate + (size_t)t * kv_dim,
+                    kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_v, prefill_ffn_up + (size_t)t * kv_dim,
+                    kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
 
                 gwen_rmsnorm_batched_f32w(fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
                                           fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
                 gwen_rmsnorm_batched_f32w(fa_k, static_cast<const float*>(w.attn_k_norm.device_data),
                                           fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
 
-                // RoPE — need to write pos to device memory for this token
                 GWEN_CHECK_CUDA(cudaMemcpyAsync(d_pos, &cur_pos, sizeof(int), cudaMemcpyHostToDevice, s));
 
                 gwen_rope(fa_q, fa_k,
                           cfg.n_head, cfg.n_head_kv, cfg.head_dim,
                           d_pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim, s);
 
-                int kv_dim = cfg.n_head_kv * cfg.head_dim;
                 int kv_blocks = (kv_dim + 255) / 256;
                 kernel_kv_cache_store<<<kv_blocks, 256, 0, s>>>(
                     cache.k_cache, cache.v_cache, fa_k, fa_v, d_pos, kv_dim);
@@ -1006,9 +1037,17 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
                 gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
 
-                gwen_gemv(w.attn_output.device_data, gated_out, pf_b + (size_t)t * cfg.n_embed,
-                          w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type, s);
+                // Store gated_out for batched output projection
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(
+                    prefill_proj_gate + (size_t)t * cfg.ssm_inner_size,
+                    gated_out, attn_dim * sizeof(half),
+                    cudaMemcpyDeviceToDevice, s));
             }
+
+            // Batch output projection: [N, attn_dim] → [N, n_embed] → pf_b
+            gwen_gemm(w.attn_output.device_data, w.attn_output.type, prefill_temp_w,
+                      prefill_proj_gate, pf_b,
+                      w.attn_output.shape[1], w.attn_output.shape[0], N, s);
 
             // Batch residual add: pf_b += pf_a
             {

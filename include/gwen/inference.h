@@ -86,6 +86,8 @@ struct InferenceState {
     half* prefill_ffn_gate = nullptr; // [max_prefill, n_ff]
     half* prefill_ffn_up = nullptr;   // [max_prefill, n_ff]
     half* prefill_ffn_out = nullptr;  // [max_prefill, n_ff]
+    half* prefill_proj_qkv = nullptr; // [max_prefill, ssm_inner*3] batch projection output
+    half* prefill_proj_gate = nullptr; // [max_prefill, ssm_inner] batch gate/output proj
     int max_prefill = 0;
 
     void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens);
