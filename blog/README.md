@@ -15,3 +15,5 @@ A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inferenc
 8. [Profiling and Kernel Optimization](08-profiling-and-kernel-optimization.md) — ncu/nsys profiling, multi-block argmax (40x), multi-warp GQA (5.9x), 493 → 599 tok/s (+34.3% vs llama.cpp)
 9. [MTP Speculative Decoding](09-mtp-speculative-decoding.md) — Qwen3.5's built-in MTP draft head, Gemma-style RMSNorm bug, Q8_0 quantization, sequential verify bottleneck analysis
 10. [Token Frequency Distribution](10-token-frequency-distribution.md) — 1.6B-token frequency analysis of Qwen3.5's 248K vocabulary, Zipf's law, optimization opportunities
+11. [Activation Replay and the MTP Verdict](11-activation-replay-mtp-verdict.md) — S snapshot rollback (42x faster reject), algebraic undo failures, and why 55% acceptance isn't enough
+12. [Fine-Tuning the MTP Head for Spoken English](12-mtp-finetuning-setup.md) — 498M-token spoken English corpus, restricted vocab (20K tokens, 94.8% coverage), training infrastructure for the MTP head

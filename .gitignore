@@ -6,3 +6,9 @@ bench/results/
 tests/golden/
 tests/comparison_results.json
 third_party/
+data/train_*.bin
+data/token_counts.bin
+data/token_freqs.*
+profiles/
+archive.zip
+train/runs/
