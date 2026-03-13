@@ -216,4 +216,11 @@ void gwen_gemm(const void* W_quant, GGMLType type,
                int out_features, int in_features, int seq_len,
                cudaStream_t stream = 0);
 
+// F32 output variant: same as gwen_gemm but writes F32 output (no FP16 truncation)
+void gwen_gemm_f32out(const void* W_quant, GGMLType type,
+                       half* temp_w,
+                       const half* x, float* y,
+                       int out_features, int in_features, int seq_len,
+                       cudaStream_t stream = 0);
+
 } // namespace gwen

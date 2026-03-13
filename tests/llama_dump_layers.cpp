@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
 
     llama_backend_init();
     auto mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0; // CPU only for callback to work
+    mparams.n_gpu_layers = 99; // GPU — eval callback still works via ggml_backend_tensor_get
 
     auto* model = llama_model_load_from_file(model_path, mparams);
     if (!model) { fprintf(stderr, "Failed to load model\n"); return 1; }
@@ -116,10 +116,30 @@ int main(int argc, char** argv) {
         }
     };
 
-    // Dump layer outputs
+    // Dump embedding (input to first layer)
+    dump_tensor("model.input_embed", "/tmp/llama_embed.bin");
+
+    // Layer 0 bisection: dump every intermediate
+    dump_tensor("attn_norm-0", "/tmp/llama_l0_rmsnorm.bin");
+    dump_tensor("linear_attn_qkv_mixed-0", "/tmp/llama_l0_qkv_mixed.bin");
+    dump_tensor("conv_input-0", "/tmp/llama_l0_conv_input.bin");
+    dump_tensor("conv_output_silu-0", "/tmp/llama_l0_conv_silu.bin");
+    dump_tensor("linear_attn_out-0", "/tmp/llama_l0_deltanet_out.bin");
+    dump_tensor("norm-0", "/tmp/llama_l0_gated_norm.bin");
+    dump_tensor("attn_output-0", "/tmp/llama_l0_out_proj.bin");
+    dump_tensor("z-0", "/tmp/llama_l0_gate_z.bin");
+    dump_tensor("final_output-0", "/tmp/llama_l0_final.bin");
+    dump_tensor("ffn_gate-0", "/tmp/llama_l0_ffn_gate.bin");
+    dump_tensor("ffn_up-0", "/tmp/llama_l0_ffn_up.bin");
+    dump_tensor("ffn_swiglu-0", "/tmp/llama_l0_ffn_swiglu.bin");
+    dump_tensor("ffn_out-0", "/tmp/llama_l0_ffn_out.bin");
+
+    // Dump per-layer hidden states (after attention residual and after FFN residual)
     for (int i = 0; i < 24; i++) {
-        std::string name = "l_out-" + std::to_string(i);
-        dump_tensor(name, "/tmp/llama_layer_" + std::to_string(i) + ".bin");
+        dump_tensor("attn_residual-" + std::to_string(i),
+                    "/tmp/llama_attn_res_" + std::to_string(i) + ".bin");
+        dump_tensor("post_ffn-" + std::to_string(i),
+                    "/tmp/llama_post_ffn_" + std::to_string(i) + ".bin");
     }
 
     // Dump final output

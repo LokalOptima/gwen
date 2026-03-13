@@ -112,9 +112,17 @@ struct InferenceState {
     void allocate(const ModelConfig& cfg, CudaAllocator& alloc, int max_seq = 4096);
 
     // Prefill scratch buffers
-    half* prefill_x = nullptr;       // [max_prefill, n_embed] input embeddings
-    half* prefill_out = nullptr;     // [max_prefill, n_embed] layer output
-    half* prefill_norm = nullptr;    // [max_prefill, n_embed] after norm
+    half* prefill_x = nullptr;       // [max_prefill, n_embed] input embeddings (FP16, for extract_hidden)
+    half* prefill_out = nullptr;     // [max_prefill, n_embed] layer output (FP16, unused in F32 path)
+    half* prefill_norm = nullptr;    // [max_prefill, n_embed] after norm (FP16, GEMM I/O)
+    float* prefill_x_f32 = nullptr;       // [max_prefill, n_embed] F32 residual accumulator A
+    float* prefill_out_f32 = nullptr;     // [max_prefill, n_embed] F32 residual accumulator B
+    float* prefill_proj_qkv_f32 = nullptr; // [max_prefill, ssm_inner*3] F32 QKV projection
+    float* prefill_proj_gate_f32 = nullptr; // [max_prefill, ssm_inner] F32 gate/output projection
+    float* prefill_dn_out_f32 = nullptr;  // [max_prefill, ssm_inner] F32 DeltaNet output temp
+    float* prefill_ffn_gate_f32 = nullptr; // [max_prefill, n_ff] F32 FFN gate
+    float* prefill_ffn_up_f32 = nullptr;   // [max_prefill, n_ff] F32 FFN up
+    float* prefill_ffn_out_f32 = nullptr;  // [max_prefill, n_ff] F32 FFN SwiGLU output
     half* prefill_temp_w = nullptr;  // scratch for dequantized weights
     half* prefill_ffn_gate = nullptr; // [max_prefill, n_ff]
     half* prefill_ffn_up = nullptr;   // [max_prefill, n_ff]
@@ -199,8 +207,11 @@ struct InferenceState {
     void undo_deltanet_token_b(cudaStream_t stream);
 
     // Generate tokens (standard greedy)
+    // teacher_tokens: if non-empty, feed these tokens as input instead of own predictions
+    //                 (for teacher-forced comparison against a reference engine)
     std::vector<int> generate(Model& model, const std::vector<int>& prompt_tokens,
-                              int n_predict, bool greedy = true, float temperature = 1.0f);
+                              int n_predict, bool greedy = true, float temperature = 1.0f,
+                              const std::vector<int>& teacher_tokens = {});
 
     // Generate tokens with MTP speculative decoding
     std::vector<int> generate_speculative(Model& model, const std::vector<int>& prompt_tokens,

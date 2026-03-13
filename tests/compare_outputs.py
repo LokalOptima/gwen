@@ -54,18 +54,13 @@ N_PREDICT = 50  # tokens to generate per prompt
 
 def run_llamacpp(prompt: str, n_predict: int = N_PREDICT, logprobs: bool = True) -> dict:
     """Run llama.cpp inference and capture outputs."""
-    # Use llama-completion (formerly main) for direct generation
+    # llama-simple: straightforward completion, no chat template
     cmd = [
-        str(LLAMACPP_BIN / "llama-cli"),
+        str(LLAMACPP_BIN / "llama-simple"),
         "-m", str(MODEL_PATH),
-        "-p", prompt,
         "-n", str(n_predict),
-        "--no-conversation",
-        "--temp", "0",  # greedy for deterministic comparison
-        "--log-disable",
+        prompt,
     ]
-    if logprobs:
-        cmd.extend(["--logits-all"])
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
@@ -74,7 +69,7 @@ def run_llamacpp(prompt: str, n_predict: int = N_PREDICT, logprobs: bool = True)
 
     return {
         "text": result.stdout.strip(),
-        "tokens": [],  # TODO: parse token IDs from verbose output
+        "tokens": [],
     }
 
 
@@ -86,7 +81,6 @@ def run_gwen(prompt: str, n_predict: int = N_PREDICT) -> dict:
         "--prompt", prompt,
         "--n-predict", str(n_predict),
         "--greedy",
-        "--output-logits",  # output raw logits as binary
     ]
 
     result = subprocess.run(cmd, capture_output=True, timeout=120)

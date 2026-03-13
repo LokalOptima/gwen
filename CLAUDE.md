@@ -73,6 +73,15 @@ linear_value_head_dim = 128
 full_attention_interval = 4
 ```
 
+### Agent Discipline (see agent-guide/)
+- Before committing source changes: run test suite. Include results in commit message.
+- Before optimizing: profile first (see agent-guide/rules/profiling.md). Three failed attempts = go read instead.
+- Before session ends or context compacts: update HANDOFF.md (template: agent-guide/templates/handoff.md).
+- Commit format: `<type>: <summary>` with `Tests:` and `Perf:` lines (see agent-guide/rules/commits.md).
+- Training runs: must produce train_setup.json + train_log.csv (see agent-guide/rules/training.md).
+- Pre-commit hooks are active: run `agent-guide/hooks/install.sh` if hooks are missing.
+- New debugging/one-off scripts go in `scratch/` (gitignored), not `tests/` or `scripts/`.
+
 ### Dependencies
 - CUDA 13.1
 - CUTLASS 4.x (as git submodule in `third_party/cutlass`)

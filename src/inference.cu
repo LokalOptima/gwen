@@ -297,7 +297,7 @@ kernel_compute_gate_beta(
     if (lane == 0) {
         // gate = ssm_a * softplus(alpha_proj + dt_bias)
         float alpha_biased = alpha_acc + dt_bias[head];
-        float sp = logf(1.0f + expf(alpha_biased));  // softplus
+        float sp = (alpha_biased > 20.0f) ? alpha_biased : logf(1.0f + expf(alpha_biased));
         gate_out[head] = ssm_a[head] * sp;
 
         // beta = sigmoid(beta_proj)
@@ -396,7 +396,7 @@ kernel_batch_compute_gate_beta(
 
     if (lane == 0) {
         float alpha_biased = alpha_acc + dt_bias[head];
-        float sp = logf(1.0f + expf(alpha_biased));
+        float sp = (alpha_biased > 20.0f) ? alpha_biased : logf(1.0f + expf(alpha_biased));
         gate_out[t * n_heads + head] = ssm_a[head] * sp;
         beta_out[t * n_heads + head] = 1.0f / (1.0f + expf(-beta_acc));
     }
@@ -1187,6 +1187,19 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     prefill_out   = static_cast<half*>(a(max_tokens * cfg.n_embed * sizeof(half)));
     prefill_norm  = static_cast<half*>(a(max_tokens * cfg.n_embed * sizeof(half)));
 
+    // F32 buffers for verified reference path (GWEN_GEMM_DECODE=1)
+    // Eliminates FP16 truncation throughout the computation, matching llama.cpp's F32 precision.
+    prefill_x_f32   = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
+    prefill_out_f32 = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
+
+    size_t qkv_dim_total = cfg.ssm_inner_size * 3;  // 6144
+    prefill_proj_qkv_f32  = static_cast<float*>(a(max_tokens * qkv_dim_total * sizeof(float)));
+    prefill_proj_gate_f32 = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
+    prefill_dn_out_f32    = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
+    prefill_ffn_gate_f32  = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
+    prefill_ffn_up_f32    = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
+    prefill_ffn_out_f32   = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
+
     // Dequantized weight scratch — large enough for biggest weight matrix
     // Biggest: QKV (6144 × 1024) or Q+gate (4096 × 1024) or FFN gate/up (3584 × 1024)
     // or LM head (248320 × 1024)
@@ -1437,6 +1450,9 @@ void InferenceState::reset_state() {
     mtp_pos = 0;
 }
 
+// Forward declaration for kernel used in extract_hidden (defined before forward_prefill)
+__global__ void kernel_f32_to_half(const float* __restrict__ in, half* __restrict__ out, int total);
+
 // ============================================================
 // Extract hidden states for all tokens (prefill layers only)
 // ============================================================
@@ -1444,8 +1460,14 @@ void InferenceState::reset_state() {
 void InferenceState::extract_hidden(Model& model, const std::vector<int>& tokens, void* output_host) {
     reset_state();
     forward_prefill(model, tokens);
-    // After forward_prefill, prefill_x holds [N, n_embed] hidden states (FP16)
-    size_t bytes = (size_t)tokens.size() * model.config.n_embed * sizeof(half);
+    // After forward_prefill, prefill_x_f32 holds [N, n_embed] hidden states (F32)
+    // Convert to FP16 for output
+    int N = (int)tokens.size();
+    int total = N * model.config.n_embed;
+    int blocks = (total + 255) / 256;
+    kernel_f32_to_half<<<blocks, 256, 0, compute_stream>>>(prefill_x_f32, prefill_x, total);
+    GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+    size_t bytes = (size_t)total * sizeof(half);
     GWEN_CHECK_CUDA(cudaMemcpy(output_host, prefill_x, bytes, cudaMemcpyDeviceToHost));
 }
 
@@ -2091,6 +2113,289 @@ kernel_add_inplace_batch(half* __restrict__ y, const half* __restrict__ residual
     y[idx] = __hadd(y[idx], residual[idx]);
 }
 
+// ============================================================
+// F32 residual stream kernels (for verified GEMM decode path)
+// ============================================================
+
+// Embedding lookup with F32 output (eliminates initial FP16 truncation)
+__global__ void __launch_bounds__(256)
+kernel_embed_lookup_batch_q6k_f32(const void* __restrict__ table,
+                                   const int* __restrict__ token_ids,
+                                   float* __restrict__ y,
+                                   int dim, int n_tokens) {
+    int token_idx = blockIdx.y;
+    if (token_idx >= n_tokens) return;
+
+    int token_id = token_ids[token_idx];
+    int blocks_per_row = dim / 256;
+    int tid = threadIdx.x;
+
+    for (int blk_local = 0; blk_local < blocks_per_row; blk_local++) {
+        int blk_idx = token_id * blocks_per_row + blk_local;
+        const uint8_t* base = static_cast<const uint8_t*>(table) + (size_t)blk_idx * 210;
+
+        const uint8_t* ql = base;
+        const uint8_t* qh = base + 128;
+        const int8_t* scales = reinterpret_cast<const int8_t*>(base + 192);
+        half d_half;
+        memcpy(&d_half, base + 208, sizeof(half));
+        float d = __half2float(d_half);
+
+        int half_idx = tid / 128;
+        int j = tid % 128;
+        int quarter = j / 32;
+        int pos_in_block = j % 32;
+
+        int ql_byte = half_idx * 64 + (quarter & 1) * 32 + pos_in_block;
+        int ql_nibble = (quarter >= 2) ? (ql[ql_byte] >> 4) : (ql[ql_byte] & 0xF);
+
+        int qh_byte = half_idx * 32 + pos_in_block;
+        int qh_shift = quarter * 2;
+        int qh_bits = (qh[qh_byte] >> qh_shift) & 0x3;
+
+        int q_val = ql_nibble | (qh_bits << 4);
+        int scale_idx = half_idx * 8 + quarter * 2 + pos_in_block / 16;
+        int8_t scale = scales[scale_idx];
+        float result = d * scale * (q_val - 32);
+        y[(size_t)token_idx * dim + blk_local * 256 + tid] = result;  // F32 output
+    }
+}
+
+// RMSNorm with F32 input, FP16 output (for feeding GEMM which expects half*)
+__global__ void __launch_bounds__(256)
+kernel_rmsnorm_batch_f32in_f32w(const float* __restrict__ x, const float* __restrict__ weight,
+                                 half* __restrict__ y, int n_tokens, int dim, float eps) {
+    int token_idx = blockIdx.x;
+    if (token_idx >= n_tokens) return;
+    int tid = threadIdx.x;
+
+    const float* xv = x + (size_t)token_idx * dim;
+    half* yv = y + (size_t)token_idx * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        float val = xv[i];
+        sum_sq += val * val;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    __shared__ float warp_sums[8];
+    int warp_id = tid / 32, lane = tid % 32;
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        sum_sq = (lane < (blockDim.x / 32)) ? warp_sums[lane] : 0.0f;
+        for (int offset = 4; offset > 0; offset >>= 1)
+            sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+
+    float inv_rms = rsqrtf(sum_sq / dim + eps);
+
+    __shared__ float s_inv_rms;
+    if (tid == 0) s_inv_rms = inv_rms;
+    __syncthreads();
+    inv_rms = s_inv_rms;
+
+    for (int i = tid; i < dim; i += blockDim.x) {
+        yv[i] = __float2half(xv[i] * inv_rms * weight[i]);
+    }
+}
+
+// F32 to half conversion
+__global__ void __launch_bounds__(256)
+kernel_f32_to_half(const float* __restrict__ in, half* __restrict__ out, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    out[idx] = __float2half(in[idx]);
+}
+
+// F32 inplace add: y[i] += x[i]
+__global__ void __launch_bounds__(256)
+kernel_add_inplace_f32(float* __restrict__ y, const float* __restrict__ x, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    y[idx] += x[idx];
+}
+
+// Batch Conv1D + SiLU with F32 data (same as kernel_batch_conv1d_silu but float I/O)
+__global__ void __launch_bounds__(256)
+kernel_batch_conv1d_silu_f32(
+    float* __restrict__ data,          // [N, dim] in-place (F32)
+    float* __restrict__ conv_state,    // [kernel_size-1, dim] rolling state
+    const float* __restrict__ weight,  // [dim, kernel_size] conv weights
+    int N, int dim, int kernel_size)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+
+    float st0 = conv_state[0 * dim + d];
+    float st1 = conv_state[1 * dim + d];
+    float st2 = conv_state[2 * dim + d];
+
+    float w0 = weight[d * kernel_size + 0];
+    float w1 = weight[d * kernel_size + 1];
+    float w2 = weight[d * kernel_size + 2];
+    float w3 = weight[d * kernel_size + 3];
+
+    for (int t = 0; t < N; t++) {
+        float x_val = data[(size_t)t * dim + d];
+        float acc = w3 * x_val + w2 * st2 + w1 * st1 + w0 * st0;
+        float silu = acc / (1.0f + expf(-acc));
+        data[(size_t)t * dim + d] = silu;  // F32 output
+
+        st0 = st1;
+        st1 = st2;
+        st2 = x_val;
+    }
+
+    conv_state[0 * dim + d] = st0;
+    conv_state[1 * dim + d] = st1;
+    conv_state[2 * dim + d] = st2;
+}
+
+// DeltaNet prefill with F32 QKV input and F32 output
+__global__ void __launch_bounds__(128)
+kernel_deltanet_prefill_f32(
+    float* __restrict__ S,              // [n_heads, dk, dv] recurrent state
+    const float* __restrict__ qkv_batch, // [N, 3*ssm_inner] F32 (after conv1d)
+    const float* __restrict__ gate_batch, // [N, n_heads]
+    const float* __restrict__ beta_batch, // [N, n_heads]
+    float* __restrict__ output_batch,    // [N, ssm_inner] F32 output
+    int N, int n_heads, int dk, int dv, int ssm_inner,
+    float q_scale)
+{
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int j = threadIdx.x;
+    int warp_id = j / 32;
+    int lane = j % 32;
+
+    float* S_head = S + (size_t)head * dk * dv;
+
+    __shared__ float sh_k[128];
+    __shared__ float sh_q[128];
+    __shared__ float sh_reduce[4];
+
+    for (int t = 0; t < N; t++) {
+        const float* q_ptr = qkv_batch + (size_t)t * ssm_inner * 3 + head * dk;
+        const float* k_ptr = q_ptr + ssm_inner;
+        const float* v_ptr = k_ptr + ssm_inner;
+
+        // L2-normalize Q
+        float q_raw = q_ptr[j];
+        float q_sq = q_raw * q_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = q_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float q_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f)) * q_scale;
+
+        // L2-normalize K
+        float k_raw = k_ptr[j];
+        float k_sq = k_raw * k_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = k_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float k_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f));
+
+        sh_q[j] = q_raw * q_inv;
+        sh_k[j] = k_raw * k_inv;
+        __syncthreads();
+
+        float decay = expf(gate_batch[t * n_heads + head]);
+        float b = beta_batch[t * n_heads + head];
+
+        float sk_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float val = S_head[i * 128 + j] * decay;
+            S_head[i * 128 + j] = val;
+            sk_j += val * sh_k[i];
+        }
+
+        float d_j = (v_ptr[j] - sk_j) * b;
+        float o_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float updated = S_head[i * 128 + j] + sh_k[i] * d_j;
+            S_head[i * 128 + j] = updated;
+            o_j += updated * sh_q[i];
+        }
+
+        output_batch[(size_t)t * ssm_inner + head * dv + j] = o_j;  // F32 output
+        __syncthreads();
+    }
+}
+
+// Batch gated RMSNorm with F32 I/O
+__global__ void __launch_bounds__(32)
+kernel_batch_gated_rmsnorm_f32(
+    const float* __restrict__ x,       // [N, n_heads * dim_per_head] F32
+    const float* __restrict__ weight,  // [dim_per_head]
+    const float* __restrict__ gate,    // [N, n_heads * dim_per_head] F32
+    float* __restrict__ output,        // [N, n_heads * dim_per_head] F32
+    int N, int n_heads, int dim_per_head, float eps)
+{
+    int block_id = blockIdx.x;
+    int t = block_id / n_heads;
+    int head = block_id % n_heads;
+    if (t >= N) return;
+
+    int lane = threadIdx.x;
+    int stride = n_heads * dim_per_head;
+    int base = t * stride + head * dim_per_head;
+
+    float sum_sq = 0.0f;
+    for (int i = lane; i < dim_per_head; i += 32) {
+        float val = x[base + i];
+        sum_sq += val * val;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    float rms_inv = rsqrtf(sum_sq / dim_per_head + eps);
+
+    for (int i = lane; i < dim_per_head; i += 32) {
+        float x_val = x[base + i] * rms_inv;
+        float w = weight[i];
+        float g = gate[base + i];
+        float silu_g = g / (1.0f + expf(-g));
+        output[base + i] = x_val * w * silu_g;  // F32 output
+    }
+}
+
+// Batched SwiGLU with F32 I/O
+__global__ void __launch_bounds__(256)
+kernel_swiglu_batch_f32(const float* __restrict__ gate, const float* __restrict__ up,
+                         float* __restrict__ y, int n_tokens, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_tokens * dim;
+    if (idx >= total) return;
+
+    float g = gate[idx];
+    float u = up[idx];
+    float sig = 1.0f / (1.0f + expf(-g));
+    y[idx] = g * sig * u;
+}
+
 int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens) {
     const auto& cfg = model.config;
     const float q_scale = 1.0f / sqrtf((float)cfg.ssm_state_size);
@@ -2104,54 +2409,102 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     int* d_token_ids = d_prefill_tokens;
     GWEN_CHECK_CUDA(cudaMemcpy(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice));
 
-    // 1. Batch embedding lookup → prefill_x [N, 1024]
+    // 1. Batch embedding lookup → F32 residual accumulator [N, 1024]
     {
         dim3 grid(1, N);
-        kernel_embed_lookup_batch_q6k<<<grid, 256, 0, s>>>(
-            model.token_embd.device_data, d_token_ids, prefill_x, cfg.n_embed, N);
+        kernel_embed_lookup_batch_q6k_f32<<<grid, 256, 0, s>>>(
+            model.token_embd.device_data, d_token_ids, prefill_x_f32, cfg.n_embed, N);
     }
 
-    // Working buffers: prefill_x = buf_a, prefill_out = buf_b
-    half* pf_a = prefill_x;      // hidden state [N, n_embed]
-    half* pf_b = prefill_out;    // alternate buffer [N, n_embed]
-    half* pf_norm = prefill_norm; // normalized [N, n_embed]
+    // Working buffers: F32 residual accumulators swap between pf_a/pf_b each half-layer.
+    // pf_norm stays FP16 — it's the RMSNorm output feeding GEMMs (which expect half*).
+    // GEMM outputs go to pf_norm (reused as temp), then are added to the F32 residual.
+    // This eliminates 48 accumulated FP16 truncations (2 adds × 24 layers) in the residual stream.
+    float* pf_a = prefill_x_f32;     // F32 residual accumulator A
+    float* pf_b = prefill_out_f32;   // F32 residual accumulator B
+    half* pf_norm = prefill_norm;     // FP16 normalized (GEMM input/output temp)
 
     int dn_state_idx = 0;
     int kv_cache_idx = 0;
+
+    // Per-layer dump for debugging (GWEN_DUMP_LAYERS=1)
+    bool dump_layers = (getenv("GWEN_DUMP_LAYERS") != nullptr);
+    auto dump_f32_buf = [&](const float* d_ptr, int offset_elems, int count, const std::string& path) {
+        if (!dump_layers) return;
+        GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+        std::vector<float> host(count);
+        GWEN_CHECK_CUDA(cudaMemcpy(host.data(), d_ptr + offset_elems,
+                                    count * sizeof(float), cudaMemcpyDeviceToHost));
+        FILE* fp = fopen(path.c_str(), "wb");
+        fwrite(&count, sizeof(int), 1, fp);
+        fwrite(host.data(), sizeof(float), count, fp);
+        fclose(fp);
+    };
+
+    // Dump embedding before any layers
+    dump_f32_buf(pf_a, (N-1)*cfg.n_embed, cfg.n_embed, "/tmp/gwen_embed.bin");
 
     // 2. Process each layer
     for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
         const auto& layer = model.layers[layer_idx];
 
         if (!layer.is_full_attention) {
-            // ===== DeltaNet Layer (GEMM for projections, sequential for state ops) =====
+            // ===== DeltaNet Layer — Full F32 internal pipeline =====
+            // RMSNorm(F32→half) → GEMM(half→F32) → Conv1d/DeltaNet/GatedRMSNorm(F32) →
+            // convert(F32→half) → GEMM(half→F32, direct to residual) → F32 add
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
 
-            // Batch RMSNorm: pf_a [N, 1024] → pf_norm [N, 1024]
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+            // RMSNorm: pf_a(F32) → pf_norm(half) for GEMM input
+            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
                 pf_a, static_cast<const float*>(w.attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // Batch QKV and gate projections via GEMM
-            int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
-            gwen_gemm(w.attn_qkv.device_data, w.attn_qkv.type, prefill_temp_w,
-                      pf_norm, prefill_proj_qkv,
-                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
-            gwen_gemm(w.attn_gate.device_data, w.attn_gate.type, prefill_temp_w,
-                      pf_norm, prefill_proj_gate,
-                      w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
+            // Dump layer 0 intermediates for bisection
+            if (layer_idx == 0 && dump_layers) {
+                // Dump RMSNorm output (FP16 → F32 for comparison)
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                {
+                    std::vector<half> h16(cfg.n_embed);
+                    GWEN_CHECK_CUDA(cudaMemcpy(h16.data(), pf_norm + (N-1)*cfg.n_embed,
+                        cfg.n_embed * sizeof(half), cudaMemcpyDeviceToHost));
+                    std::vector<float> h32(cfg.n_embed);
+                    for (int j = 0; j < (int)cfg.n_embed; j++) h32[j] = __half2float(h16[j]);
+                    int count = cfg.n_embed;
+                    FILE* fp = fopen("/tmp/gwen_l0_rmsnorm.bin", "wb");
+                    fwrite(&count, sizeof(int), 1, fp);
+                    fwrite(h32.data(), sizeof(float), count, fp);
+                    fclose(fp);
+                }
+            }
 
-            // Batch DeltaNet state ops — 5 kernel launches instead of ~4096 per-token launches
+            // QKV and gate GEMM with F32 output
+            int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
+            gwen_gemm_f32out(w.attn_qkv.device_data, w.attn_qkv.type, prefill_temp_w,
+                             pf_norm, prefill_proj_qkv_f32,
+                             w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
+            gwen_gemm_f32out(w.attn_gate.device_data, w.attn_gate.type, prefill_temp_w,
+                             pf_norm, prefill_proj_gate_f32,
+                             w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
+
+            // Dump layer 0 QKV GEMM output
+            if (layer_idx == 0) {
+                dump_f32_buf(prefill_proj_qkv_f32, (N-1)*qkv_dim, qkv_dim,
+                             "/tmp/gwen_l0_qkv.bin");
+                dump_f32_buf(prefill_proj_gate_f32, (N-1)*cfg.ssm_inner_size, cfg.ssm_inner_size,
+                             "/tmp/gwen_l0_gate.bin");
+            }
+
+            // F32 DeltaNet state ops
             {
-                // 1. Batch conv1d + SiLU on all N tokens (modifies prefill_proj_qkv in-place)
+                // Conv1d + SiLU on F32 QKV data
                 int conv_grid = (qkv_dim + 255) / 256;
-                kernel_batch_conv1d_silu<<<conv_grid, 256, 0, s>>>(
-                    prefill_proj_qkv, state.conv_state,
+                kernel_batch_conv1d_silu_f32<<<conv_grid, 256, 0, s>>>(
+                    prefill_proj_qkv_f32, state.conv_state,
                     static_cast<const float*>(w.ssm_conv1d.device_data),
                     N, qkv_dim, cfg.ssm_conv_kernel);
 
-                // 2. Batch gate/beta computation from pf_norm
+                // Gate/beta (reads FP16 pf_norm, outputs F32 — unchanged)
                 kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_heads, N), 32, 0, s>>>(
                     pf_norm,
                     w.ssm_alpha.device_data, w.ssm_beta.device_data,
@@ -2160,106 +2513,119 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     prefill_dn_gate, prefill_dn_beta,
                     N, cfg.n_embed, cfg.ssm_n_heads);
 
-                // 3. Persistent DeltaNet state update (all N tokens, includes L2 norm)
-                //    Output goes to prefill_ffn_gate (temporarily, before FFN uses it)
-                kernel_deltanet_prefill<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                    state.S, prefill_proj_qkv,
+                // DeltaNet with F32 I/O
+                kernel_deltanet_prefill_f32<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                    state.S, prefill_proj_qkv_f32,
                     prefill_dn_gate, prefill_dn_beta,
-                    prefill_ffn_gate,  // [N, ssm_inner] temp output
+                    prefill_dn_out_f32,
                     N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size,
                     cfg.ssm_inner_size, q_scale);
 
-                // 4. Batch gated RMSNorm: attn_out × gate → output for GEMM
-                kernel_batch_gated_rmsnorm<<<N * cfg.ssm_n_heads, 32, 0, s>>>(
-                    prefill_ffn_gate,  // attn_out [N, ssm_inner]
+                // Gated RMSNorm with F32 I/O
+                kernel_batch_gated_rmsnorm_f32<<<N * cfg.ssm_n_heads, 32, 0, s>>>(
+                    prefill_dn_out_f32,
                     static_cast<const float*>(w.ssm_norm.device_data),
-                    prefill_proj_gate, // gate [N, ssm_inner]
-                    prefill_proj_gate, // output overwrites gate
+                    prefill_proj_gate_f32,
+                    prefill_proj_gate_f32,
                     N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
             }
 
-            // Batch output projection: [N, 2048] → [N, 1024] → pf_b
-            gwen_gemm(w.ssm_out.device_data, w.ssm_out.type, prefill_temp_w,
-                      prefill_proj_gate, pf_b,
-                      w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
+            // Convert F32→FP16 for Out GEMM input, then GEMM→F32 directly to residual
+            {
+                int total_gate = N * cfg.ssm_inner_size;
+                int blocks_gate = (total_gate + 255) / 256;
+                kernel_f32_to_half<<<blocks_gate, 256, 0, s>>>(
+                    prefill_proj_gate_f32, prefill_proj_gate, total_gate);
+            }
+            gwen_gemm_f32out(w.ssm_out.device_data, w.ssm_out.type, prefill_temp_w,
+                             prefill_proj_gate, pf_b,
+                             w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
 
-            // Batch residual add: pf_b += pf_a
+            // F32 residual add: pf_b += pf_a
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
+                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
             }
+            // Dump attn_residual (last token in pf_b)
+            dump_f32_buf(pf_b, (N-1)*cfg.n_embed, cfg.n_embed,
+                         "/tmp/gwen_attn_res_" + std::to_string(layer_idx) + ".bin");
 
-            // Batch post-attention RMSNorm: pf_b → pf_norm
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+            // Post-attention RMSNorm: pf_b(F32) → pf_norm(half)
+            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
                 pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // Batch FFN using GEMM
-            gwen_gemm(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_gate,
-                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_up,
-                      w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+            // FFN with F32 output GEMMs and F32 SwiGLU
+            gwen_gemm_f32out(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
+                             pf_norm, prefill_ffn_gate_f32,
+                             w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_f32out(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
+                             pf_norm, prefill_ffn_up_f32,
+                             w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
-            // Batch SwiGLU
             {
                 int total = N * cfg.n_ff;
                 int blocks = (total + 255) / 256;
-                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
-                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
+                kernel_swiglu_batch_f32<<<blocks, 256, 0, s>>>(
+                    prefill_ffn_gate_f32, prefill_ffn_up_f32, prefill_ffn_out_f32, N, cfg.n_ff);
             }
 
-            // Batch FFN down GEMM → pf_a
-            gwen_gemm(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
-                      prefill_ffn_out, pf_a,
-                      w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+            // Convert F32 SwiGLU output → FP16 for FFN down GEMM, then GEMM→F32 to residual
+            {
+                int total_ffn = N * cfg.n_ff;
+                int blocks_ffn = (total_ffn + 255) / 256;
+                kernel_f32_to_half<<<blocks_ffn, 256, 0, s>>>(
+                    prefill_ffn_out_f32, prefill_ffn_out, total_ffn);
+            }
+            gwen_gemm_f32out(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
+                             prefill_ffn_out, pf_a,
+                             w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
-            // Batch residual add: pf_a += pf_b
+            // F32 residual add: pf_a += pf_b
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
+                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
             }
+            // Dump post_ffn (last token in pf_a)
+            dump_f32_buf(pf_a, (N-1)*cfg.n_embed, cfg.n_embed,
+                         "/tmp/gwen_post_ffn_" + std::to_string(layer_idx) + ".bin");
 
         } else {
-            // ===== Full Attention Layer =====
+            // ===== Full Attention Layer — F32 residual + F32 FFN =====
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            // Batch RMSNorm
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+            // RMSNorm: pf_a(F32) → pf_norm(half)
+            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
                 pf_a, static_cast<const float*>(w.attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
             int attn_dim = cfg.n_head * cfg.head_dim;  // 2048
             int kv_dim = cfg.n_head_kv * cfg.head_dim;  // 512
-            int q_proj_dim = w.attn_q.shape[1];  // 4096 (Q + gate interleaved)
+            int q_proj_dim = w.attn_q.shape[1];  // 4096
 
-            // Batch Q, K, V projections via GEMM
+            // Q, K, V projections (FP16 — per-token attention ops are FP16)
             gwen_gemm(w.attn_q.device_data, w.attn_q.type, prefill_temp_w,
-                      pf_norm, prefill_proj_qkv,  // [N, q_proj_dim]
+                      pf_norm, prefill_proj_qkv,
                       q_proj_dim, w.attn_q.shape[0], N, s);
-            // Reuse FFN buffers for K, V batch (they're large enough and unused here)
             gwen_gemm(w.attn_k.device_data, w.attn_k.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_gate,  // [N, kv_dim] (512 << 3584)
+                      pf_norm, prefill_ffn_gate,
                       kv_dim, w.attn_k.shape[0], N, s);
             gwen_gemm(w.attn_v.device_data, w.attn_v.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_up,  // [N, kv_dim]
+                      pf_norm, prefill_ffn_up,
                       kv_dim, w.attn_v.shape[0], N, s);
 
-            // Per-token: deinterleave, norms, RoPE, attention (sequential due to KV cache)
+            // Per-token attention (FP16 internal — only 6 layers, non-recurrent)
             for (int t = 0; t < N; t++) {
                 int cur_pos = pos + t;
 
-                // Deinterleave Q+gate from batch buffer
                 int deint_blocks = (attn_dim + 255) / 256;
                 kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
                     prefill_proj_qkv + (size_t)t * q_proj_dim,
                     fa_q, gated_out, cfg.n_head, cfg.head_dim);
 
-                // Copy K, V from batch buffers
                 GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_k, prefill_ffn_gate + (size_t)t * kv_dim,
                     kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
                 GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_v, prefill_ffn_up + (size_t)t * kv_dim,
@@ -2288,60 +2654,78 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
                 gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
 
-                // Store gated_out for batched output projection
                 GWEN_CHECK_CUDA(cudaMemcpyAsync(
                     prefill_proj_gate + (size_t)t * cfg.ssm_inner_size,
                     gated_out, attn_dim * sizeof(half),
                     cudaMemcpyDeviceToDevice, s));
             }
 
-            // Batch output projection: [N, attn_dim] → [N, n_embed] → pf_b
-            gwen_gemm(w.attn_output.device_data, w.attn_output.type, prefill_temp_w,
-                      prefill_proj_gate, pf_b,
-                      w.attn_output.shape[1], w.attn_output.shape[0], N, s);
+            // Out projection → F32 directly to residual
+            gwen_gemm_f32out(w.attn_output.device_data, w.attn_output.type, prefill_temp_w,
+                             prefill_proj_gate, pf_b,
+                             w.attn_output.shape[1], w.attn_output.shape[0], N, s);
 
-            // Batch residual add: pf_b += pf_a
+            // F32 residual add: pf_b += pf_a
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
+                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
             }
+            // Dump attn_residual (last token in pf_b)
+            dump_f32_buf(pf_b, (N-1)*cfg.n_embed, cfg.n_embed,
+                         "/tmp/gwen_attn_res_" + std::to_string(layer_idx) + ".bin");
 
-            // Batch post-attention RMSNorm
-            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+            // Post-attention RMSNorm: pf_b(F32) → pf_norm(half)
+            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
                 pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // Batch FFN GEMMs
-            gwen_gemm(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_gate,
-                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
-                      pf_norm, prefill_ffn_up,
-                      w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+            // FFN with F32 output GEMMs and F32 SwiGLU
+            gwen_gemm_f32out(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
+                             pf_norm, prefill_ffn_gate_f32,
+                             w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_f32out(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
+                             pf_norm, prefill_ffn_up_f32,
+                             w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
             {
                 int total = N * cfg.n_ff;
                 int blocks = (total + 255) / 256;
-                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
-                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
+                kernel_swiglu_batch_f32<<<blocks, 256, 0, s>>>(
+                    prefill_ffn_gate_f32, prefill_ffn_up_f32, prefill_ffn_out_f32, N, cfg.n_ff);
             }
 
-            gwen_gemm(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
-                      prefill_ffn_out, pf_a,
-                      w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+            // Convert F32→FP16 for FFN down GEMM, then GEMM→F32 to residual
+            {
+                int total_ffn = N * cfg.n_ff;
+                int blocks_ffn = (total_ffn + 255) / 256;
+                kernel_f32_to_half<<<blocks_ffn, 256, 0, s>>>(
+                    prefill_ffn_out_f32, prefill_ffn_out, total_ffn);
+            }
+            gwen_gemm_f32out(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
+                             prefill_ffn_out, pf_a,
+                             w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
+            // F32 residual add: pf_a += pf_b
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
+                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
             }
+            // Dump post_ffn (last token in pf_a)
+            dump_f32_buf(pf_a, (N-1)*cfg.n_embed, cfg.n_embed,
+                         "/tmp/gwen_post_ffn_" + std::to_string(layer_idx) + ".bin");
         }
     }
 
-    // 3. Final RMSNorm on last token only: pf_a[N-1] → x_norm
-    half* last_hidden = pf_a + (size_t)(N - 1) * cfg.n_embed;
-    gwen_rmsnorm_f32w(last_hidden, static_cast<const float*>(model.output_norm.device_data),
+    // 3. Final RMSNorm on last token: convert F32→half, then normalize
+    // This also leaves buf_a with the FP16 hidden state for subsequent decode tokens
+    float* last_hidden_f32 = pf_a + (size_t)(N - 1) * cfg.n_embed;
+    {
+        int blocks = (cfg.n_embed + 255) / 256;
+        kernel_f32_to_half<<<blocks, 256, 0, s>>>(last_hidden_f32, buf_a, cfg.n_embed);
+    }
+    gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
                       x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
     // 4. LM Head GEMV on last token
@@ -2350,15 +2734,17 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
+
+    // Dump result_norm (F32 hidden state before LM head) and result_output (F32 logits)
+    dump_f32_buf(last_hidden_f32, 0, cfg.n_embed, "/tmp/gwen_result_norm.bin");
+    dump_f32_buf(logits_f, 0, cfg.n_vocab, "/tmp/gwen_result_output.bin");
+
     kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
     kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
 
     GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
     int next_token;
     GWEN_CHECK_CUDA(cudaMemcpy(&next_token, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Copy last hidden state to buf_a for subsequent decode tokens
-    GWEN_CHECK_CUDA(cudaMemcpy(buf_a, last_hidden, cfg.n_embed * sizeof(half), cudaMemcpyDeviceToDevice));
 
     pos += N;
     return next_token;
@@ -2680,7 +3066,8 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 // ============================================================
 
 std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& prompt_tokens,
-                                           int n_predict, bool greedy, float temperature) {
+                                           int n_predict, bool greedy, float temperature,
+                                           const std::vector<int>& teacher_tokens) {
     std::vector<int> output_tokens;
 
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -2710,12 +3097,40 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
     // forward_prefill(N=1): verified GEMM reference path, enable with GWEN_GEMM_DECODE=1.
     bool gemm_decode = (getenv("GWEN_GEMM_DECODE") != nullptr);
     bool dump_logits = (getenv("GWEN_DUMP_LOGITS") != nullptr);
+    bool teacher_forcing = !teacher_tokens.empty();
+
+    // Binary logit dump: GWEN_LOGITS_BIN=path writes same format as llama_golden
+    const char* logits_bin_path = getenv("GWEN_LOGITS_BIN");
+    FILE* logits_bin_fp = nullptr;
+    if (logits_bin_path) {
+        logits_bin_fp = fopen(logits_bin_path, "wb");
+        int32_t header[2] = {n_predict, (int32_t)model.config.n_vocab};
+        fwrite(header, sizeof(int32_t), 2, logits_bin_fp);
+        // Write position 0 (from prefill)
+        int32_t tok0 = output_tokens[0];
+        fwrite(&tok0, sizeof(int32_t), 1, logits_bin_fp);
+        std::vector<float> host_logits(model.config.n_vocab);
+        GWEN_CHECK_CUDA(cudaMemcpy(host_logits.data(), logits_f,
+            model.config.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
+        fwrite(host_logits.data(), sizeof(float), model.config.n_vocab, logits_bin_fp);
+    }
+
     for (int i = 1; i < n_predict; i++) {
+        // In teacher-forcing mode, feed the reference token instead of own prediction.
+        // This keeps GWEN's state synchronized with the reference engine so we can
+        // compare logits at every position without cascade divergence.
+        int input_token;
+        if (teacher_forcing && (i - 1) < (int)teacher_tokens.size()) {
+            input_token = teacher_tokens[i - 1];
+        } else {
+            input_token = output_tokens.back();
+        }
+
         int next;
         if (gemm_decode) {
-            next = forward_prefill(model, {output_tokens.back()});
+            next = forward_prefill(model, {input_token});
         } else {
-            next = forward(model, output_tokens.back());
+            next = forward(model, input_token);
         }
         output_tokens.push_back(next);
 
@@ -2735,8 +3150,18 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
             printf("\n");
         }
 
-        if (next == (int)model.config.eos_token_id) break;
+        if (logits_bin_fp) {
+            int32_t tok = next;
+            fwrite(&tok, sizeof(int32_t), 1, logits_bin_fp);
+            std::vector<float> hl(model.config.n_vocab);
+            GWEN_CHECK_CUDA(cudaMemcpy(hl.data(), logits_f,
+                model.config.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
+            fwrite(hl.data(), sizeof(float), model.config.n_vocab, logits_bin_fp);
+        }
+
+        if (!teacher_forcing && next == (int)model.config.eos_token_id) break;
     }
+    if (logits_bin_fp) fclose(logits_bin_fp);
 
     return output_tokens;
 }

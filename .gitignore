@@ -12,3 +12,4 @@ data/token_freqs.*
 profiles/
 archive.zip
 train/runs/
+scratch/

@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <getopt.h>
+#include <sstream>
 
 using namespace gwen;
 
@@ -18,6 +19,7 @@ static void print_usage(const char* prog) {
     printf("  --greedy           Use greedy decoding\n");
     printf("  --benchmark        Output benchmark timing as JSON\n");
     printf("  --output-logits    Output raw logits\n");
+    printf("  --teacher-tokens T Comma-separated reference token IDs for teacher-forced comparison\n");
     printf("  --info             Print model info and exit\n");
     printf("  --help             Show this help\n");
 }
@@ -27,6 +29,7 @@ int main(int argc, char** argv) {
     std::string mtp_path;
     std::string mtp_lm_head_path;
     std::string prompt;
+    std::string teacher_tokens_str;
     int n_predict = 50;
     bool greedy = true;  // default greedy for now
     bool benchmark = false;
@@ -42,19 +45,21 @@ int main(int argc, char** argv) {
         {"greedy",       no_argument,       nullptr, 'g'},
         {"benchmark",    no_argument,       nullptr, 'b'},
         {"output-logits",no_argument,       nullptr, 'l'},
+        {"teacher-tokens",required_argument, nullptr, 't'},
         {"info",         no_argument,       nullptr, 'i'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:gblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:t:gblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
             case 'L': mtp_lm_head_path = optarg; break;
             case 'p': prompt = optarg; break;
             case 'n': n_predict = atoi(optarg); break;
+            case 't': teacher_tokens_str = optarg; break;
             case 'g': greedy = true; break;
             case 'b': benchmark = true; break;
             case 'l': output_logits = true; break;
@@ -143,12 +148,25 @@ int main(int argc, char** argv) {
     }
     printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 
+    // Parse teacher tokens if provided
+    std::vector<int> teacher_tokens;
+    if (!teacher_tokens_str.empty()) {
+        std::istringstream iss(teacher_tokens_str);
+        std::string tok;
+        while (std::getline(iss, tok, ',')) {
+            if (!tok.empty()) teacher_tokens.push_back(std::stoi(tok));
+        }
+        printf("\nTeacher-forcing with %zu reference tokens\n", teacher_tokens.size());
+    }
+
     // Generate
     printf("\nGenerating %d tokens (greedy=%s)...\n", n_predict, greedy ? "true" : "false");
     auto t4 = std::chrono::high_resolution_clock::now();
 
     std::vector<int> output_tokens;
-    if (model->has_mtp) {
+    if (!teacher_tokens.empty()) {
+        output_tokens = state.generate(*model, prompt_tokens, n_predict, greedy, 1.0f, teacher_tokens);
+    } else if (model->has_mtp) {
         output_tokens = state.generate_speculative(*model, prompt_tokens, n_predict);
     } else {
         output_tokens = state.generate(*model, prompt_tokens, n_predict, greedy);

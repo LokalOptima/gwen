@@ -1,24 +1,33 @@
 #!/bin/bash
-# Comprehensive correctness testing for GWEN
-# Usage: ./scripts/test_correctness.sh
+# GWEN Correctness Test Suite
+#
+# Self-contained regression tests — no live llama.cpp dependency.
 #
 # Tests:
 # 1. dp4a kernel unit tests (GEMV accuracy vs legacy FP16 path)
 # 2. CUTLASS GEMM vs GEMV (numerical agreement)
-# 3. Greedy token matching vs llama.cpp (multiple prompts)
-# 4. Determinism check (same output across multiple runs)
+# 3. Per-layer golden check vs llama.cpp reference (tests/golden/)
+# 4. Self-regression: greedy tokens match GWEN's own golden data (tests/golden_gwen/)
+# 5. Determinism check (same output across multiple runs)
+#
+# Generate golden data:
+#   llama.cpp layers:  scripts/generate_golden.sh
+#   GWEN tokens:       scripts/generate_gwen_golden.sh
 
 set -euo pipefail
 
 MODEL="Qwen3.5-0.8B-Q4_K_M.gguf"
 GWEN="./build/gwen"
-LLAMA_GENERATE="./tests/llama_generate"
+GOLDEN_LLAMA="tests/golden"
+GOLDEN_GWEN="tests/golden_gwen"
 PASS=0
 FAIL=0
+SKIP=0
 TOTAL=0
 
 pass() { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  FAIL: $1"; }
+skip() { SKIP=$((SKIP+1)); echo "  SKIP: $1"; }
 
 echo "╔═══════════════════════════════════════════════╗"
 echo "║       GWEN Correctness Test Suite             ║"
@@ -27,12 +36,16 @@ echo ""
 
 # ── 1. dp4a Kernel Unit Tests ──
 echo "── 1. dp4a Kernel Unit Tests ──"
-DP4A_OUT=$(./build/test_dp4a "$MODEL" 2>&1)
-echo "$DP4A_OUT" | grep -E "PASS|FAIL|Max diff"
-if echo "$DP4A_OUT" | grep -q "ALL DP4A TESTS PASSED"; then
-    pass "dp4a kernels match legacy FP16 path"
+if [ -x "./build/test_dp4a" ]; then
+    DP4A_OUT=$(./build/test_dp4a "$MODEL" 2>&1)
+    echo "$DP4A_OUT" | grep -E "PASS|FAIL|Max diff"
+    if echo "$DP4A_OUT" | grep -q "ALL DP4A TESTS PASSED"; then
+        pass "dp4a kernels match legacy FP16 path"
+    else
+        fail "dp4a kernel divergence"
+    fi
 else
-    fail "dp4a kernel divergence"
+    skip "test_dp4a not built"
 fi
 echo ""
 
@@ -47,70 +60,95 @@ if [ -x "./build/test_gemm" ]; then
         fail "CUTLASS GEMM divergence"
     fi
 else
-    echo "  (test_gemm not built, skipping)"
+    skip "test_gemm not built"
 fi
 echo ""
 
-# ── 3. Greedy Token Matching vs llama.cpp ──
-echo "── 3. Greedy Token Match vs llama.cpp ──"
+# ── 3. Per-Layer Golden Check vs llama.cpp ──
+echo "── 3. Per-Layer Golden Check (vs llama.cpp reference) ──"
+if [ -d "$GOLDEN_LLAMA" ] && [ -d "$GOLDEN_LLAMA/prompt_0" ]; then
+    LOGIT_OUT=$(uv run --with numpy scripts/test_logits.py 2>&1)
+    echo "$LOGIT_OUT"
+
+    N_LOGIT_PASS=$(echo "$LOGIT_OUT" | grep -c "PASS:" || true)
+    N_LOGIT_FAIL=$(echo "$LOGIT_OUT" | grep -c "FAIL:" || true)
+
+    if [ "$N_LOGIT_FAIL" -eq 0 ] && [ "$N_LOGIT_PASS" -gt 0 ]; then
+        pass "per-layer golden check ($N_LOGIT_PASS prompts)"
+    else
+        fail "per-layer golden check ($N_LOGIT_FAIL failures)"
+    fi
+else
+    skip "no llama.cpp golden data (run scripts/generate_golden.sh)"
+fi
+echo ""
+
+# ── 4. Self-Regression: GWEN Greedy Token Match ──
+echo "── 4. Self-Regression (GWEN greedy tokens vs golden) ──"
 
 PROMPTS=(
     "The quick brown fox"
     "In the beginning"
     "def fibonacci(n):"
     "The capital of France is"
+    "1+1=2. 2+2=4. 3+3="
+    "Once upon a time there was"
+    "import numpy as np"
+    "The meaning of life is"
 )
 
-for prompt in "${PROMPTS[@]}"; do
-    if [ -x "$LLAMA_GENERATE" ]; then
-        # Get llama.cpp tokens
-        LLAMA_TOKENS=$(LD_LIBRARY_PATH=./third_party/llama.cpp/build/bin \
-            timeout 30 "$LLAMA_GENERATE" "$MODEL" "$prompt" 30 2>&1 \
-            | grep -P '^\s*\[\d+\]' | head -30 | grep -oP 'token=\K[0-9]+' | tr '\n' ' ' || echo "")
+if [ -d "$GOLDEN_GWEN" ]; then
+    for i in "${!PROMPTS[@]}"; do
+        prompt="${PROMPTS[$i]}"
+        golden_file="$GOLDEN_GWEN/prompt_${i}.tokens"
 
-        # Get GWEN tokens (use GEMM decode path for correctness comparison)
-        GWEN_TOKENS=$(GWEN_GEMM_DECODE=1 "${GWEN}" --model "$MODEL" --prompt "$prompt" \
+        if [ ! -f "$golden_file" ]; then
+            skip "\"$prompt\" (no golden file)"
+            continue
+        fi
+
+        # Get GWEN's current greedy tokens
+        GWEN_TOKENS=$("$GWEN" --model "$MODEL" --prompt "$prompt" \
             --n-predict 30 --greedy 2>&1 \
-            | grep "Generated token IDs:" | sed 's/Generated token IDs: //' | tr -s ' ' || echo "")
+            | grep "Generated token IDs:" | sed 's/Generated token IDs: //' | tr -s ' ')
 
-        if [ -n "$LLAMA_TOKENS" ] && [ -n "$GWEN_TOKENS" ]; then
-            LLAMA_ARR=($LLAMA_TOKENS)
-            GWEN_ARR=($GWEN_TOKENS)
+        if [ -z "$GWEN_TOKENS" ]; then
+            fail "\"$prompt\" (GWEN produced no output)"
+            continue
+        fi
+
+        # Convert to one-per-line for comparison
+        CURRENT=$(echo "$GWEN_TOKENS" | tr ' ' '\n' | grep -v '^$')
+        GOLDEN=$(< "$golden_file")
+
+        if [ "$CURRENT" = "$GOLDEN" ]; then
+            pass "\"$prompt\" → 30/30 tokens match golden"
+        else
+            # Count matching prefix
             MATCH=0
-            CHECK=${#GWEN_ARR[@]}
-            for i in $(seq 0 $((CHECK-1))); do
-                [ "${LLAMA_ARR[$i]:-}" = "${GWEN_ARR[$i]:-}" ] && MATCH=$((MATCH+1))
-            done
-            if [ $MATCH -eq $CHECK ]; then
-                pass "\"$prompt\" → $MATCH/$CHECK tokens match"
-            else
-                fail "\"$prompt\" → $MATCH/$CHECK tokens match (DIVERGE at position $MATCH)"
-                echo "    llama: ${LLAMA_TOKENS:0:80}..."
-                echo "    gwen:  ${GWEN_TOKENS:0:80}..."
-            fi
-        else
-            echo "  SKIP: \"$prompt\" (could not get tokens from both engines)"
+            TOTAL_TOKENS=$(echo "$GOLDEN" | wc -l)
+            while IFS= read -r gold_tok <&3 && IFS= read -r cur_tok <&4; do
+                if [ "$gold_tok" = "$cur_tok" ]; then
+                    MATCH=$((MATCH+1))
+                else
+                    break
+                fi
+            done 3< <(echo "$GOLDEN") 4< <(echo "$CURRENT")
+
+            fail "\"$prompt\" → $MATCH/$TOTAL_TOKENS tokens match (diverges at position $MATCH)"
         fi
-    else
-        # Self-test only: verify GWEN produces reasonable output
-        GWEN_OUT=$("${GWEN}" --model "$MODEL" --prompt "$prompt" \
-            --n-predict 30 --greedy 2>&1)
-        GWEN_TOKENS=$(echo "$GWEN_OUT" | grep "Generated token IDs:" | sed 's/Generated token IDs: //')
-        if [ -n "$GWEN_TOKENS" ]; then
-            pass "\"$prompt\" → generated 30 tokens (no llama.cpp to compare)"
-        else
-            fail "\"$prompt\" → no output"
-        fi
-    fi
-done
+    done
+else
+    skip "no GWEN golden data (run scripts/generate_gwen_golden.sh)"
+fi
 echo ""
 
-# ── 4. Determinism Check ──
-echo "── 4. Determinism (5 runs, same output) ──"
+# ── 5. Determinism Check ──
+echo "── 5. Determinism (5 runs, same output) ──"
 TOKENS_PREV=""
 ALL_SAME=1
 for i in $(seq 1 5); do
-    TOKENS=$("${GWEN}" --model "$MODEL" --prompt "Hello world" \
+    TOKENS=$("$GWEN" --model "$MODEL" --prompt "Hello world" \
         --n-predict 20 --greedy 2>&1 \
         | grep "Generated token IDs:" | sed 's/Generated token IDs: //' | tr -s ' ')
     if [ -n "$TOKENS_PREV" ] && [ "$TOKENS" != "$TOKENS_PREV" ]; then
@@ -128,7 +166,7 @@ echo ""
 
 # ── Summary ──
 echo "═══════════════════════════════════════════════"
-echo "  Results: $PASS passed, $FAIL failed, $TOTAL total"
+echo "  Results: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
 if [ $FAIL -eq 0 ]; then
     echo "  ALL TESTS PASSED"
 else
