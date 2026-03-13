@@ -12,6 +12,7 @@ static void print_usage(const char* prog) {
     printf("Options:\n");
     printf("  --model PATH       Path to GGUF model file (required)\n");
     printf("  --mtp PATH         Path to MTP weights file (enables speculative decoding)\n");
+    printf("  --mtp-lm-head PATH Path to reduced LM head for faster MTP (GWRL format)\n");
     printf("  --prompt TEXT       Prompt text\n");
     printf("  --n-predict N      Number of tokens to generate (default: 50)\n");
     printf("  --greedy           Use greedy decoding\n");
@@ -24,6 +25,7 @@ static void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     std::string model_path;
     std::string mtp_path;
+    std::string mtp_lm_head_path;
     std::string prompt;
     int n_predict = 50;
     bool greedy = true;  // default greedy for now
@@ -34,6 +36,7 @@ int main(int argc, char** argv) {
     static struct option long_options[] = {
         {"model",        required_argument, nullptr, 'm'},
         {"mtp",          required_argument, nullptr, 'M'},
+        {"mtp-lm-head",  required_argument, nullptr, 'L'},
         {"prompt",       required_argument, nullptr, 'p'},
         {"n-predict",    required_argument, nullptr, 'n'},
         {"greedy",       no_argument,       nullptr, 'g'},
@@ -45,10 +48,11 @@ int main(int argc, char** argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:p:n:gblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:gblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
+            case 'L': mtp_lm_head_path = optarg; break;
             case 'p': prompt = optarg; break;
             case 'n': n_predict = atoi(optarg); break;
             case 'g': greedy = true; break;
@@ -81,6 +85,11 @@ int main(int argc, char** argv) {
     // Load MTP weights if provided
     if (!mtp_path.empty()) {
         model->load_mtp(mtp_path);
+    }
+
+    // Load reduced LM head if provided
+    if (!mtp_lm_head_path.empty()) {
+        model->load_reduced_lm_head(mtp_lm_head_path);
     }
 
     model->print_info();
@@ -130,6 +139,7 @@ int main(int argc, char** argv) {
     state.allocate_prefill(model->config, allocator, 4096);
     if (model->has_mtp) {
         state.allocate_mtp(model->config, allocator, 4096);
+        state.allocate_batch2(model->config, allocator);
     }
     printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 

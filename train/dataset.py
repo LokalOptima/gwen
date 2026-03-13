@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 SENTINEL = 0xFFFFFFFF
@@ -111,6 +111,11 @@ class TokenSequenceDataset(Dataset):
 
         self.chunks = chunks
         self.n_tokens = sum(len(c) for c in chunks)
+        self._lengths = [len(c) for c in chunks]
+
+    @property
+    def lengths(self) -> list[int]:
+        return self._lengths
 
     def __len__(self) -> int:
         return len(self.chunks)
@@ -119,28 +124,102 @@ class TokenSequenceDataset(Dataset):
         chunk = self.chunks[idx]
         length = len(chunk)
 
-        # Pad to seq_len if needed
-        if length < self.seq_len:
-            padded = np.zeros(self.seq_len, dtype=np.uint32)
-            padded[:length] = chunk
-            chunk = padded
-
         token_ids = torch.from_numpy(chunk.astype(np.int64))
 
         # MTP targets: token_ids[t+2] mapped to restricted vocab
-        # For positions t=0..L-3, target = restricted(token_ids[t+2])
         target_ids = chunk[2:length] if length > 2 else np.array([], dtype=np.uint32)
-        targets = self.vocab.map_targets(target_ids)
-
-        # Pad targets to seq_len-2
-        target_padded = np.full(self.seq_len - 2, -100, dtype=np.int32)
-        target_padded[: len(targets)] = targets
+        targets = torch.from_numpy(self.vocab.map_targets(target_ids)).long()
 
         return {
             "token_ids": token_ids,
-            "targets": torch.from_numpy(target_padded).long(),
+            "targets": targets,
             "length": length,
         }
+
+
+def mtp_collate(batch: list[dict]) -> dict:
+    """Collate variable-length sequences, padding to max length in batch.
+
+    Pads token_ids with 0, targets with -100 (ignore_index).
+    This ensures compute scales with actual sequence lengths, not seq_len.
+    """
+    max_len = max(item["length"] for item in batch)
+    max_target_len = max(len(item["targets"]) for item in batch)
+
+    token_ids = torch.zeros(len(batch), max_len, dtype=torch.long)
+    targets = torch.full((len(batch), max_target_len), -100, dtype=torch.long)
+
+    for i, item in enumerate(batch):
+        L = item["length"]
+        token_ids[i, :L] = item["token_ids"]
+        tgt_len = len(item["targets"])
+        targets[i, :tgt_len] = item["targets"]
+
+    return {"token_ids": token_ids, "targets": targets}
+
+
+class TokenBatchSampler(Sampler):
+    """Batch sampler that targets a constant token budget per batch.
+
+    Sorts sequences by length, packs similar-length sequences into batches
+    targeting `max_tokens` total tokens per batch. Shuffles batch order each
+    epoch (deterministic, seeded).
+
+    Benefits over fixed batch_size:
+    - Consistent GPU memory/compute per batch
+    - Minimal padding (similar-length sequences grouped)
+    - More training signal from short sequences
+    """
+
+    def __init__(
+        self,
+        lengths: list[int],
+        max_tokens: int,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = True,
+    ):
+        self.max_tokens = max_tokens
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+
+        # Sort indices by length (longest first for greedy packing)
+        sorted_indices = sorted(range(len(lengths)), key=lambda i: -lengths[i])
+
+        # Greedily pack into batches targeting max_tokens
+        self.batches = []
+        batch = []
+        batch_max_len = 0
+        for idx in sorted_indices:
+            seq_len = lengths[idx]
+            new_max = max(batch_max_len, seq_len)
+            # If adding this sequence would exceed budget, flush
+            if batch and new_max * (len(batch) + 1) > max_tokens:
+                self.batches.append(batch)
+                batch = [idx]
+                batch_max_len = seq_len
+            else:
+                batch.append(idx)
+                batch_max_len = new_max
+        if batch and (not drop_last or len(batch) > 1):
+            self.batches.append(batch)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        if self.shuffle:
+            rng = torch.Generator().manual_seed(self.seed + self.epoch)
+            order = torch.randperm(len(self.batches), generator=rng).tolist()
+        else:
+            order = list(range(len(self.batches)))
+        for i in order:
+            yield self.batches[i]
+
+    def __len__(self):
+        return len(self.batches)
 
 
 def make_splits(
@@ -172,6 +251,11 @@ class _SubsetDataset(Dataset):
     def __init__(self, dataset: TokenSequenceDataset, indices: list[int]):
         self.dataset = dataset
         self.indices = indices
+        self._lengths = [dataset.lengths[i] for i in indices]
+
+    @property
+    def lengths(self) -> list[int]:
+        return self._lengths
 
     def __len__(self) -> int:
         return len(self.indices)

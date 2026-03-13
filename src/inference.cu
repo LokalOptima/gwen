@@ -36,6 +36,7 @@ kernel_deltanet_decode(
     const float* __restrict__ gate,  // [n_heads] gate = ssm_a * softplus(alpha_proj + dt_bias)
     const float* __restrict__ beta_in,  // [n_heads] sigmoid(beta_proj)
     half* __restrict__ output,       // [n_heads * d_v] output
+    float* __restrict__ d_out,       // [n_heads * d_v] delta (optional, for activation replay)
     int n_heads, int dk, int dv)
 {
     int head = blockIdx.x;
@@ -76,12 +77,17 @@ kernel_deltanet_decode(
     }
 
     output[head * dv + j] = __float2half(o_j);
+
+    // Save exact delta for activation replay undo (avoids precision loss from algebraic inversion)
+    if (d_out) {
+        d_out[head * dv + j] = d_j;
+    }
 }
 
 void gwen_deltanet_decode(float* S, const half* q, const half* k, const half* v,
                           const float* alpha, const float* beta, half* output,
                           int n_heads, int dk, int dv, cudaStream_t stream) {
-    kernel_deltanet_decode<<<n_heads, 128, 0, stream>>>(S, q, k, v, alpha, beta, output, n_heads, dk, dv);
+    kernel_deltanet_decode<<<n_heads, 128, 0, stream>>>(S, q, k, v, alpha, beta, output, nullptr, n_heads, dk, dv);
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 
@@ -300,6 +306,530 @@ kernel_compute_gate_beta(
 }
 
 // ============================================================
+// Batch DeltaNet prefill kernels
+// ============================================================
+// These replace the per-token sequential loop in forward_prefill,
+// reducing ~73K kernel launches per sequence to ~5 per layer.
+
+// Batch Conv1D + SiLU: processes all N tokens in one launch.
+// Each thread handles one dimension, loops over N tokens sequentially
+// maintaining the causal conv state in registers.
+__global__ void __launch_bounds__(256)
+kernel_batch_conv1d_silu(
+    half* __restrict__ data,           // [N, dim] in-place
+    float* __restrict__ conv_state,    // [kernel_size-1, dim] rolling state
+    const float* __restrict__ weight,  // [dim, kernel_size] conv weights
+    int N, int dim, int kernel_size)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+
+    // Load initial conv state into registers
+    float st0 = conv_state[0 * dim + d];
+    float st1 = conv_state[1 * dim + d];
+    float st2 = conv_state[2 * dim + d];
+
+    float w0 = weight[d * kernel_size + 0];
+    float w1 = weight[d * kernel_size + 1];
+    float w2 = weight[d * kernel_size + 2];
+    float w3 = weight[d * kernel_size + 3];
+
+    for (int t = 0; t < N; t++) {
+        float x_val = __half2float(data[(size_t)t * dim + d]);
+        float acc = w3 * x_val + w2 * st2 + w1 * st1 + w0 * st0;
+        float silu = acc / (1.0f + expf(-acc));
+        data[(size_t)t * dim + d] = __float2half(silu);
+
+        st0 = st1;
+        st1 = st2;
+        st2 = x_val;
+    }
+
+    // Save final conv state
+    conv_state[0 * dim + d] = st0;
+    conv_state[1 * dim + d] = st1;
+    conv_state[2 * dim + d] = st2;
+}
+
+// Batch gate/beta computation for all N tokens.
+// 2D grid: (n_heads, N), 32 threads per block (one warp).
+__global__ void __launch_bounds__(32)
+kernel_batch_compute_gate_beta(
+    const half* __restrict__ x_batch,     // [N, n_embed]
+    const void* __restrict__ alpha_w,     // Q8_0 [n_heads, n_embed/32] blocks
+    const void* __restrict__ beta_w,      // Q8_0 [n_heads, n_embed/32] blocks
+    const float* __restrict__ ssm_a,      // [n_heads]
+    const float* __restrict__ dt_bias,    // [n_heads]
+    float* __restrict__ gate_out,         // [N, n_heads]
+    float* __restrict__ beta_out,         // [N, n_heads]
+    int N, int n_embed, int n_heads)
+{
+    int head = blockIdx.x;
+    int t = blockIdx.y;
+    if (head >= n_heads || t >= N) return;
+    int lane = threadIdx.x;
+
+    const half* x = x_batch + (size_t)t * n_embed;
+    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
+    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
+    int blocks_per_head = n_embed / 32;
+
+    float alpha_acc = 0.0f;
+    float beta_acc = 0.0f;
+
+    for (int b = lane; b < blocks_per_head; b += 32) {
+        const auto& ab = alpha_blocks[head * blocks_per_head + b];
+        const auto& bb = beta_blocks[head * blocks_per_head + b];
+        float ad = __half2float(ab.d);
+        float bd = __half2float(bb.d);
+        for (int j2 = 0; j2 < 32; j2++) {
+            float x_val = __half2float(x[b * 32 + j2]);
+            alpha_acc += (ad * ab.qs[j2]) * x_val;
+            beta_acc += (bd * bb.qs[j2]) * x_val;
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        alpha_acc += __shfl_xor_sync(0xFFFFFFFF, alpha_acc, offset);
+        beta_acc += __shfl_xor_sync(0xFFFFFFFF, beta_acc, offset);
+    }
+
+    if (lane == 0) {
+        float alpha_biased = alpha_acc + dt_bias[head];
+        float sp = logf(1.0f + expf(alpha_biased));
+        gate_out[t * n_heads + head] = ssm_a[head] * sp;
+        beta_out[t * n_heads + head] = 1.0f / (1.0f + expf(-beta_acc));
+    }
+}
+
+// Persistent DeltaNet state update for all N tokens.
+// One block per head (16 blocks), 128 threads = one column of S each.
+// Includes L2 normalization of Q and K (avoids separate kernel launch).
+// S stays in global memory with coalesced access (row-major, threads span columns).
+__global__ void __launch_bounds__(128)
+kernel_deltanet_prefill(
+    float* __restrict__ S,              // [n_heads, dk, dv] recurrent state
+    const half* __restrict__ qkv_batch, // [N, 3*ssm_inner] (after conv1d)
+    const float* __restrict__ gate_batch, // [N, n_heads]
+    const float* __restrict__ beta_batch, // [N, n_heads]
+    half* __restrict__ output_batch,    // [N, ssm_inner]
+    int N, int n_heads, int dk, int dv, int ssm_inner,
+    float q_scale)
+{
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int j = threadIdx.x;  // 0..127, one column of S
+    int warp_id = j / 32;
+    int lane = j % 32;
+
+    float* S_head = S + (size_t)head * dk * dv;
+
+    __shared__ float sh_k[128];
+    __shared__ float sh_q[128];
+    __shared__ float sh_reduce[4];
+
+    for (int t = 0; t < N; t++) {
+        const half* q_ptr = qkv_batch + (size_t)t * ssm_inner * 3 + head * dk;
+        const half* k_ptr = q_ptr + ssm_inner;
+        const half* v_ptr = k_ptr + ssm_inner;
+
+        // Load and L2-normalize Q
+        float q_raw = __half2float(q_ptr[j]);
+        float q_sq = q_raw * q_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = q_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float q_inv = rsqrtf(sh_reduce[0] + 1e-12f) * q_scale;
+
+        // Load and L2-normalize K
+        float k_raw = __half2float(k_ptr[j]);
+        float k_sq = k_raw * k_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = k_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float k_inv = rsqrtf(sh_reduce[0] + 1e-12f);
+
+        sh_q[j] = q_raw * q_inv;
+        sh_k[j] = k_raw * k_inv;
+        __syncthreads();
+
+        float decay = expf(gate_batch[t * n_heads + head]);
+        float b = beta_batch[t * n_heads + head];
+
+        // Pass 1: Decay S and compute sk
+        float sk_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float val = S_head[i * 128 + j] * decay;
+            S_head[i * 128 + j] = val;
+            sk_j += val * sh_k[i];
+        }
+
+        // Pass 2: Update S and compute output
+        float d_j = (__half2float(v_ptr[j]) - sk_j) * b;
+        float o_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float updated = S_head[i * 128 + j] + sh_k[i] * d_j;
+            S_head[i * 128 + j] = updated;
+            o_j += updated * sh_q[i];
+        }
+
+        output_batch[(size_t)t * ssm_inner + head * dv + j] = __float2half(o_j);
+        __syncthreads();  // sync before next iteration's shared memory loads
+    }
+}
+
+// Batch gated RMSNorm for all N tokens.
+// Grid: N * n_heads blocks, 32 threads each.
+__global__ void __launch_bounds__(32)
+kernel_batch_gated_rmsnorm(
+    const half* __restrict__ x,        // [N, n_heads * dim_per_head]
+    const float* __restrict__ weight,  // [dim_per_head] (shared across heads)
+    const half* __restrict__ gate,     // [N, n_heads * dim_per_head]
+    half* __restrict__ output,         // [N, n_heads * dim_per_head]
+    int N, int n_heads, int dim_per_head, float eps)
+{
+    int block_id = blockIdx.x;
+    int t = block_id / n_heads;
+    int head = block_id % n_heads;
+    if (t >= N) return;
+
+    int lane = threadIdx.x;
+    int stride = n_heads * dim_per_head;
+    int base = t * stride + head * dim_per_head;
+
+    float sum_sq = 0.0f;
+    for (int i = lane; i < dim_per_head; i += 32) {
+        float val = __half2float(x[base + i]);
+        sum_sq += val * val;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+    }
+    float rms_inv = rsqrtf(sum_sq / dim_per_head + eps);
+
+    for (int i = lane; i < dim_per_head; i += 32) {
+        float x_val = __half2float(x[base + i]) * rms_inv;
+        float w = weight[i];
+        float g = __half2float(gate[base + i]);
+        float silu_g = g / (1.0f + expf(-g));
+        output[base + i] = __float2half(x_val * w * silu_g);
+    }
+}
+
+// ============================================================
+// Batch prefill kernels — multi-sequence batching
+// ============================================================
+
+// Batch conv1d + SiLU with B independent conv states.
+// Grid: (ceil(dim/256), B). Each thread handles one dimension of one sequence.
+__global__ void __launch_bounds__(256)
+kernel_batch_conv1d_silu_multi(
+    half* __restrict__ data,           // [B*L, dim] in-place (sequences contiguous in B)
+    float* __restrict__ conv_states,   // [B * (kernel_size-1) * dim] all conv states contiguous
+    const float* __restrict__ weight,  // [dim, kernel_size] conv weights (shared)
+    int B, int L, int dim, int kernel_size)
+{
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.y;
+    if (d >= dim || b >= B) return;
+
+    int conv_stride = (kernel_size - 1) * dim;
+    float* conv = conv_states + (size_t)b * conv_stride;
+    half* seq_data = data + (size_t)b * L * dim;
+
+    float st0 = conv[0 * dim + d];
+    float st1 = conv[1 * dim + d];
+    float st2 = conv[2 * dim + d];
+
+    float w0 = weight[d * kernel_size + 0];
+    float w1 = weight[d * kernel_size + 1];
+    float w2 = weight[d * kernel_size + 2];
+    float w3 = weight[d * kernel_size + 3];
+
+    for (int t = 0; t < L; t++) {
+        float x_val = __half2float(seq_data[(size_t)t * dim + d]);
+        float acc = w3 * x_val + w2 * st2 + w1 * st1 + w0 * st0;
+        float silu = acc / (1.0f + expf(-acc));
+        seq_data[(size_t)t * dim + d] = __float2half(silu);
+        st0 = st1; st1 = st2; st2 = x_val;
+    }
+
+    conv[0 * dim + d] = st0;
+    conv[1 * dim + d] = st1;
+    conv[2 * dim + d] = st2;
+}
+
+// Persistent DeltaNet prefill for B sequences in parallel.
+// Grid: n_heads * B blocks, 128 threads each.
+// Each block processes L tokens of one (batch, head) pair.
+__global__ void __launch_bounds__(128)
+kernel_deltanet_prefill_batch(
+    float* __restrict__ S,              // [B * n_heads * dk * dv] all S states
+    const half* __restrict__ qkv_batch, // [B*L, 3*ssm_inner] (sequences contiguous in B)
+    const float* __restrict__ gate_batch, // [B*L, n_heads]
+    const float* __restrict__ beta_batch, // [B*L, n_heads]
+    half* __restrict__ output_batch,    // [B*L, ssm_inner]
+    int B, int L, int n_heads, int dk, int dv, int ssm_inner,
+    float q_scale)
+{
+    int block_id = blockIdx.x;
+    int b = block_id / n_heads;
+    int head = block_id % n_heads;
+    if (b >= B) return;
+    int j = threadIdx.x;  // 0..127, one column of S
+    int warp_id = j / 32;
+    int lane = j % 32;
+
+    float* S_head = S + ((size_t)b * n_heads + head) * dk * dv;
+
+    __shared__ float sh_k[128];
+    __shared__ float sh_q[128];
+    __shared__ float sh_reduce[4];
+
+    for (int t = 0; t < L; t++) {
+        int global_t = b * L + t;
+        const half* q_ptr = qkv_batch + (size_t)global_t * ssm_inner * 3 + head * dk;
+        const half* k_ptr = q_ptr + ssm_inner;
+        const half* v_ptr = k_ptr + ssm_inner;
+
+        // Load and L2-normalize Q
+        float q_raw = __half2float(q_ptr[j]);
+        float q_sq = q_raw * q_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = q_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float q_inv = rsqrtf(sh_reduce[0] + 1e-12f) * q_scale;
+
+        // Load and L2-normalize K
+        float k_raw = __half2float(k_ptr[j]);
+        float k_sq = k_raw * k_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = k_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float k_inv = rsqrtf(sh_reduce[0] + 1e-12f);
+
+        sh_q[j] = q_raw * q_inv;
+        sh_k[j] = k_raw * k_inv;
+        __syncthreads();
+
+        float decay = expf(gate_batch[global_t * n_heads + head]);
+        float beta = beta_batch[global_t * n_heads + head];
+
+        // Pass 1: Decay S and compute sk
+        float sk_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float val = S_head[i * 128 + j] * decay;
+            S_head[i * 128 + j] = val;
+            sk_j += val * sh_k[i];
+        }
+
+        // Pass 2: Update S and compute output
+        float d_j = (__half2float(v_ptr[j]) - sk_j) * beta;
+        float o_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float updated = S_head[i * 128 + j] + sh_k[i] * d_j;
+            S_head[i * 128 + j] = updated;
+            o_j += updated * sh_q[i];
+        }
+
+        output_batch[(size_t)global_t * ssm_inner + head * dv + j] = __float2half(o_j);
+        __syncthreads();
+    }
+}
+
+// Batched RoPE for prefill: apply RoPE to all B*L tokens.
+// Position for token i = i % L (each sequence starts at pos 0).
+// Grid.x: n_heads + n_kv_heads, Grid.y: B*L tokens.
+__global__ void __launch_bounds__(256)
+kernel_rope_batch(
+    half* __restrict__ q,    // [B*L, n_heads * head_dim]
+    half* __restrict__ k,    // [B*L, n_kv_heads * head_dim]
+    int n_heads, int n_kv_heads, int head_dim,
+    int L, float theta, int rope_dim)
+{
+    int head = blockIdx.x;
+    int token_idx = blockIdx.y;
+    int pos = token_idx % L;
+
+    int is_k = (head >= n_heads);
+    int actual_head;
+    half* vec;
+
+    int q_stride = n_heads * head_dim;
+    int kv_stride = n_kv_heads * head_dim;
+
+    if (!is_k) {
+        actual_head = head;
+        vec = q + (size_t)token_idx * q_stride + actual_head * head_dim;
+    } else {
+        actual_head = head - n_heads;
+        if (actual_head >= n_kv_heads) return;
+        vec = k + (size_t)token_idx * kv_stride + actual_head * head_dim;
+    }
+
+    int tid = threadIdx.x;
+    int n_pairs = rope_dim / 2;
+    if (tid >= n_pairs) return;
+
+    float freq_exp = -2.0f * tid / (float)rope_dim;
+    float freq = (float)pos * powf(theta, freq_exp);
+    float cos_val = cosf(freq);
+    float sin_val = sinf(freq);
+
+    int d0 = 2 * tid, d1 = 2 * tid + 1;
+    float x0 = __half2float(vec[d0]);
+    float x1 = __half2float(vec[d1]);
+    vec[d0] = __float2half(x0 * cos_val - x1 * sin_val);
+    vec[d1] = __float2half(x0 * sin_val + x1 * cos_val);
+}
+
+// Batched deinterleave Q+gate for all B*L tokens.
+// Input: [B*L, n_head * head_dim * 2] interleaved
+// Output: [B*L, n_head * head_dim] Q, [B*L, n_head * head_dim] gate
+// Grid: (ceil(n_head*head_dim / 256), B*L)
+__global__ void __launch_bounds__(256)
+kernel_deinterleave_qgate_batch(
+    const half* __restrict__ interleaved,  // [B*L, n_head * head_dim * 2]
+    half* __restrict__ q_out,              // [B*L, n_head * head_dim]
+    half* __restrict__ gate_out,           // [B*L, n_head * head_dim]
+    int n_tokens, int n_head, int head_dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int token = blockIdx.y;
+    int total = n_head * head_dim;
+    if (idx >= total || token >= n_tokens) return;
+
+    int h = idx / head_dim;
+    int d = idx % head_dim;
+
+    size_t src_base = (size_t)token * n_head * head_dim * 2;
+    int src_q = h * head_dim * 2 + d;
+    int src_g = h * head_dim * 2 + head_dim + d;
+
+    size_t dst_offset = (size_t)token * total + idx;
+    q_out[dst_offset] = interleaved[src_base + src_q];
+    gate_out[dst_offset] = interleaved[src_base + src_g];
+}
+
+// Flash-attention-style batched causal self-attention for prefill.
+// One warp (32 threads) per (batch, q_head) pair.
+// Each warp processes all L query positions with online softmax.
+// No materialized score matrix — O(1) extra memory per block.
+// GQA: n_head Q heads share n_kv_heads K/V heads.
+__global__ void __launch_bounds__(32)
+kernel_batch_causal_attn(
+    const half* __restrict__ Q,       // [B*L, n_head * head_dim]
+    const half* __restrict__ K,       // [B*L, n_kv_heads * head_dim]
+    const half* __restrict__ V,       // [B*L, n_kv_heads * head_dim]
+    half* __restrict__ output,        // [B*L, n_head * head_dim]
+    int L, int n_head, int n_kv_heads, int head_dim, float scale)
+{
+    int block_id = blockIdx.x;
+    int b = block_id / n_head;
+    int h = block_id % n_head;
+    int kv_h = h * n_kv_heads / n_head;  // GQA mapping
+    int lane = threadIdx.x;  // 0..31
+
+    int q_stride = n_head * head_dim;
+    int kv_stride = n_kv_heads * head_dim;
+    int elems = head_dim / 32;  // 8 for head_dim=256
+
+    for (int t = 0; t < L; t++) {
+        const half* q_ptr = Q + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
+
+        float q_local[8];
+        #pragma unroll
+        for (int e = 0; e < 8; e++) q_local[e] = __half2float(q_ptr[e]) * scale;
+
+        float max_score = -FLT_MAX;
+        float sum_exp = 0.0f;
+        float o_local[8] = {};
+
+        for (int k = 0; k <= t; k++) {
+            const half* k_ptr = K + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) dot += q_local[e] * __half2float(k_ptr[e]);
+
+            // Warp reduction — all 32 lanes get the full dot product
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
+
+            // Online softmax update
+            float old_max = max_score;
+            max_score = fmaxf(max_score, dot);
+            float rescale = expf(old_max - max_score);
+            sum_exp = sum_exp * rescale + expf(dot - max_score);
+
+            #pragma unroll
+            for (int e = 0; e < 8; e++) o_local[e] *= rescale;
+
+            float w = expf(dot - max_score);
+            const half* v_ptr = V + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) o_local[e] += w * __half2float(v_ptr[e]);
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+        half* o_ptr = output + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) o_ptr[e] = __float2half(o_local[e] * inv_sum);
+    }
+}
+
+// Batched sigmoid-mul: output[i] = attn[i] * sigmoid(gate[i]) for all B*L tokens
+__global__ void __launch_bounds__(256)
+kernel_sigmoid_mul_batch(
+    const half* __restrict__ attn,     // [N, dim]
+    const half* __restrict__ gate,     // [N, dim]
+    half* __restrict__ output,         // [N, dim]
+    int total)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    float a = __half2float(attn[idx]);
+    float g = __half2float(gate[idx]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    output[idx] = __float2half(a * sig);
+}
+
+// ============================================================
 // GQA attention decode kernel (multi-warp)
 // ============================================================
 // 8 warps (256 threads) per query head for better SM utilization
@@ -484,6 +1014,12 @@ kernel_argmax_reduce(const float* __restrict__ partial_max,
     if (tid == 0) *result = s_idx[0];
 }
 
+// Remap argmax result through a token ID lookup table (for reduced LM head)
+__global__ void kernel_remap_token(const int* __restrict__ token_map,
+                                   int* __restrict__ argmax_result) {
+    *argmax_result = token_map[*argmax_result];
+}
+
 // ============================================================
 // KV cache store kernel (reads pos from device memory for graph capture)
 // ============================================================
@@ -588,8 +1124,8 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     d_argmax_token = static_cast<int*>(a(sizeof(int)));
     argmax_partial_max = static_cast<float*>(a(ARGMAX_BLOCKS * sizeof(float)));
     argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
-    // d_token_id and d_pos are adjacent so we can copy both in one call
-    d_token_id = static_cast<int*>(a(2 * sizeof(int)));
+    // d_token_id layout: [tok_a, pos_a, tok_b, pos_b] — 4 ints for batch2 support
+    d_token_id = static_cast<int*>(a(4 * sizeof(int)));
     d_pos = d_token_id + 1;
     max_seq_alloc = max_seq;
 
@@ -669,6 +1205,50 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     size_t qkv_dim = cfg.ssm_inner_size * 3;  // 6144 (DeltaNet) — also big enough for attn Q+gate (4096)
     prefill_proj_qkv  = static_cast<half*>(a(max_tokens * qkv_dim * sizeof(half)));
     prefill_proj_gate = static_cast<half*>(a(max_tokens * cfg.ssm_inner_size * sizeof(half)));
+
+    // Batch DeltaNet gate/beta buffers and pre-allocated token IDs
+    prefill_dn_gate = static_cast<float*>(a(max_tokens * cfg.ssm_n_heads * sizeof(float)));
+    prefill_dn_beta = static_cast<float*>(a(max_tokens * cfg.ssm_n_heads * sizeof(float)));
+    d_prefill_tokens = static_cast<int*>(a(max_tokens * sizeof(int)));
+}
+
+// ============================================================
+// Batch prefill allocation (B independent sequences)
+// ============================================================
+
+void InferenceState::allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
+                                             int max_total_tokens, int max_seqs) {
+    // Allocate prefill buffers for max_total_tokens (= max_seqs * max_seq_len)
+    allocate_prefill(cfg, alloc, max_total_tokens);
+    max_batch_seqs = max_seqs;
+
+    auto a = [&](size_t bytes) -> void* { return alloc.alloc(bytes); };
+
+    // Count DeltaNet layers
+    n_batch_dn_layers = 0;
+    for (uint32_t i = 0; i < cfg.n_layers; i++) {
+        if (!cfg.is_full_attention_layer(i)) n_batch_dn_layers++;
+    }
+
+    // Allocate B independent DeltaNet S states: [max_seqs * n_dn_layers * n_heads * dk * dv]
+    int n_heads = cfg.ssm_n_heads;
+    int dk = cfg.ssm_state_size;
+    int dv = cfg.ssm_state_size;
+    size_t S_per_layer = (size_t)n_heads * dk * dv * sizeof(float);
+    size_t S_total = (size_t)max_seqs * n_batch_dn_layers * S_per_layer;
+    batch_dn_S = static_cast<float*>(a(S_total));
+
+    // Allocate B independent conv states: [max_seqs * n_dn_layers * (conv_kernel-1) * qkv_dim]
+    int qkv_dim = cfg.ssm_inner_size * 3;
+    int conv_km1 = cfg.ssm_conv_kernel - 1;  // 3
+    size_t conv_per_layer = (size_t)conv_km1 * qkv_dim * sizeof(float);
+    size_t conv_total = (size_t)max_seqs * n_batch_dn_layers * conv_per_layer;
+    batch_dn_conv = static_cast<float*>(a(conv_total));
+
+    printf("Batch prefill: max_seqs=%d, max_tokens=%d\n", max_seqs, max_total_tokens);
+    printf("  DeltaNet S states: %.1f MB (%d seqs × %d layers × %.0f KB/layer)\n",
+           S_total / 1024.0 / 1024.0, max_seqs, n_batch_dn_layers, S_per_layer / 1024.0);
+    printf("  Conv states: %.1f MB\n", conv_total / 1024.0 / 1024.0);
 }
 
 // ============================================================
@@ -698,50 +1278,173 @@ void InferenceState::allocate_mtp(const ModelConfig& cfg, CudaAllocator& alloc, 
     d_mtp_token = static_cast<int*>(a(2 * sizeof(int)));
     d_mtp_pos = d_mtp_token + 1;
 
-    // DeltaNet state checkpoint buffers (for speculative decode rollback)
-    for (auto& state : deltanet_states) {
-        size_t S_bytes = (size_t)state.n_heads * state.state_size * state.state_size * sizeof(float);
-        size_t conv_bytes = (size_t)(state.conv_kernel - 1) * state.qkv_dim * sizeof(float);
-        dn_S_checkpoint.push_back(static_cast<float*>(a(S_bytes)));
-        dn_conv_checkpoint.push_back(static_cast<float*>(a(conv_bytes)));
-    }
+    // Token A hidden state backup (for reject path: swap into mtp_hidden)
+    mtp_hidden_b = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
 
-    printf("MTP state allocated (KV cache: %.1f MB, checkpoints: %.1f MB)\n",
-           2 * kv_bytes / 1024.0 / 1024.0,
-           deltanet_states.size() > 0 ?
-               deltanet_states.size() * (
-                   (size_t)deltanet_states[0].n_heads * deltanet_states[0].state_size *
-                   deltanet_states[0].state_size * sizeof(float) +
-                   (size_t)(deltanet_states[0].conv_kernel - 1) * deltanet_states[0].qkv_dim * sizeof(float)
-               ) / 1024.0 / 1024.0 : 0.0);
+    // Activation replay buffers (replaces 19.3 MB checkpoint with ~578 KB cache)
+    n_dn_layers = (int)deltanet_states.size();
+    if (n_dn_layers > 0) {
+        const auto& s0 = deltanet_states[0];
+        int dk = s0.state_size, dv = s0.state_size;
+        int n_heads = s0.n_heads;
+        int qkv_dim = s0.qkv_dim;
+
+        // S snapshots: one per DeltaNet layer, saved after token A in 2tok loop
+        size_t S_bytes_per_layer = (size_t)n_heads * dk * dv * sizeof(float);
+        for (int i = 0; i < n_dn_layers; i++) {
+            dn_S_snapshot.push_back(static_cast<float*>(a(S_bytes_per_layer)));
+        }
+
+        // conv_state[0] per layer: [qkv_dim] float
+        size_t conv_replay_bytes = (size_t)n_dn_layers * qkv_dim * sizeof(float);
+        dn_replay_conv_row = static_cast<float*>(a(conv_replay_bytes));
+
+        // Device pointer array for batched conv undo kernel
+        d_conv_ptrs = static_cast<float**>(a(n_dn_layers * sizeof(float*)));
+        std::vector<float*> h_conv_ptrs(n_dn_layers);
+        for (int i = 0; i < n_dn_layers; i++) {
+            h_conv_ptrs[i] = deltanet_states[i].conv_state;
+        }
+        GWEN_CHECK_CUDA(cudaMemcpy(d_conv_ptrs, h_conv_ptrs.data(),
+                                    n_dn_layers * sizeof(float*), cudaMemcpyHostToDevice));
+
+        size_t replay_total = n_dn_layers * S_bytes_per_layer + conv_replay_bytes;
+        printf("MTP state allocated (KV cache: %.1f MB, replay buffers: %.1f KB)\n",
+               2 * kv_bytes / 1024.0 / 1024.0, replay_total / 1024.0);
+    } else {
+        printf("MTP state allocated (KV cache: %.1f MB, no DeltaNet layers)\n",
+               2 * kv_bytes / 1024.0 / 1024.0);
+    }
+}
+
+// ============================================================
+// Batch-2 scratch allocation (token B buffers for 2-token verify)
+// ============================================================
+
+void InferenceState::allocate_batch2(const ModelConfig& cfg, CudaAllocator& alloc) {
+    auto a = [&](size_t bytes) -> void* { return alloc.alloc(bytes); };
+
+    b2_buf_a     = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
+    b2_buf_b     = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
+    b2_x_norm    = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
+
+    int qkv_dim = cfg.ssm_inner_size * 3;
+    b2_qkv       = static_cast<half*>(a(qkv_dim * sizeof(half)));
+    b2_gate_z    = static_cast<half*>(a(cfg.ssm_inner_size * sizeof(half)));
+    b2_attn_out  = static_cast<half*>(a(cfg.ssm_inner_size * sizeof(half)));
+    b2_gated_out = static_cast<half*>(a(cfg.ssm_inner_size * sizeof(half)));
+
+    int q_dim = cfg.n_head * cfg.head_dim * 2;
+    b2_fa_q      = static_cast<half*>(a(q_dim * sizeof(half)));
+    b2_fa_k      = static_cast<half*>(a(cfg.n_head_kv * cfg.head_dim * sizeof(half)));
+    b2_fa_v      = static_cast<half*>(a(cfg.n_head_kv * cfg.head_dim * sizeof(half)));
+
+    b2_ffn_gate  = static_cast<half*>(a(cfg.n_ff * sizeof(half)));
+    b2_ffn_up    = static_cast<half*>(a(cfg.n_ff * sizeof(half)));
+    b2_ffn_out   = static_cast<half*>(a(cfg.n_ff * sizeof(half)));
+
+    b2_logits_h  = static_cast<half*>(a(cfg.n_vocab * sizeof(half)));
+    b2_logits_f  = static_cast<float*>(a(cfg.n_vocab * sizeof(float)));
+
+    int max_q8_dim = std::max(cfg.n_ff, std::max(cfg.n_embed, cfg.ssm_inner_size));
+    int q8_blocks = (max_q8_dim + 31) / 32;
+    b2_x_q8_a = a(q8_blocks * 36);
+    b2_x_q8_b = a(q8_blocks * 36);
+
+    b2_d_argmax = static_cast<int*>(a(sizeof(int)));
+    b2_argmax_partial_max = static_cast<float*>(a(ARGMAX_BLOCKS * sizeof(float)));
+    b2_argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
+
+    batch2_allocated = true;
+    printf("Batch-2 verify buffers allocated\n");
 }
 
 // ============================================================
 // DeltaNet state checkpoint / restore (for speculative decode rollback)
 // ============================================================
 
-void InferenceState::save_deltanet_checkpoint(cudaStream_t stream) {
-    for (size_t i = 0; i < deltanet_states.size(); i++) {
-        auto& state = deltanet_states[i];
-        size_t S_bytes = (size_t)state.n_heads * state.state_size * state.state_size * sizeof(float);
-        size_t conv_bytes = (size_t)(state.conv_kernel - 1) * state.qkv_dim * sizeof(float);
-        GWEN_CHECK_CUDA(cudaMemcpyAsync(dn_S_checkpoint[i], state.S, S_bytes,
-                                          cudaMemcpyDeviceToDevice, stream));
-        GWEN_CHECK_CUDA(cudaMemcpyAsync(dn_conv_checkpoint[i], state.conv_state, conv_bytes,
-                                          cudaMemcpyDeviceToDevice, stream));
-    }
+// ============================================================
+// Conv1d state undo kernel (for speculative decode reject)
+// ============================================================
+
+__global__ void __launch_bounds__(256)
+kernel_conv1d_undo_batch(
+    float** __restrict__ conv_ptrs,        // [n_layers] conv_state pointers
+    const float* __restrict__ saved_rows,  // [n_layers, dim] saved row 0
+    int dim, int n_layers)
+{
+    int layer = blockIdx.y;
+    if (layer >= n_layers) return;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dim) return;
+
+    float* conv = conv_ptrs[layer];
+
+    // Reverse shift: current [row2, x_A, x_B] → restore [saved_row0, row2, x_A]
+    float row2 = conv[0 * dim + idx];
+    float x_A  = conv[1 * dim + idx];
+
+    conv[0 * dim + idx] = saved_rows[layer * dim + idx];
+    conv[1 * dim + idx] = row2;
+    conv[2 * dim + idx] = x_A;
 }
 
-void InferenceState::restore_deltanet_checkpoint(cudaStream_t stream) {
-    for (size_t i = 0; i < deltanet_states.size(); i++) {
+void InferenceState::undo_deltanet_token_b(cudaStream_t stream) {
+    const auto& s0 = deltanet_states[0];
+    int qkv_dim = s0.qkv_dim;
+
+    // Restore S from snapshots (exact — saved after token A's decode)
+    for (int i = 0; i < n_dn_layers; i++) {
         auto& state = deltanet_states[i];
         size_t S_bytes = (size_t)state.n_heads * state.state_size * state.state_size * sizeof(float);
-        size_t conv_bytes = (size_t)(state.conv_kernel - 1) * state.qkv_dim * sizeof(float);
-        GWEN_CHECK_CUDA(cudaMemcpyAsync(state.S, dn_S_checkpoint[i], S_bytes,
-                                          cudaMemcpyDeviceToDevice, stream));
-        GWEN_CHECK_CUDA(cudaMemcpyAsync(state.conv_state, dn_conv_checkpoint[i], conv_bytes,
+        GWEN_CHECK_CUDA(cudaMemcpyAsync(state.S, dn_S_snapshot[i], S_bytes,
                                           cudaMemcpyDeviceToDevice, stream));
     }
+
+    // Undo conv1d state shift: 1 kernel launch
+    int conv_blocks = (qkv_dim + 255) / 256;
+    dim3 grid_c(conv_blocks, n_dn_layers);
+    kernel_conv1d_undo_batch<<<grid_c, 256, 0, stream>>>(
+        d_conv_ptrs, dn_replay_conv_row,
+        qkv_dim, n_dn_layers);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+// ============================================================
+// Reset all recurrent state for independent sequence processing
+// ============================================================
+
+void InferenceState::reset_state() {
+    for (auto& state : deltanet_states) {
+        size_t S_bytes = (size_t)state.n_heads * state.state_size * state.state_size * sizeof(float);
+        size_t conv_bytes = (size_t)(state.conv_kernel - 1) * state.qkv_dim * sizeof(float);
+        GWEN_CHECK_CUDA(cudaMemset(state.S, 0, S_bytes));
+        GWEN_CHECK_CUDA(cudaMemset(state.conv_state, 0, conv_bytes));
+    }
+    for (auto& cache : kv_caches) {
+        size_t kv_bytes = (size_t)cache.max_seq * cache.n_kv_heads * cache.head_dim * sizeof(half);
+        GWEN_CHECK_CUDA(cudaMemset(cache.k_cache, 0, kv_bytes));
+        GWEN_CHECK_CUDA(cudaMemset(cache.v_cache, 0, kv_bytes));
+    }
+    if (mtp_kv_cache.k_cache) {
+        size_t kv_bytes = (size_t)mtp_kv_cache.max_seq * mtp_kv_cache.n_kv_heads * mtp_kv_cache.head_dim * sizeof(half);
+        GWEN_CHECK_CUDA(cudaMemset(mtp_kv_cache.k_cache, 0, kv_bytes));
+        GWEN_CHECK_CUDA(cudaMemset(mtp_kv_cache.v_cache, 0, kv_bytes));
+    }
+    pos = 0;
+    mtp_pos = 0;
+}
+
+// ============================================================
+// Extract hidden states for all tokens (prefill layers only)
+// ============================================================
+
+void InferenceState::extract_hidden(Model& model, const std::vector<int>& tokens, void* output_host) {
+    reset_state();
+    forward_prefill(model, tokens);
+    // After forward_prefill, prefill_x holds [N, n_embed] hidden states (FP16)
+    size_t bytes = (size_t)tokens.size() * model.config.n_embed * sizeof(half);
+    GWEN_CHECK_CUDA(cudaMemcpy(output_host, prefill_x, bytes, cudaMemcpyDeviceToHost));
 }
 
 // ============================================================
@@ -801,7 +1504,7 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
 
             kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
                 state.S, q, k, v, d_alpha, d_beta,
-                attn_out, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+                attn_out, nullptr, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
 
             // Fused gated RMSNorm + Q8_1 quantize
             kernel_gated_rmsnorm_quantize_q8_1<<<cfg.ssm_n_heads, 128, 0, s>>>(
@@ -913,6 +1616,325 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
 
     kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
     kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
+}
+
+// ============================================================
+// 2-token forward body — batch GEMV reads weights once for 2 tokens
+// ============================================================
+// Token A: d_token_id[0], d_pos[0] → buf_a (hidden) → d_argmax_token (result)
+// Token B: d_token_id[1], d_pos[1] → b2_buf_a (hidden) → b2_d_argmax (result)
+// d_token_id layout: [tok_a, pos_a, tok_b, pos_b] (4 ints, one cudaMemcpy)
+
+void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
+    const auto& cfg = model.config;
+    const float q_scale = 1.0f / sqrtf((float)cfg.ssm_state_size);
+
+    // Aliases for token A (existing buffers) and token B (b2_ buffers)
+    // Token A hidden: buf_a/buf_b (pointer-swap residual), x_norm, qkv, gate_z, ...
+    // Token B hidden: b2_buf_a/b2_buf_b, b2_x_norm, b2_qkv, b2_gate_z, ...
+
+    // We use d_token_id / d_pos for token A, and a separate pair for token B.
+    // Layout: d_token_id[0]=tok_a, d_token_id[1]=pos_a (d_pos), d_token_id[2]=tok_b, d_token_id[3]=pos_b
+    int* d_token_b = d_token_id + 2;
+    int* d_pos_b   = d_token_id + 3;
+
+    // 1. Embedding lookup for both tokens
+    gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
+                      d_token_id, buf_a, cfg.n_embed, s);
+    gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
+                      d_token_b, b2_buf_a, cfg.n_embed, s);
+
+    int dn_state_idx = 0;
+    int kv_cache_idx = 0;
+
+    // 2. Process each layer — token A first (state update), then token B, batch GEMV where possible
+    for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
+        const auto& layer = model.layers[layer_idx];
+
+        if (!layer.is_full_attention) {
+            const auto& w = layer.deltanet;
+            int dn_idx = dn_state_idx++;
+            auto& state = deltanet_states[dn_idx];
+
+            // --- RMSNorm + Q8_1 quantize for both tokens ---
+            gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_quantize_q8_1(b2_buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              b2_x_q8_a, b2_x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+
+            // --- Batch2 GEMV: QKV and gate projections (read weights once) ---
+            gwen_gemv_dp4a_batch2(w.attn_qkv.device_data, x_q8_a, b2_x_q8_a,
+                      qkv, b2_qkv,
+                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], w.attn_qkv.type, s);
+            gwen_gemv_dp4a_batch2(w.attn_gate.device_data, x_q8_a, b2_x_q8_a,
+                      gate_z, b2_gate_z,
+                      w.attn_gate.shape[1], w.attn_gate.shape[0], w.attn_gate.type, s);
+
+            int qkv_dim = cfg.ssm_inner_size * 3;
+            int conv_blocks = (qkv_dim + 255) / 256;
+
+            // --- Sequential: Conv1D + state ops for token A ---
+            kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
+                qkv, qkv, state.conv_state,
+                static_cast<const float*>(w.ssm_conv1d.device_data),
+                qkv_dim, cfg.ssm_conv_kernel);
+
+            half *qa = qkv, *ka = qkv + cfg.ssm_inner_size, *va = qkv + 2 * cfg.ssm_inner_size;
+            gwen_l2_normalize(qa, qa, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
+            gwen_l2_normalize(ka, ka, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
+
+            kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
+                x_norm, w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                static_cast<const float*>(w.ssm_a.device_data),
+                static_cast<const float*>(w.ssm_dt_bias.device_data),
+                d_alpha, d_beta, cfg.n_embed, cfg.ssm_n_heads);
+
+            kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                state.S, qa, ka, va, d_alpha, d_beta,
+                attn_out, nullptr, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+
+            // --- Save S snapshot after token A, before token B ---
+            // 1 MB D2D per layer (baked into CUDA graph, ~1 μs each)
+            if (dn_idx < (int)dn_S_snapshot.size()) {
+                size_t S_bytes = (size_t)cfg.ssm_n_heads * cfg.ssm_state_size * cfg.ssm_state_size * sizeof(float);
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(
+                    dn_S_snapshot[dn_idx], state.S, S_bytes,
+                    cudaMemcpyDeviceToDevice, s));
+            }
+
+            // --- Save conv_state[0] before token B's conv1d shifts it out ---
+            if (dn_replay_conv_row) {
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(
+                    dn_replay_conv_row + dn_idx * qkv_dim,
+                    state.conv_state,
+                    qkv_dim * sizeof(float),
+                    cudaMemcpyDeviceToDevice, s));
+            }
+
+            // --- Sequential: Conv1D + state ops for token B (uses updated state) ---
+            kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
+                b2_qkv, b2_qkv, state.conv_state,
+                static_cast<const float*>(w.ssm_conv1d.device_data),
+                qkv_dim, cfg.ssm_conv_kernel);
+
+            half *qb = b2_qkv, *kb = b2_qkv + cfg.ssm_inner_size, *vb = b2_qkv + 2 * cfg.ssm_inner_size;
+            gwen_l2_normalize(qb, qb, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
+            gwen_l2_normalize(kb, kb, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
+
+            kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
+                b2_x_norm, w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                static_cast<const float*>(w.ssm_a.device_data),
+                static_cast<const float*>(w.ssm_dt_bias.device_data),
+                d_alpha, d_beta, cfg.n_embed, cfg.ssm_n_heads);
+
+            kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                state.S, qb, kb, vb, d_alpha, d_beta,
+                b2_attn_out, nullptr, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+
+            // --- Gated RMSNorm + Q8_1 for both tokens ---
+            kernel_gated_rmsnorm_quantize_q8_1<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                attn_out, static_cast<const float*>(w.ssm_norm.device_data),
+                gate_z, static_cast<block_q8_1*>(x_q8_b),
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
+            kernel_gated_rmsnorm_quantize_q8_1<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                b2_attn_out, static_cast<const float*>(w.ssm_norm.device_data),
+                b2_gate_z, static_cast<block_q8_1*>(b2_x_q8_b),
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
+
+            // --- Batch2 GEMV: ssm_out with residual ---
+            gwen_gemv_dp4a_residual_batch2(w.ssm_out.device_data, x_q8_b, b2_x_q8_b,
+                      buf_b, b2_buf_b, buf_a, b2_buf_a,
+                      w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type, s);
+
+            // --- RMSNorm + Q8_1 for both tokens (FFN input) ---
+            gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_quantize_q8_1(b2_buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              b2_x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+
+            // --- Batch2 GEMV: FFN gate and up ---
+            gwen_gemv_dp4a_batch2(w.ffn_gate.device_data, x_q8_a, b2_x_q8_a,
+                      ffn_gate, b2_ffn_gate,
+                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
+            gwen_gemv_dp4a_batch2(w.ffn_up.device_data, x_q8_a, b2_x_q8_a,
+                      ffn_up, b2_ffn_up,
+                      w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
+
+            // --- SwiGLU + Q8_1 for both tokens ---
+            gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
+            gwen_swiglu_quantize_q8_1(b2_ffn_gate, b2_ffn_up, b2_x_q8_b, cfg.n_ff, s);
+
+            // --- Batch2 GEMV: FFN down with residual ---
+            gwen_gemv_dp4a_residual_batch2(w.ffn_down.device_data, x_q8_b, b2_x_q8_b,
+                      buf_a, b2_buf_a, buf_b, b2_buf_b,
+                      w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
+
+        } else {
+            const auto& w = layer.full_attn;
+            auto& cache = kv_caches[kv_cache_idx++];
+
+            // --- RMSNorm + Q8_1 for both tokens ---
+            gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_quantize_q8_1(b2_buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              b2_x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+
+            // --- Batch2 GEMV: Q, K, V projections ---
+            gwen_gemv_dp4a_batch2(w.attn_q.device_data, x_q8_a, b2_x_q8_a,
+                      qkv, b2_qkv,
+                      w.attn_q.shape[1], w.attn_q.shape[0], w.attn_q.type, s);
+            gwen_gemv_dp4a_batch2(w.attn_k.device_data, x_q8_a, b2_x_q8_a,
+                      fa_k, b2_fa_k,
+                      w.attn_k.shape[1], w.attn_k.shape[0], w.attn_k.type, s);
+            gwen_gemv_dp4a_batch2(w.attn_v.device_data, x_q8_a, b2_x_q8_a,
+                      fa_v, b2_fa_v,
+                      w.attn_v.shape[1], w.attn_v.shape[0], w.attn_v.type, s);
+
+            // --- Token A: deinterleave, norms, RoPE, KV store, attention ---
+            {
+                int attn_dim = cfg.n_head * cfg.head_dim;
+                int deint_blocks = (attn_dim + 255) / 256;
+                kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
+                    qkv, fa_q, gated_out, cfg.n_head, cfg.head_dim);
+            }
+            gwen_rmsnorm_batched_f32w(fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
+                                      fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_batched_f32w(fa_k, static_cast<const float*>(w.attn_k_norm.device_data),
+                                      fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
+            gwen_rope(fa_q, fa_k, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
+                      d_pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim, s);
+            {
+                int kv_dim = cfg.n_head_kv * cfg.head_dim;
+                int kv_blocks = (kv_dim + 255) / 256;
+                kernel_kv_cache_store<<<kv_blocks, 256, 0, s>>>(
+                    cache.k_cache, cache.v_cache, fa_k, fa_v, d_pos, kv_dim);
+            }
+            {
+                float scale = 1.0f / sqrtf((float)cfg.head_dim);
+                kernel_gqa_attention_decode<<<cfg.n_head, 256, 0, s>>>(
+                    fa_q, cache.k_cache, cache.v_cache,
+                    attn_out, attn_scores, d_pos,
+                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
+            }
+            {
+                int attn_dim = cfg.n_head * cfg.head_dim;
+                gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
+            }
+
+            // --- Token B: deinterleave, norms, RoPE, KV store, attention ---
+            {
+                int attn_dim = cfg.n_head * cfg.head_dim;
+                int deint_blocks = (attn_dim + 255) / 256;
+                kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
+                    b2_qkv, b2_fa_q, b2_gated_out, cfg.n_head, cfg.head_dim);
+            }
+            gwen_rmsnorm_batched_f32w(b2_fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
+                                      b2_fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_batched_f32w(b2_fa_k, static_cast<const float*>(w.attn_k_norm.device_data),
+                                      b2_fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
+            gwen_rope(b2_fa_q, b2_fa_k, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
+                      d_pos_b, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim, s);
+            {
+                int kv_dim = cfg.n_head_kv * cfg.head_dim;
+                int kv_blocks = (kv_dim + 255) / 256;
+                kernel_kv_cache_store<<<kv_blocks, 256, 0, s>>>(
+                    cache.k_cache, cache.v_cache, b2_fa_k, b2_fa_v, d_pos_b, kv_dim);
+            }
+            {
+                float scale = 1.0f / sqrtf((float)cfg.head_dim);
+                kernel_gqa_attention_decode<<<cfg.n_head, 256, 0, s>>>(
+                    b2_fa_q, cache.k_cache, cache.v_cache,
+                    b2_attn_out, attn_scores, d_pos_b,
+                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
+            }
+            {
+                int attn_dim = cfg.n_head * cfg.head_dim;
+                gwen_sigmoid_mul(b2_attn_out, b2_gated_out, b2_gated_out, attn_dim, s);
+            }
+
+            // --- Quantize gated outputs + batch2 output proj with residual ---
+            gwen_quantize_q8_1(gated_out, x_q8_b, cfg.n_head * cfg.head_dim, s);
+            gwen_quantize_q8_1(b2_gated_out, b2_x_q8_b, cfg.n_head * cfg.head_dim, s);
+            gwen_gemv_dp4a_residual_batch2(w.attn_output.device_data, x_q8_b, b2_x_q8_b,
+                      buf_b, b2_buf_b, buf_a, b2_buf_a,
+                      w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type, s);
+
+            // --- RMSNorm + Q8_1 for FFN ---
+            gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_quantize_q8_1(b2_buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              b2_x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+
+            // --- Batch2 GEMV: FFN ---
+            gwen_gemv_dp4a_batch2(w.ffn_gate.device_data, x_q8_a, b2_x_q8_a,
+                      ffn_gate, b2_ffn_gate,
+                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
+            gwen_gemv_dp4a_batch2(w.ffn_up.device_data, x_q8_a, b2_x_q8_a,
+                      ffn_up, b2_ffn_up,
+                      w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
+            gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
+            gwen_swiglu_quantize_q8_1(b2_ffn_gate, b2_ffn_up, b2_x_q8_b, cfg.n_ff, s);
+            gwen_gemv_dp4a_residual_batch2(w.ffn_down.device_data, x_q8_b, b2_x_q8_b,
+                      buf_a, b2_buf_a, buf_b, b2_buf_b,
+                      w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
+        }
+    }
+
+    // 3. Save hidden states for MTP
+    // mtp_hidden  ← token B's hidden (used on accept path)
+    // mtp_hidden_b ← token A's hidden (swapped in on reject path)
+    if (mtp_hidden) {
+        GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, b2_buf_a, cfg.n_embed * sizeof(half),
+                                          cudaMemcpyDeviceToDevice, s));
+    }
+    if (mtp_hidden_b) {
+        GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden_b, buf_a, cfg.n_embed * sizeof(half),
+                                          cudaMemcpyDeviceToDevice, s));
+    }
+
+    // 4. LM head for both tokens — batch2 GEMV for the big 248K×1024 projection
+    gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(model.output_norm.device_data),
+                      x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+    gwen_rmsnorm_quantize_q8_1(b2_buf_a, static_cast<const float*>(model.output_norm.device_data),
+                      b2_x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+    gwen_gemv_dp4a_batch2(model.token_embd.device_data, x_q8_a, b2_x_q8_a,
+              logits_h, b2_logits_h,
+              cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
+
+    int logit_blocks = (cfg.n_vocab + 255) / 256;
+    kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
+    kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(b2_logits_h, b2_logits_f, cfg.n_vocab);
+
+    kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
+    kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
+    kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(b2_logits_f, b2_argmax_partial_max, b2_argmax_partial_idx, cfg.n_vocab);
+    kernel_argmax_reduce<<<1, 256, 0, s>>>(b2_argmax_partial_max, b2_argmax_partial_idx, b2_d_argmax, ARGMAX_BLOCKS);
+}
+
+std::pair<int,int> InferenceState::forward_2tok(Model& model, int token_id_a, int token_id_b) {
+    // Pack: [tok_a, pos_a, tok_b, pos_b] — 4 ints, one memcpy
+    int params[4] = {token_id_a, pos, token_id_b, pos + 1};
+    GWEN_CHECK_CUDA(cudaMemcpy(d_token_id, params, 4 * sizeof(int), cudaMemcpyHostToDevice));
+
+    if (!graph_2tok_captured) {
+        cudaGraph_t graph;
+        GWEN_CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal));
+        forward_body_2tok(model, compute_stream);
+        GWEN_CHECK_CUDA(cudaStreamEndCapture(compute_stream, &graph));
+        GWEN_CHECK_CUDA(cudaGraphInstantiate(&graph_2tok_exec, graph, nullptr, nullptr, 0));
+        GWEN_CHECK_CUDA(cudaGraphDestroy(graph));
+        graph_2tok_captured = true;
+    }
+
+    GWEN_CHECK_CUDA(cudaGraphLaunch(graph_2tok_exec, compute_stream));
+    GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+
+    int results[2];
+    GWEN_CHECK_CUDA(cudaMemcpy(&results[0], d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
+    GWEN_CHECK_CUDA(cudaMemcpy(&results[1], b2_d_argmax, sizeof(int), cudaMemcpyDeviceToHost));
+
+    pos += 2;
+    return {results[0], results[1]};
 }
 
 // ============================================================
@@ -1076,9 +2098,8 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     GWEN_CHECK(N <= max_prefill, "Prompt too long for prefill buffer");
     GWEN_CHECK(N > 0, "Empty prompt");
 
-    // Upload token IDs to device
-    int* d_token_ids;
-    GWEN_CHECK_CUDA(cudaMalloc(&d_token_ids, N * sizeof(int)));
+    // Upload token IDs to device (use pre-allocated buffer)
+    int* d_token_ids = d_prefill_tokens;
     GWEN_CHECK_CUDA(cudaMemcpy(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice));
 
     // 1. Batch embedding lookup → prefill_x [N, 1024]
@@ -1119,53 +2140,40 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                       pf_norm, prefill_proj_gate,
                       w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
 
-            // Per-token sequential processing for DeltaNet state ops
-            for (int t = 0; t < N; t++) {
-                half* x_t = pf_norm + (size_t)t * cfg.n_embed;
-                half* qkv_t = prefill_proj_qkv + (size_t)t * qkv_dim;
-                half* gate_t = prefill_proj_gate + (size_t)t * cfg.ssm_inner_size;
-
-                // Copy projections to working buffers for conv1d (modifies in-place)
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(qkv, qkv_t, qkv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(gate_z, gate_t, cfg.ssm_inner_size * sizeof(half), cudaMemcpyDeviceToDevice, s));
-
-                // Conv1D + SiLU (modifies qkv in-place)
-                int conv_blocks = (qkv_dim + 255) / 256;
-                kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
-                    qkv, qkv, state.conv_state,
+            // Batch DeltaNet state ops — 5 kernel launches instead of ~4096 per-token launches
+            {
+                // 1. Batch conv1d + SiLU on all N tokens (modifies prefill_proj_qkv in-place)
+                int conv_grid = (qkv_dim + 255) / 256;
+                kernel_batch_conv1d_silu<<<conv_grid, 256, 0, s>>>(
+                    prefill_proj_qkv, state.conv_state,
                     static_cast<const float*>(w.ssm_conv1d.device_data),
-                    qkv_dim, cfg.ssm_conv_kernel);
+                    N, qkv_dim, cfg.ssm_conv_kernel);
 
-                half* q = qkv;
-                half* k = qkv + cfg.ssm_inner_size;
-                half* v = qkv + 2 * cfg.ssm_inner_size;
-
-                gwen_l2_normalize(q, q, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
-                gwen_l2_normalize(k, k, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
-
-                kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
-                    x_t,
+                // 2. Batch gate/beta computation from pf_norm
+                kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_heads, N), 32, 0, s>>>(
+                    pf_norm,
                     w.ssm_alpha.device_data, w.ssm_beta.device_data,
                     static_cast<const float*>(w.ssm_a.device_data),
                     static_cast<const float*>(w.ssm_dt_bias.device_data),
-                    d_alpha, d_beta,
-                    cfg.n_embed, cfg.ssm_n_heads);
+                    prefill_dn_gate, prefill_dn_beta,
+                    N, cfg.n_embed, cfg.ssm_n_heads);
 
-                kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                    state.S, q, k, v, d_alpha, d_beta,
-                    attn_out, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+                // 3. Persistent DeltaNet state update (all N tokens, includes L2 norm)
+                //    Output goes to prefill_ffn_gate (temporarily, before FFN uses it)
+                kernel_deltanet_prefill<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                    state.S, prefill_proj_qkv,
+                    prefill_dn_gate, prefill_dn_beta,
+                    prefill_ffn_gate,  // [N, ssm_inner] temp output
+                    N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size,
+                    cfg.ssm_inner_size, q_scale);
 
-                kernel_gated_rmsnorm<<<cfg.ssm_n_heads, 32, 0, s>>>(
-                    attn_out,
+                // 4. Batch gated RMSNorm: attn_out × gate → output for GEMM
+                kernel_batch_gated_rmsnorm<<<N * cfg.ssm_n_heads, 32, 0, s>>>(
+                    prefill_ffn_gate,  // attn_out [N, ssm_inner]
                     static_cast<const float*>(w.ssm_norm.device_data),
-                    gate_z, gated_out,
-                    cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
-
-                // Store gated_out to batch buffer for batched output projection
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                    prefill_proj_gate + (size_t)t * cfg.ssm_inner_size,
-                    gated_out, cfg.ssm_inner_size * sizeof(half),
-                    cudaMemcpyDeviceToDevice, s));
+                    prefill_proj_gate, // gate [N, ssm_inner]
+                    prefill_proj_gate, // output overwrites gate
+                    N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
             }
 
             // Batch output projection: [N, 2048] → [N, 1024] → pf_b
@@ -1351,8 +2359,318 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     GWEN_CHECK_CUDA(cudaMemcpy(buf_a, last_hidden, cfg.n_embed * sizeof(half), cudaMemcpyDeviceToDevice));
 
     pos += N;
-    GWEN_CHECK_CUDA(cudaFree(d_token_ids));
     return next_token;
+}
+
+// ============================================================
+// Batch extract: B independent sequences, GEMM-batched forward
+// ============================================================
+// Processes B sequences of length L through all 24 layers.
+// GEMM projections operate on all B*L tokens at once (one weight read).
+// DeltaNet uses B independent S/conv states in parallel.
+// Full attention uses flash-attention-style causal attention (no KV cache).
+// Output: prefill_x holds [B*L, n_embed] hidden states.
+
+void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_tokens,
+                                           int B, int L, void* output_host) {
+    const auto& cfg = model.config;
+    int N = B * L;  // total tokens
+    cudaStream_t s = compute_stream;
+
+    GWEN_CHECK(N <= max_prefill, "Batch too large for prefill buffers");
+    GWEN_CHECK(B <= max_batch_seqs, "Too many sequences for batch state");
+    GWEN_CHECK(B > 0 && L > 0, "Empty batch");
+
+    const float q_scale = 1.0f / sqrtf((float)cfg.ssm_state_size);
+
+    // Zero batch DeltaNet states (S and conv)
+
+    {
+        int n_heads = cfg.ssm_n_heads;
+        int dk = cfg.ssm_state_size, dv = cfg.ssm_state_size;
+        size_t S_per_layer = (size_t)n_heads * dk * dv * sizeof(float);
+        size_t S_total = (size_t)B * n_batch_dn_layers * S_per_layer;
+        GWEN_CHECK_CUDA(cudaMemsetAsync(batch_dn_S, 0, S_total, s));
+
+        int qkv_dim = cfg.ssm_inner_size * 3;
+        int conv_km1 = cfg.ssm_conv_kernel - 1;
+        size_t conv_per_layer = (size_t)conv_km1 * qkv_dim * sizeof(float);
+        size_t conv_total = (size_t)B * n_batch_dn_layers * conv_per_layer;
+        GWEN_CHECK_CUDA(cudaMemsetAsync(batch_dn_conv, 0, conv_total, s));
+    }
+
+    // Upload token IDs to device
+    GWEN_CHECK_CUDA(cudaMemcpyAsync(d_prefill_tokens, all_tokens,
+                                     N * sizeof(int), cudaMemcpyHostToDevice, s));
+
+
+    // 1. Batch embedding lookup → prefill_x [B*L, 1024]
+
+    {
+        dim3 grid(1, N);
+        kernel_embed_lookup_batch_q6k<<<grid, 256, 0, s>>>(
+            model.token_embd.device_data, d_prefill_tokens, prefill_x, cfg.n_embed, N);
+    }
+
+    half* pf_a = prefill_x;
+    half* pf_b = prefill_out;
+    half* pf_norm = prefill_norm;
+
+    int dn_layer_idx = 0;
+
+    // 2. Process each layer — all B*L tokens through GEMM, per-sequence for recurrent ops
+    for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
+        const auto& layer = model.layers[layer_idx];
+
+        if (!layer.is_full_attention) {
+            // ===== DeltaNet Layer =====
+            const auto& w = layer.deltanet;
+            int dn_idx = dn_layer_idx++;
+
+            // Batch RMSNorm: [B*L, 1024] → [B*L, 1024]
+        
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+                pf_a, static_cast<const float*>(w.attn_norm.device_data),
+                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
+
+            // Batch GEMM projections on all B*L tokens (ONE weight read each)
+            int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
+        
+            gwen_gemm(w.attn_qkv.device_data, w.attn_qkv.type, prefill_temp_w,
+                      pf_norm, prefill_proj_qkv,
+                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
+            gwen_gemm(w.attn_gate.device_data, w.attn_gate.type, prefill_temp_w,
+                      pf_norm, prefill_proj_gate,
+                      w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
+
+            // Batch conv1d + SiLU: B independent conv states
+            int n_heads = cfg.ssm_n_heads;
+            int dk = cfg.ssm_state_size;
+            int dv = cfg.ssm_state_size;
+            size_t S_per_layer_elems = (size_t)n_heads * dk * dv;
+            size_t conv_per_layer_elems = (size_t)(cfg.ssm_conv_kernel - 1) * qkv_dim;
+
+            // Pointer to this layer's batch of S states and conv states
+            float* batch_S_layer = batch_dn_S + (size_t)dn_idx * max_batch_seqs * S_per_layer_elems;
+            float* batch_conv_layer = batch_dn_conv + (size_t)dn_idx * max_batch_seqs * conv_per_layer_elems;
+
+        
+            {
+                int conv_grid_x = (qkv_dim + 255) / 256;
+                dim3 conv_grid(conv_grid_x, B);
+                kernel_batch_conv1d_silu_multi<<<conv_grid, 256, 0, s>>>(
+                    prefill_proj_qkv, batch_conv_layer,
+                    static_cast<const float*>(w.ssm_conv1d.device_data),
+                    B, L, qkv_dim, cfg.ssm_conv_kernel);
+            }
+
+            // Batch gate/beta for all B*L tokens
+        
+            kernel_batch_compute_gate_beta<<<dim3(n_heads, N), 32, 0, s>>>(
+                pf_norm,
+                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                static_cast<const float*>(w.ssm_a.device_data),
+                static_cast<const float*>(w.ssm_dt_bias.device_data),
+                prefill_dn_gate, prefill_dn_beta,
+                N, cfg.n_embed, n_heads);
+
+            // Persistent DeltaNet: n_heads * B blocks, each processes L tokens
+            kernel_deltanet_prefill_batch<<<n_heads * B, 128, 0, s>>>(
+                batch_S_layer, prefill_proj_qkv,
+                prefill_dn_gate, prefill_dn_beta,
+                prefill_ffn_gate,  // temp output [B*L, ssm_inner]
+                B, L, n_heads, dk, dv, cfg.ssm_inner_size, q_scale);
+
+            // Batch gated RMSNorm
+        
+            kernel_batch_gated_rmsnorm<<<N * n_heads, 32, 0, s>>>(
+                prefill_ffn_gate,
+                static_cast<const float*>(w.ssm_norm.device_data),
+                prefill_proj_gate,
+                prefill_proj_gate,
+                N, n_heads, dk, cfg.rms_norm_eps);
+
+            // Batch output projection GEMM → pf_b
+        
+            gwen_gemm(w.ssm_out.device_data, w.ssm_out.type, prefill_temp_w,
+                      prefill_proj_gate, pf_b,
+                      w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
+
+            // Batch residual add: pf_b += pf_a
+        
+            {
+                int total = N * cfg.n_embed;
+                int blocks = (total + 255) / 256;
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
+            }
+
+            // Batch post-attention RMSNorm
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+                pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
+
+            // Batch FFN GEMMs
+        
+            gwen_gemm(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_gate,
+                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_up,
+                      w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+
+        
+            {
+                int total = N * cfg.n_ff;
+                int blocks = (total + 255) / 256;
+                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
+                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
+            }
+
+        
+            gwen_gemm(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
+                      prefill_ffn_out, pf_a,
+                      w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+
+        
+            {
+                int total = N * cfg.n_embed;
+                int blocks = (total + 255) / 256;
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
+            }
+
+        } else {
+            // ===== Full Attention Layer (flash-attention, no KV cache) =====
+            const auto& w = layer.full_attn;
+
+            int attn_dim = cfg.n_head * cfg.head_dim;  // 2048
+            int kv_dim = cfg.n_head_kv * cfg.head_dim;  // 512
+            int q_proj_dim = w.attn_q.shape[1];  // 4096 (Q + gate interleaved)
+
+            // Batch RMSNorm
+        
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+                pf_a, static_cast<const float*>(w.attn_norm.device_data),
+                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
+
+            // Batch Q, K, V projections via GEMM (ONE weight read each)
+        
+            gwen_gemm(w.attn_q.device_data, w.attn_q.type, prefill_temp_w,
+                      pf_norm, prefill_proj_qkv,  // [N, q_proj_dim=4096]
+                      q_proj_dim, w.attn_q.shape[0], N, s);
+            gwen_gemm(w.attn_k.device_data, w.attn_k.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_gate,  // [N, kv_dim=512]
+                      kv_dim, w.attn_k.shape[0], N, s);
+            gwen_gemm(w.attn_v.device_data, w.attn_v.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_up,    // [N, kv_dim=512]
+                      kv_dim, w.attn_v.shape[0], N, s);
+
+            // Batch deinterleave Q+gate → prefill_proj_gate (Q) and prefill_ffn_out (gate)
+        
+            {
+                int deint_blocks = (attn_dim + 255) / 256;
+                dim3 grid(deint_blocks, N);
+                kernel_deinterleave_qgate_batch<<<grid, 256, 0, s>>>(
+                    prefill_proj_qkv, prefill_proj_gate, prefill_ffn_out,
+                    N, cfg.n_head, cfg.head_dim);
+            }
+
+            // Batch Q RMSNorm (per-head): [N * n_head, head_dim]
+            gwen_rmsnorm_batched_f32w(
+                prefill_proj_gate, static_cast<const float*>(w.attn_q_norm.device_data),
+                prefill_proj_gate, N * cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
+
+            // Batch K RMSNorm (per-head): [N * n_kv_heads, head_dim]
+            gwen_rmsnorm_batched_f32w(
+                prefill_ffn_gate, static_cast<const float*>(w.attn_k_norm.device_data),
+                prefill_ffn_gate, N * cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
+
+            // Batch RoPE: positions = t % L
+            {
+                dim3 rope_grid(cfg.n_head + cfg.n_head_kv, N);
+                int n_pairs = cfg.rope_dim / 2;
+                int rope_threads = ((n_pairs + 31) / 32) * 32;
+                if (rope_threads < 32) rope_threads = 32;
+                if (rope_threads > 256) rope_threads = 256;
+                kernel_rope_batch<<<rope_grid, rope_threads, 0, s>>>(
+                    prefill_proj_gate, prefill_ffn_gate,
+                    cfg.n_head, cfg.n_head_kv, cfg.head_dim,
+                    L, cfg.rope_theta, cfg.rope_dim);
+            }
+
+            // Flash causal attention: one warp per (batch, head) pair
+        
+            float scale = 1.0f / sqrtf((float)cfg.head_dim);
+            kernel_batch_causal_attn<<<B * cfg.n_head, 32, 0, s>>>(
+                prefill_proj_gate, prefill_ffn_gate, prefill_ffn_up,
+                prefill_proj_qkv,  // reuse for attention output [N, n_head*head_dim]
+                L, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale);
+
+            // Batch sigmoid-mul: output = attn_out * sigmoid(gate)
+        
+            {
+                int total = N * attn_dim;
+                int blocks = (total + 255) / 256;
+                kernel_sigmoid_mul_batch<<<blocks, 256, 0, s>>>(
+                    prefill_proj_qkv, prefill_ffn_out, prefill_proj_gate,
+                    total);
+            }
+
+            // Batch output projection GEMM → pf_b
+        
+            gwen_gemm(w.attn_output.device_data, w.attn_output.type, prefill_temp_w,
+                      prefill_proj_gate, pf_b,
+                      w.attn_output.shape[1], w.attn_output.shape[0], N, s);
+
+            // Batch residual add: pf_b += pf_a
+        
+            {
+                int total = N * cfg.n_embed;
+                int blocks = (total + 255) / 256;
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
+            }
+
+            // Batch post-attention RMSNorm
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+                pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
+
+            // Batch FFN GEMMs
+        
+            gwen_gemm(w.ffn_gate.device_data, w.ffn_gate.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_gate,
+                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm(w.ffn_up.device_data, w.ffn_up.type, prefill_temp_w,
+                      pf_norm, prefill_ffn_up,
+                      w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+
+        
+            {
+                int total = N * cfg.n_ff;
+                int blocks = (total + 255) / 256;
+                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
+                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
+            }
+
+        
+            gwen_gemm(w.ffn_down.device_data, w.ffn_down.type, prefill_temp_w,
+                      prefill_ffn_out, pf_a,
+                      w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+
+        
+            {
+                int total = N * cfg.n_embed;
+                int blocks = (total + 255) / 256;
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
+            }
+        }
+    }
+
+    // 3. Copy hidden states to host: pf_a holds [B*L, n_embed]
+
+    // 3. Copy hidden states to host: pf_a holds [B*L, n_embed]
+    GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+    size_t bytes = (size_t)N * cfg.n_embed * sizeof(half);
+    GWEN_CHECK_CUDA(cudaMemcpy(output_host, pf_a, bytes, cudaMemcpyDeviceToHost));
 }
 
 // ============================================================
@@ -1544,16 +2862,33 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
         }
     }
 
-    // 5. Output norm + shared LM head + argmax
+    // 5. Output norm + LM head + argmax
     gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(mtp_w.output_norm.device_data),
                       x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
-    gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
-              cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
 
-    int logit_blocks = (cfg.n_vocab + 255) / 256;
-    kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
-    kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
-    kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
+    if (model.has_reduced_lm_head) {
+        // Reduced LM head: only score top-K tokens (massive bandwidth reduction)
+        const auto& rl = model.reduced_lm_head;
+        int K = rl.K;
+        gwen_gemv_dp4a(rl.weights.device_data, x_q8_a, logits_h,
+                  K, cfg.n_embed, rl.type, s);
+
+        int logit_blocks = (K + 255) / 256;
+        kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, K);
+        kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, K);
+        kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
+        // Remap index (0..K-1) → real token ID
+        kernel_remap_token<<<1, 1, 0, s>>>(rl.d_token_ids, d_argmax_token);
+    } else {
+        // Full LM head: score all vocab tokens
+        gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
+                  cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
+
+        int logit_blocks = (cfg.n_vocab + 255) / 256;
+        kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
+        kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
+        kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
+    }
 }
 
 int InferenceState::forward_mtp(Model& model, int token_id) {
@@ -1580,20 +2915,24 @@ int InferenceState::forward_mtp(Model& model, int token_id) {
 }
 
 // ============================================================
-// Speculative Generation with MTP
+// Speculative Generation with MTP + activation replay
 // ============================================================
-// Loop structure: each cycle does forward(last_emitted) to verify the draft,
-// then forward(accepted_token) to get a bonus. No checkpointing needed.
+// Uses forward_2tok() to verify draft + get bonus in ONE pass that reads
+// model weights only once. This halves the bandwidth of the verify step.
 //
-// Accept: forward(last) → pred==draft → emit draft → forward(draft) → emit bonus → MTP(bonus)
-// Reject: forward(last) → pred≠draft → emit pred → forward(pred) → emit bonus → MTP(bonus)
-// Both paths: 2 forward + 1 MTP → 2 output tokens (cost is acceptance-rate-independent)
+// Each cycle: forward_2tok(last_emitted, draft) → pred_a, pred_b
+//   Accept: pred_a == draft → emit draft, emit pred_b → MTP(pred_b) → new draft
+//   Reject: pred_a != draft → undo token B state (~0.05ms), emit pred_a → MTP(pred_a)
+//
+// Activation replay eliminates the 1.66ms re-forward on reject by inverting
+// the DeltaNet state update using saved activations from forward_body_2tok.
 
 std::vector<int> InferenceState::generate_speculative(Model& model,
                                                        const std::vector<int>& prompt_tokens,
                                                        int n_predict) {
     std::vector<int> output_tokens;
     int accepted = 0, rejected = 0, total_mtp = 0;
+    std::string ar_sequence;  // accept/reject pattern for diagnostics
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -1627,40 +2966,79 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
     int draft = forward_mtp(model, output_tokens.back());
     total_mtp++;
 
-    // Speculative decode loop
-    // Invariant: output_tokens.back() has been emitted but NOT yet processed by forward().
-    //            draft = MTP's prediction for what comes after the next processed token.
-    //            mtp_hidden is set from the most recent forward() call.
+    // Speculative decode loop with batch2 GEMV + activation replay
+    // Invariant: output_tokens.back() has been emitted but NOT yet processed.
+    //            draft = MTP's prediction. mtp_hidden is set.
     while ((int)output_tokens.size() < n_predict) {
         int last_token = output_tokens.back();
 
-        // Step 1: Process last_token through target model (CUDA graph replay)
-        int pred = forward(model, last_token);
-        // mtp_hidden is now set to hidden state after last_token
+        if (batch2_allocated) {
+            // === BATCH2 + ACTIVATION REPLAY ===
+            // forward_body_2tok saves token B's DeltaNet activations to replay buffers
+            // and saves both tokens' mtp_hidden (A→mtp_hidden_b, B→mtp_hidden)
+            auto [pred_a, pred_b] = forward_2tok(model, last_token, draft);
 
-        // Step 2: Check if MTP draft matches target prediction
-        if (pred == draft) {
-            output_tokens.push_back(draft);
-            accepted++;
+            if (pred_a == draft) {
+                // Draft accepted — state is correct, both tokens processed
+                output_tokens.push_back(draft);
+                output_tokens.push_back(pred_b);
+                accepted++;
+                ar_sequence += 'A';
+
+                if (pred_b == (int)model.config.eos_token_id) break;
+                if ((int)output_tokens.size() >= n_predict) break;
+
+                // mtp_hidden already holds token B's hidden state
+                draft = forward_mtp(model, pred_b);
+                total_mtp++;
+            } else {
+                // Draft rejected — undo token B's state update via activation replay
+                rejected++;
+                ar_sequence += 'R';
+
+                // Undo DeltaNet S matrices and conv1d state for token B (~0.05 ms)
+                undo_deltanet_token_b(compute_stream);
+
+                // Undo position: forward_2tok advanced by 2, keep only token A's
+                pos -= 1;
+
+                // Swap mtp_hidden to token A's hidden (saved in mtp_hidden_b)
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, mtp_hidden_b,
+                    model.config.n_embed * sizeof(half),
+                    cudaMemcpyDeviceToDevice, compute_stream));
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+
+                output_tokens.push_back(pred_a);
+                if (pred_a == (int)model.config.eos_token_id) break;
+                if ((int)output_tokens.size() >= n_predict) break;
+
+                // Draft next token using token A's correct hidden state
+                draft = forward_mtp(model, pred_a);
+                total_mtp++;
+            }
         } else {
-            output_tokens.push_back(pred);
-            rejected++;
+            // === FALLBACK: two sequential forwards ===
+            int pred = forward(model, last_token);
+            if (pred == draft) {
+                output_tokens.push_back(draft);
+                accepted++;
+            } else {
+                output_tokens.push_back(pred);
+                rejected++;
+            }
+
+            int emitted = output_tokens.back();
+            if (emitted == (int)model.config.eos_token_id) break;
+            if ((int)output_tokens.size() >= n_predict) break;
+
+            int bonus = forward(model, emitted);
+            output_tokens.push_back(bonus);
+
+            if (bonus == (int)model.config.eos_token_id) break;
+
+            draft = forward_mtp(model, bonus);
+            total_mtp++;
         }
-
-        int emitted = output_tokens.back();
-        if (emitted == (int)model.config.eos_token_id) break;
-        if ((int)output_tokens.size() >= n_predict) break;
-
-        // Step 3: Process the emitted token to get bonus + advance state
-        int bonus = forward(model, emitted);
-        output_tokens.push_back(bonus);
-
-        if (bonus == (int)model.config.eos_token_id) break;
-
-        // Step 4: Generate next draft from bonus token
-        // mtp_hidden was set by forward(emitted) above
-        draft = forward_mtp(model, bonus);
-        total_mtp++;
     }
 
     // Trim to n_predict if we overshot
@@ -1672,6 +3050,7 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
            accepted, rejected,
            (accepted + rejected) > 0 ? 100.0 * accepted / (accepted + rejected) : 0.0,
            total_mtp);
+    printf("MTP sequence: %s\n", ar_sequence.c_str());
 
     return output_tokens;
 }

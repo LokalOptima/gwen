@@ -24,27 +24,28 @@ I ran the analysis on a freshly-prepared spoken-English-heavy corpus (details be
 
 | K | Token Coverage | Pair Coverage | Avg Run | Notes |
 |---|---------------|---------------|---------|-------|
-| 10,000 | 88.9% | 79.7% | 8.9 | Too aggressive — 1 in 9 tokens OOV |
-| **20,000** | **94.8%** | **90.0%** | **17.9** | Sweet spot — 18 tokens between OOV hits |
-| 50,000 | 99.6% | 99.2% | 93.3 | Nearly full coverage, LM head still 5x smaller |
+| 10,000 | 91.7% | 84.7% | 12.9 | Aggressive — 1 in 12 tokens OOV |
+| **20,000** | **95.9%** | **92.3%** | **25.8** | Sweet spot — 26 tokens between OOV hits |
+| 30,000 | 97.9% | 96.0% | 48.7 | Diminishing returns vs GEMV cost |
+| 50,000 | 99.5% | 99.1% | 190.5 | Nearly full coverage, LM head still 5x smaller |
 
-K=20,000 is the sweet spot: 94.8% of tokens are in-vocab, and the average run of consecutive in-vocab tokens before hitting an OOV is 17.9 — meaning ~18 successful speculation opportunities per interruption.
+K=20,000 is the sweet spot: 95.9% of tokens are in-vocab, and the average run of consecutive in-vocab tokens before hitting an OOV is 25.8 — meaning ~26 successful speculation opportunities per interruption. Coverage is higher than the original 1.6B general corpus analysis because spoken English has a much narrower token distribution.
 
 The GEMV shrinks from [1024 × 248K] to [1024 × 20K] — **12.4x smaller**. At inference time, if the ground truth next-next token is OOV, MTP automatically rejects (no computation wasted on impossible predictions).
 
 ### Throughput Projections
 
-With K=20K (94.8% coverage) and different acceptance rates within the restricted vocab:
+With K=20K (95.9% coverage) and different acceptance rates within the restricted vocab:
 
 | Accuracy (α) | Effective Accept | Tokens/sec | Speedup |
 |-------------|-----------------|------------|---------|
-| 60% | 56.9% | 816 | 1.36x |
-| 70% | 66.4% | 865 | 1.44x |
-| **75%** | **71.1%** | **889** | **1.48x** |
-| 80% | 75.8% | 893 | 1.49x |
-| 90% | 85.3% | 901 | 1.50x |
+| 60% | 57.6% | 816 | 1.36x |
+| 70% | 67.2% | 867 | 1.45x |
+| **75%** | **71.9%** | **893** | **1.49x** |
+| 80% | 76.7% | 919 | 1.53x |
+| 90% | 86.3% | 971 | 1.62x |
 
-The pre-trained MTP head achieves ~55% on general text. If fine-tuning on spoken English pushes within-vocab accuracy from 55% to 70-75%, we cross the break-even threshold and reach **~860-890 tok/s** — a meaningful 44-48% speedup over baseline.
+The pre-trained MTP head achieves ~55% on general text. If fine-tuning on spoken English pushes within-vocab accuracy from 55% to 70-75%, we cross the break-even threshold and reach **~870-890 tok/s** — a meaningful 45-49% speedup over baseline.
 
 ## Training Data: 498M Tokens of Spoken English
 
@@ -85,7 +86,7 @@ data/
 ├── train_speech.bin      #  32 MB — LibriSpeech + LibriTTS
 ├── train_openwebtext.bin # 382 MB — OpenWebText
 ├── train_fineweb.bin     # 345 MB — FineWeb-Edu
-├── token_counts.bin      # 1.9 MB — frequency counts from 1.6B token analysis
+├── token_counts.bin      # 1.9 MB — frequency counts from 498M training corpus
 └── token_freqs.csv       #         — human-readable frequency ranking
 ```
 
@@ -145,13 +146,14 @@ train/
 ```
 
 Configuration:
-- **Optimizer**: AdamW (lr=3e-4, weight_decay=0.01, betas=(0.9, 0.95))
+- **Optimizer**: AdamW (lr=1e-4, weight_decay=0.01, betas=(0.9, 0.95))
 - **Schedule**: 5% linear warmup → cosine annealing
-- **Precision**: AMP (autocast BF16 forward, FP32 backward)
+- **Precision**: BF16 autocast (no GradScaler — BF16 has same exponent range as FP32)
 - **Gradient clipping**: max norm 1.0
-- **Batch size**: 32 × 512 = 16K tokens/batch
+- **Batching**: Token-budget sampler (`--max-tokens 32768`) — sorts by length, packs similar-length sequences, pads only to max-in-batch
 - **Validation**: 5% held-out split
-- **Checkpoints**: best.pt (by val loss) + latest.pt, full train_setup.json
+- **Checkpoints**: best.pt (by val loss) + latest.pt, with optimizer/scheduler state for clean resume
+- **Reproducibility**: `train_setup.json` records exact command, SHA256 checksums of data files, all hyperparameters
 
 Training tracks OOV fraction and estimated acceptance rate (accuracy on non-masked targets) per epoch. The export subcommand converts the trained checkpoint back to GWMT binary format for GWEN inference.
 
@@ -159,4 +161,4 @@ Training tracks OOV fraction and estimated acceptance rate (accuracy on non-mask
 
 With 498M tokens prepared, the restricted vocab analysis done, and the training infrastructure built, the next step is actually running training and measuring whether fine-tuning pushes acceptance above the 65% break-even threshold.
 
-The key question: can a 21M-parameter head, initialized from pre-trained weights and fine-tuned on spoken English with a 20K restricted vocab, achieve 70%+ acceptance rate on STT-style text? The frequency analysis suggests the ceiling is there (94.8% coverage, 18-token average runs). It comes down to whether the model can learn the patterns.
+The key question: can a 21M-parameter head, initialized from pre-trained weights and fine-tuned on spoken English with a 20K restricted vocab, achieve 70%+ acceptance rate on STT-style text? The frequency analysis suggests the ceiling is there (95.9% coverage, 18-token average runs). It comes down to whether the model can learn the patterns.

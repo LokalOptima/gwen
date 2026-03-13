@@ -186,6 +186,56 @@ void Model::load_mtp(const std::string& mtp_path) {
     printf("MTP weights loaded: %.1f MB total\n", total_bytes / 1024.0 / 1024.0);
 }
 
+// ============================================================
+// Reduced LM head loading (GWRL binary format)
+// ============================================================
+
+void Model::load_reduced_lm_head(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    GWEN_CHECK(f.is_open(), ("Failed to open reduced LM head file: " + path).c_str());
+
+    // Read header
+    char magic[4];
+    f.read(magic, 4);
+    GWEN_CHECK(memcmp(magic, "GWRL", 4) == 0, "Invalid reduced LM head file magic (expected GWRL)");
+
+    uint32_t version, K, n_embed, ggml_type, row_bytes;
+    f.read(reinterpret_cast<char*>(&version), 4);
+    GWEN_CHECK(version == 1, "Unsupported GWRL version");
+
+    f.read(reinterpret_cast<char*>(&K), 4);
+    f.read(reinterpret_cast<char*>(&n_embed), 4);
+    f.read(reinterpret_cast<char*>(&ggml_type), 4);
+    f.read(reinterpret_cast<char*>(&row_bytes), 4);
+
+    printf("Loading reduced LM head: %u tokens, %u embed, type=%u, %u bytes/row\n",
+           K, n_embed, ggml_type, row_bytes);
+
+    // Read token ID mapping
+    reduced_lm_head.token_ids.resize(K);
+    f.read(reinterpret_cast<char*>(reduced_lm_head.token_ids.data()), K * sizeof(int32_t));
+
+    // Read weight data
+    size_t weight_bytes = (size_t)K * row_bytes;
+    reduced_lm_head.host_buffer.resize(weight_bytes);
+    f.read(reinterpret_cast<char*>(reduced_lm_head.host_buffer.data()), weight_bytes);
+
+    // Set up WeightRef
+    reduced_lm_head.weights.host_data = reduced_lm_head.host_buffer.data();
+    reduced_lm_head.weights.type = static_cast<GGMLType>(ggml_type);
+    reduced_lm_head.weights.n_elements = (size_t)K * n_embed;
+    reduced_lm_head.weights.size_bytes = weight_bytes;
+    reduced_lm_head.weights.shape = {n_embed, K};  // GGML convention
+    reduced_lm_head.K = K;
+    reduced_lm_head.row_bytes = row_bytes;
+    reduced_lm_head.type = static_cast<GGMLType>(ggml_type);
+
+    has_reduced_lm_head = true;
+    printf("Reduced LM head loaded: %u tokens, %.1f MB (%.1fx reduction)\n",
+           K, weight_bytes / 1024.0 / 1024.0,
+           (float)config.n_vocab / K);
+}
+
 // Upload all weight tensors to GPU
 static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
     if (w.host_data && w.size_bytes > 0 && !w.on_device()) {
@@ -228,6 +278,18 @@ void Model::upload_weights(CudaAllocator& allocator) {
             upload_weight(allocator, w.ffn_up);
             upload_weight(allocator, w.ffn_down);
         }
+    }
+
+    // Upload reduced LM head if loaded
+    if (has_reduced_lm_head) {
+        upload_weight(allocator, reduced_lm_head.weights);
+        // Upload token ID mapping to device
+        size_t ids_bytes = reduced_lm_head.K * sizeof(int32_t);
+        reduced_lm_head.d_token_ids = static_cast<int*>(allocator.upload(
+            reduced_lm_head.token_ids.data(), ids_bytes));
+        printf("Reduced LM head uploaded: %.1f MB weights + %.1f KB token map\n",
+               reduced_lm_head.weights.size_bytes / 1024.0 / 1024.0,
+               ids_bytes / 1024.0);
     }
 
     // Upload MTP weights if loaded

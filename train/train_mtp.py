@@ -2,33 +2,46 @@
 """
 Fine-tune the MTP head for restricted-vocab English speculative decoding.
 
-Freezes the main Qwen3.5-0.8B model and trains only the 21M-param MTP head
-to predict token[t+2] from embed[t+1] + hidden[t], over a restricted vocab
-of the top-K most frequent English tokens.
+Freezes the main Qwen3.5-0.8B model (served by GWEN server for hidden states)
+and trains only the 21M-param MTP head to predict token[t+2] from
+embed[t+1] + hidden[t], over a restricted vocab of the top-K most frequent
+English tokens.
 
-Online training: each batch runs a frozen forward pass through the base model
-to get hidden states, then trains the MTP head on those.
+Requires a running GWEN server (build/gwen_server) for hidden state extraction.
+Embeddings are loaded directly from safetensors (no transformers needed).
 
 Usage:
-    uv run --with 'torch>=2.5' --with safetensors --with transformers --with numpy \
+    # Start GWEN server first:
+    build/gwen_server --model Qwen3.5-0.8B-Q4_K_M.gguf --port 8090
+
+    # Then train:
+    uv run --with 'torch>=2.7' --with safetensors --with numpy --with tqdm \
         train/train_mtp.py train \
         --data data/train_tokens.bin \
         --counts data/token_counts.bin \
         --model-dir ~/models/hf/Qwen3.5-0.8B \
-        --out-dir train/runs/mtp_v1 \
+        --server-url http://127.0.0.1:8090 \
+        --out-dir train/runs/mtp_spoken_v1 \
         --top-k 20000 \
-        --epochs 5
+        --epochs 3 \
+        --max-tokens 32768 \
+        --lr 1e-4 \
+        --from-pretrained
 
-    uv run --with 'torch>=2.5' --with safetensors --with numpy \
+    # Export:
+    uv run --with 'torch>=2.7' --with safetensors --with numpy \
         train/train_mtp.py export \
         --checkpoint train/runs/mtp_v1/best.pt \
         --output ~/models/gguf/mtp_finetuned.bin
 """
 
 import argparse
+import hashlib
+import http.client
 import json
 import math
 import os
+import struct
 import sys
 import time
 from pathlib import Path
@@ -36,11 +49,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 # Add parent to path so we can import from train/
 sys.path.insert(0, str(Path(__file__).parent))
-from dataset import RestrictedVocab, TokenSequenceDataset, make_splits
+from dataset import RestrictedVocab, TokenBatchSampler, TokenSequenceDataset, make_splits, mtp_collate
 from model import MTPHead
 
 
@@ -48,76 +63,136 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def sha256_file(path: Path) -> str:
+    """Compute SHA256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 # ---------------------------------------------------------------------------
-# Base model loading
+# Embeddings: load directly from safetensors (no transformers)
 # ---------------------------------------------------------------------------
 
-def load_base_model(model_dir: Path, device: str) -> tuple:
-    """Load frozen Qwen3.5-0.8B and return (embed_tokens, forward_fn).
+def load_embeddings(model_dir: Path, device: str) -> torch.Tensor:
+    """Load token embedding weights from safetensors.
 
-    Returns:
-        embed_fn: callable(input_ids) → [B, L, 1024] token embeddings
-        hidden_fn: callable(input_ids) → [B, L, 1024] last hidden state
+    Returns the [vocab_size, n_embed] embedding matrix on device.
+    Only loads this one tensor — no full model, no transformers.
     """
-    log(f"Loading base model from {model_dir}...")
+    from safetensors import safe_open
 
-    try:
-        from transformers import AutoModel
-        model = AutoModel.from_pretrained(
-            str(model_dir),
-            dtype=torch.bfloat16,
-            trust_remote_code=True,
-        )
-    except Exception as e1:
-        # Qwen3.5 is a multimodal model; try loading text model directly
-        log(f"AutoModel failed ({e1}), trying Qwen3_5 text model...")
+    model_dir = Path(model_dir)
+    index_path = model_dir / "model.safetensors.index.json"
+
+    # Qwen3.5 multimodal uses "model.language_model.embed_tokens.weight"
+    # Standard text models use "model.embed_tokens.weight"
+    emb_keys = ["model.language_model.embed_tokens.weight", "model.embed_tokens.weight"]
+
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        emb_key = None
+        for k in emb_keys:
+            if k in index["weight_map"]:
+                emb_key = k
+                break
+        if emb_key is None:
+            raise KeyError(f"Cannot find embedding tensor. Available: {list(index['weight_map'].keys())[:10]}")
+        sf_path = model_dir / index["weight_map"][emb_key]
+    else:
+        sf_path = next(model_dir.glob("*.safetensors"))
+        emb_key = None  # will try both below
+
+    log(f"Loading embeddings from {sf_path}...")
+    with safe_open(str(sf_path), framework="pt") as f:
+        if emb_key:
+            embed_weight = f.get_tensor(emb_key)
+        else:
+            for k in emb_keys:
+                if k in f.keys():
+                    embed_weight = f.get_tensor(k)
+                    break
+            else:
+                raise KeyError(f"Cannot find embedding tensor in {sf_path}")
+
+    # Keep on CPU — F.embedding is just indexing, fast on CPU.
+    # Saves ~500 MB GPU memory vs loading to device.
+    embed_weight = embed_weight.to(dtype=torch.bfloat16)
+    log(f"  Embedding matrix: {list(embed_weight.shape)}, {embed_weight.dtype} (CPU)")
+    return embed_weight
+
+
+# ---------------------------------------------------------------------------
+# GWEN server client for hidden state extraction
+# ---------------------------------------------------------------------------
+
+class GwenClient:
+    """Client for GWEN inference server's batch hidden state extraction.
+
+    Uses keep-alive HTTP connection for efficiency.
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.conn = http.client.HTTPConnection(host, port, timeout=300)
+        self._check_health()
+
+    def _check_health(self):
+        """Verify server is running."""
         try:
-            from transformers import AutoModelForCausalLM
-            full_model = AutoModelForCausalLM.from_pretrained(
-                str(model_dir),
-                dtype=torch.bfloat16,
-                trust_remote_code=True,
+            self.conn.request("GET", "/health")
+            resp = self.conn.getresponse()
+            data = json.loads(resp.read().decode())
+            log(f"GWEN server: {data.get('model', '?')}, "
+                f"n_embed={data.get('n_embed', '?')}, "
+                f"max_seq={data.get('max_seq', '?')}")
+        except ConnectionRefusedError:
+            raise RuntimeError(
+                f"Cannot connect to GWEN server at {self.host}:{self.port}. "
+                f"Start it first: build/gwen_server --model <path.gguf> --port {self.port}"
             )
-            model = full_model.model if hasattr(full_model, "model") else full_model
-        except Exception as e2:
-            log(f"Failed to load model: {e2}")
-            log("Make sure you have a compatible transformers version:")
-            log("  uv pip install 'transformers>=4.57'")
-            sys.exit(1)
 
-    model = model.to(device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
+    def _reconnect(self):
+        """Reconnect if connection dropped."""
+        self.conn.close()
+        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=300)
 
-    # Find the text backbone and embedding layer
-    # Qwen3_5Model (AutoModel) has .language_model (Qwen3_5TextModel)
-    # Qwen3_5TextModel has .embed_tokens and .layers
-    text_model = model
-    for attr in ("language_model", "model", "text_model"):
-        if hasattr(text_model, attr):
-            text_model = getattr(text_model, attr)
-            break
+    def batch_extract(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Extract hidden states for a batch of padded sequences.
 
-    embed_layer = text_model.embed_tokens
-    n_params = sum(p.numel() for p in text_model.parameters())
-    log(f"Base model loaded: {n_params / 1e6:.0f}M params, {device}")
+        Args:
+            token_ids: [B, L] int tensor (padded sequences)
 
-    @torch.no_grad()
-    def embed_fn(input_ids: torch.Tensor) -> torch.Tensor:
-        return embed_layer(input_ids)
+        Returns:
+            [B, L, n_embed] float16 tensor of hidden states
+        """
+        token_np = token_ids.cpu().numpy().astype(np.int32)
+        B, L = token_np.shape
 
-    @torch.no_grad()
-    def hidden_fn(input_ids: torch.Tensor) -> torch.Tensor:
-        out = text_model(input_ids)
-        # Handle different return types
-        if hasattr(out, "last_hidden_state"):
-            return out.last_hidden_state
-        elif isinstance(out, tuple):
-            return out[0]
-        return out
+        # Binary protocol: [uint32 B][uint32 L][int32 tokens[B*L]]
+        body = struct.pack('<II', B, L) + token_np.tobytes()
 
-    return embed_fn, hidden_fn
+        try:
+            self.conn.request("POST", "/batch_extract", body=body,
+                              headers={"Content-Type": "application/octet-stream"})
+            resp = self.conn.getresponse()
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+            self._reconnect()
+            self.conn.request("POST", "/batch_extract", body=body,
+                              headers={"Content-Type": "application/octet-stream"})
+            resp = self.conn.getresponse()
+
+        if resp.status != 200:
+            raise RuntimeError(f"GWEN server error {resp.status}: {resp.read().decode()}")
+
+        data = resp.read()
+        B2, L2, d = struct.unpack('<III', data[:12])
+        hidden = np.frombuffer(data[12:], dtype=np.float16).reshape(B2, L2, d).copy()
+        return torch.from_numpy(hidden)
 
 
 # ---------------------------------------------------------------------------
@@ -144,29 +219,45 @@ def train(args: argparse.Namespace) -> None:
     log(f"  Train: {len(train_ds):,} sequences ({len(train_ds) * args.seq_len / 1e6:.0f}M tokens)")
     log(f"  Val:   {len(val_ds):,} sequences")
 
-    # DataLoaders
+    # DataLoaders with token-budget batching
     n_workers = min(os.cpu_count() or 4, 8)
     pin = device == "cuda"
+
+    train_sampler = TokenBatchSampler(
+        train_ds.lengths, max_tokens=args.max_tokens,
+        shuffle=True, seed=42, drop_last=True,
+    )
+    val_sampler = TokenBatchSampler(
+        val_ds.lengths, max_tokens=args.max_tokens,
+        shuffle=False, drop_last=False,
+    )
+
+    log(f"  Token budget: {args.max_tokens:,} tokens/batch")
+    log(f"  Train batches: {len(train_sampler):,}, Val batches: {len(val_sampler):,}")
+
     train_dl = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
+        collate_fn=mtp_collate,
         num_workers=n_workers,
         pin_memory=pin,
         persistent_workers=True,
-        drop_last=True,
     )
     val_dl = DataLoader(
         val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
+        batch_sampler=val_sampler,
+        collate_fn=mtp_collate,
         num_workers=n_workers,
         pin_memory=pin,
         persistent_workers=True,
     )
 
-    # Base model (frozen)
-    embed_fn, hidden_fn = load_base_model(Path(args.model_dir), device)
+    # Embeddings from safetensors (just the lookup table, ~500MB)
+    embed_weight = load_embeddings(Path(args.model_dir), device)
+
+    # GWEN server for hidden state extraction
+    host, port = args.server_url.replace("http://", "").split(":")
+    gwen = GwenClient(host, int(port))
 
     # MTP head
     log("Initializing MTP head...")
@@ -191,7 +282,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # Scheduler: linear warmup + cosine decay
-    total_steps = len(train_dl) * args.epochs
+    total_steps = len(train_sampler) * args.epochs
     warmup_steps = int(total_steps * 0.05)
 
     def lr_lambda(step: int) -> float:
@@ -202,9 +293,8 @@ def train(args: argparse.Namespace) -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # AMP
+    # AMP — BF16 has same exponent range as FP32, no GradScaler needed
     use_amp = device == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Loss
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
@@ -214,15 +304,34 @@ def train(args: argparse.Namespace) -> None:
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         mtp.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = ckpt.get("epoch", 0) + 1
         log(f"Resumed from epoch {start_epoch} (val_loss={ckpt.get('val_loss', '?')})")
 
-    # Save setup
+    # Save setup with checksums for reproducibility
+    data_path = Path(args.data).resolve()
+    counts_path = Path(args.counts).resolve()
+    log("Computing file checksums...")
+    data_sha = sha256_file(data_path)
+    counts_sha = sha256_file(counts_path)
+
     setup = {
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "data": str(args.data),
-        "counts": str(args.counts),
+        "command": sys.argv,
+        "data": {
+            "path": str(data_path),
+            "sha256": data_sha,
+            "size_bytes": data_path.stat().st_size,
+        },
+        "counts": {
+            "path": str(counts_path),
+            "sha256": counts_sha,
+        },
         "model_dir": str(args.model_dir),
+        "server_url": args.server_url,
         "mtp": {
             "vocab_size": args.top_k,
             "hidden_size": 1024,
@@ -234,13 +343,13 @@ def train(args: argparse.Namespace) -> None:
         },
         "training": {
             "epochs": args.epochs,
-            "batch_size": args.batch_size,
+            "max_tokens": args.max_tokens,
             "seq_len": args.seq_len,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
             "warmup_frac": 0.05,
             "grad_clip": args.grad_clip,
-            "amp": use_amp,
+            "amp_dtype": "bfloat16",
             "from_pretrained": args.from_pretrained,
             "val_fraction": args.val_fraction,
         },
@@ -251,6 +360,8 @@ def train(args: argparse.Namespace) -> None:
         "data_stats": {
             "train_sequences": len(train_ds),
             "val_sequences": len(val_ds),
+            "train_batches": len(train_sampler),
+            "val_batches": len(val_sampler),
             "seq_len": args.seq_len,
         },
         "device": device,
@@ -276,61 +387,83 @@ def train(args: argparse.Namespace) -> None:
     log(f"Total steps: {total_steps:,}, warmup: {warmup_steps:,}")
 
     for epoch in range(start_epoch, args.epochs):
+        train_sampler.set_epoch(epoch)
         t0 = time.time()
         mtp.train()
         total_loss = 0.0
         total_oov = 0
         total_targets = 0
         n_batches = 0
-        log_interval = max(len(train_dl) // 5, 1)
 
-        for batch in train_dl:
-            token_ids = batch["token_ids"].to(device, non_blocking=True)
+        pbar = tqdm(train_dl, desc=f"Epoch {epoch+1}/{args.epochs}",
+                    unit="batch", file=sys.stderr, dynamic_ncols=True)
+        for batch in pbar:
+            token_ids = batch["token_ids"]
             targets = batch["targets"].to(device, non_blocking=True)
 
             B, L = token_ids.shape
 
-            # Frozen base model forward
-            with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-                embeddings = embed_fn(token_ids)     # [B, L, 1024]
-                hidden = hidden_fn(token_ids)        # [B, L, 1024]
+            # Embeddings: CPU lookup (fast indexing, saves ~500MB GPU)
+            with torch.no_grad():
+                embeddings = F.embedding(token_ids, embed_weight)  # [B, L, 1024] CPU
+
+            # Hidden states: from GWEN server (GPU-accelerated prefill)
+            with torch.no_grad():
+                hidden = gwen.batch_extract(token_ids)  # [B, L, 1024] FP16 CPU
 
             # MTP inputs: embed[1:L-1] and hidden[0:L-2]
-            # Target: token[2:L] → restricted vocab
             embed_input = embeddings[:, 1 : L - 1]   # [B, L-2, 1024]
             hidden_input = hidden[:, : L - 2]         # [B, L-2, 1024]
+            mtp_targets = targets  # [B, L-2]
 
-            # MTP forward + loss
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = mtp(embed_input, hidden_input)  # [B, L-2, K]
-                loss = loss_fn(logits.reshape(-1, args.top_k), targets.reshape(-1))
+            # Chunked forward/backward to bound GPU memory.
+            # With K=20K vocab, logits [chunk, L-2, 20K] in FP32 dominate.
+            # Target: keep logits under ~500 MB → chunk * (L-2) * K * 4 < 500M
+            seq_logit_bytes = max(L - 2, 1) * args.top_k * 4  # FP32 per sequence
+            max_chunk = max(1, int(500_000_000 / seq_logit_bytes))
+            max_chunk = min(max_chunk, B)
+            n_chunks = (B + max_chunk - 1) // max_chunk
+            optimizer.zero_grad(set_to_none=True)
+            batch_loss = 0.0
+            skip = False
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                log(f"  WARNING: {loss.item()} loss at batch {n_batches}, skipping")
+            for ci in range(0, B, max_chunk):
+                ce = min(ci + max_chunk, B)
+                e_chunk = embed_input[ci:ce].to(device, non_blocking=True)
+                h_chunk = hidden_input[ci:ce].to(device, dtype=torch.bfloat16, non_blocking=True)
+                t_chunk = mtp_targets[ci:ce]
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    logits = mtp(e_chunk, h_chunk)  # [chunk, L-2, K]
+                    loss = loss_fn(logits.reshape(-1, args.top_k), t_chunk.reshape(-1))
+                    loss = loss / n_chunks  # scale for gradient accumulation
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    log(f"  WARNING: {loss.item()} loss at batch {n_batches}, skipping")
+                    skip = True
+                    break
+
+                loss.backward()
+                batch_loss += loss.item()  # already divided by n_chunks
+
+            if skip:
                 optimizer.zero_grad(set_to_none=True)
-                scaler.update()
                 continue
 
-            # Backward
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(mtp.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
 
-            total_loss += loss.item()
+            total_loss += batch_loss
             total_oov += (targets == -100).sum().item()
             total_targets += targets.numel()
             n_batches += 1
 
-            # Sub-epoch logging
-            if n_batches % log_interval == 0 and n_batches < len(train_dl):
-                avg = total_loss / n_batches
-                pct = n_batches / len(train_dl) * 100
-                lr = optimizer.param_groups[0]["lr"]
-                log(f"  [{n_batches}/{len(train_dl)} ({pct:.0f}%)] loss={avg:.4f} lr={lr:.2e}")
+            # Update progress bar
+            avg = total_loss / n_batches
+            lr_val = optimizer.param_groups[0]["lr"]
+            pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{lr_val:.1e}",
+                             B=B, L=L)
 
         avg_train = total_loss / max(n_batches, 1)
         oov_frac = total_oov / max(total_targets, 1)
@@ -342,29 +475,42 @@ def train(args: argparse.Namespace) -> None:
         val_total = 0
         val_batches = 0
 
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            for batch in val_dl:
-                token_ids = batch["token_ids"].to(device, non_blocking=True)
+        with torch.no_grad():
+            val_pbar = tqdm(val_dl, desc="  Validating", unit="batch",
+                            file=sys.stderr, dynamic_ncols=True)
+            for batch in val_pbar:
+                token_ids = batch["token_ids"]
                 targets = batch["targets"].to(device, non_blocking=True)
 
                 B, L = token_ids.shape
-                embeddings = embed_fn(token_ids)
-                hidden = hidden_fn(token_ids)
+                embeddings = F.embedding(token_ids, embed_weight)
+                hidden = gwen.batch_extract(token_ids)
 
                 embed_input = embeddings[:, 1 : L - 1]
                 hidden_input = hidden[:, : L - 2]
 
-                logits = mtp(embed_input, hidden_input)
-                loss = loss_fn(logits.reshape(-1, args.top_k), targets.reshape(-1))
-                val_loss += loss.item()
+                # Chunked validation (same memory-budget approach as training)
+                seq_logit_bytes = max(L - 2, 1) * args.top_k * 4
+                max_chunk = max(1, int(500_000_000 / seq_logit_bytes))
+                max_chunk = min(max_chunk, B)
+                for ci in range(0, B, max_chunk):
+                    ce = min(ci + max_chunk, B)
+                    e_chunk = embed_input[ci:ce].to(device)
+                    h_chunk = hidden_input[ci:ce].to(device, dtype=torch.bfloat16)
+                    t_chunk = targets[ci:ce]
 
-                # Acceptance rate estimate (accuracy on non-OOV targets)
-                preds = logits.argmax(dim=-1)  # [B, L-2]
-                mask = targets != -100
-                if mask.any():
-                    val_correct += (preds[mask] == targets[mask]).sum().item()
-                    val_total += mask.sum().item()
-                val_batches += 1
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                        logits = mtp(e_chunk, h_chunk)
+                        loss = loss_fn(logits.reshape(-1, args.top_k), t_chunk.reshape(-1))
+                    val_loss += loss.item()
+
+                    preds = logits.argmax(dim=-1)
+                    mask = t_chunk != -100
+                    if mask.any():
+                        val_correct += (preds[mask] == targets[ci:ce][mask]).sum().item()
+                        val_total += mask.sum().item()
+
+                val_batches += (B + max_chunk - 1) // max_chunk
 
         avg_val = val_loss / max(val_batches, 1)
         accept_est = val_correct / max(val_total, 1)
@@ -385,9 +531,11 @@ def train(args: argparse.Namespace) -> None:
         )
         log_file.flush()
 
-        # Checkpoint
+        # Checkpoint (includes optimizer/scheduler for clean restart)
         ckpt = {
             "model": mtp.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "val_loss": avg_val,
             "accept_est": accept_est,
@@ -413,7 +561,6 @@ def train(args: argparse.Namespace) -> None:
 
 def export(args: argparse.Namespace) -> None:
     """Export trained MTP weights to GWMT format for GWEN inference."""
-    import struct
 
     ckpt_path = Path(args.checkpoint)
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
@@ -453,9 +600,6 @@ def export(args: argparse.Namespace) -> None:
         is_norm = "norm" in our_name
 
         if is_norm:
-            # Convert back to Qwen3.5 convention: stored = weight - 1.0
-            # Then add 1.0 for GWMT (which stores 1+w)
-            # Net effect: just keep as-is (our weight IS 1+w already)
             data = tensor.float().numpy()
             dtype_code = DTYPE_F32
         else:
@@ -515,16 +659,21 @@ def main():
     p.add_argument("--counts", type=Path, default=Path("data/token_counts.bin"),
                     help="Token frequency counts (int64)")
     p.add_argument("--model-dir", type=Path, default=Path.home() / "models" / "hf" / "Qwen3.5-0.8B",
-                    help="HuggingFace model directory for base model")
+                    help="HuggingFace model dir (for embeddings + pre-trained MTP weights)")
+    p.add_argument("--server-url", type=str, default="http://127.0.0.1:8090",
+                    help="GWEN server URL for hidden state extraction")
     p.add_argument("--out-dir", type=Path, default=Path("train/runs/mtp_v1"),
                     help="Output directory for checkpoints and logs")
     p.add_argument("--top-k", type=int, default=20000, help="Restricted vocab size")
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--max-tokens", type=int, default=32768,
+                    help="Token budget per batch (replaces fixed batch_size)")
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--micro-batch", type=int, default=128,
+                    help="Max sequences per MTP forward/backward chunk (bounds GPU memory)")
     p.add_argument("--val-fraction", type=float, default=0.05)
     p.add_argument("--from-pretrained", action="store_true", default=True,
                     help="Initialize from pre-trained MTP weights (default: True)")

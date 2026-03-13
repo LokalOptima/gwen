@@ -70,6 +70,18 @@ struct MTPWeights {
     // lm_head is shared with token_embd (no dedicated weights)
 };
 
+// Reduced LM head for fast MTP (GWRL format — vocabulary pruning)
+// Only stores rows for the top-K most common tokens
+struct ReducedLMHead {
+    WeightRef weights;                  // [K, n_embed] Q6_K (same quant as token_embd)
+    std::vector<int32_t> token_ids;     // [K] mapping: index → real token ID (host)
+    int* d_token_ids = nullptr;         // [K] mapping on device
+    int K = 0;                          // number of tokens in reduced set
+    int row_bytes = 0;                  // bytes per quantized row
+    GGMLType type = GGMLType::Q6_K;     // quantization type
+    std::vector<uint8_t> host_buffer;   // host-side storage for weight data
+};
+
 // Complete model
 struct Model {
     ModelConfig config;
@@ -87,11 +99,18 @@ struct Model {
     MTPWeights mtp;
     std::vector<std::vector<uint8_t>> mtp_host_buffers;  // host-side storage for MTP weight data
 
+    // Reduced LM head for fast MTP (optional)
+    bool has_reduced_lm_head = false;
+    ReducedLMHead reduced_lm_head;
+
     // Load from GGUF file
     static std::unique_ptr<Model> load(const std::string& gguf_path);
 
     // Load MTP weights from binary file (GWMT format)
     void load_mtp(const std::string& mtp_path);
+
+    // Load reduced LM head from binary file (GWRL format)
+    void load_reduced_lm_head(const std::string& path);
 
     // Upload all weights to GPU
     void upload_weights(CudaAllocator& allocator);

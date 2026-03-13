@@ -16,4 +16,6 @@ A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inferenc
 9. [MTP Speculative Decoding](09-mtp-speculative-decoding.md) — Qwen3.5's built-in MTP draft head, Gemma-style RMSNorm bug, Q8_0 quantization, sequential verify bottleneck analysis
 10. [Token Frequency Distribution](10-token-frequency-distribution.md) — 1.6B-token frequency analysis of Qwen3.5's 248K vocabulary, Zipf's law, optimization opportunities
 11. [Activation Replay and the MTP Verdict](11-activation-replay-mtp-verdict.md) — S snapshot rollback (42x faster reject), algebraic undo failures, and why 55% acceptance isn't enough
-12. [Fine-Tuning the MTP Head for Spoken English](12-mtp-finetuning-setup.md) — 498M-token spoken English corpus, restricted vocab (20K tokens, 94.8% coverage), training infrastructure for the MTP head
+12. [Fine-Tuning the MTP Head for Spoken English](12-mtp-finetuning-setup.md) — 498M-token spoken English corpus, restricted vocab (20K tokens, 95.9% coverage), training infrastructure for the MTP head
+13. [Training the MTP Head](13-mtp-finetuning-training.md) — DeltaNet VRAM catastrophe (13 GB for batch=1), token-budget batching vs padding, BF16 autocast fix, full training run
+14. [Batched GEMM Hidden State Extraction](14-batched-gemm-extraction.md) — CUDA server for training data extraction, 20K tok/s at B=64, DeltaNet recurrence bottleneck (54%), optimization attempts and lessons

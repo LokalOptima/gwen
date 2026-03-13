@@ -340,6 +340,252 @@ kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
 }
 
 // ============================================================
+// Batch-2 dp4a GEMV: read quantized weights ONCE, dot-product
+// with TWO Q8_1 input vectors, produce TWO output rows.
+// This halves the bandwidth for 2-token verify in speculative decode.
+// ============================================================
+
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
+kernel_gemv_q4_k_dp4a_batch2(const block_q4_k* __restrict__ W,
+                              const block_q8_1* __restrict__ x_q8_0,
+                              const block_q8_1* __restrict__ x_q8_1,
+                              half* __restrict__ y0, half* __restrict__ y1,
+                              const half* __restrict__ res0, const half* __restrict__ res1,
+                              int out_features, int blocks_per_row) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid = threadIdx.x + threadIdx.y * 32;
+    constexpr int QI = 32;
+    constexpr int VDR = 2;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;
+
+    float sf0 = 0.0f, sf1 = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int iqs = (tid * VDR) % QI;
+        const block_q4_k& blk = W[row * blocks_per_row + kbx];
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+
+        const int* q4 = reinterpret_cast<const int*>(blk.qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        int v0 = q4[0];
+        int v1 = q4[4];
+
+        float d = __half2float(blk.d);
+        float dmin = __half2float(blk.dmin);
+        float sd0 = 0.0f, sm0 = 0.0f, sd1 = 0.0f, sm1 = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            int v0i = (v0 >> (4 * i)) & 0x0F0F0F0F;
+            int v1i = (v1 >> (4 * i)) & 0x0F0F0F0F;
+
+            int sb = bq8_offset + i;
+            int sc, m;
+            if (sb < 4) { sc = blk.scales[sb] & 0x3F; m = blk.scales[sb + 4] & 0x3F; }
+            else { sc = (blk.scales[sb + 4] & 0xF) | ((blk.scales[sb - 4] >> 6) << 4);
+                   m  = (blk.scales[sb + 4] >> 4) | ((blk.scales[sb] >> 6) << 4); }
+
+            int q8_idx = kbx * (QK_K / 32) + bq8_offset + i;
+            int u_off = (iqs / 2) % 4;
+
+            { // Token 0
+                const block_q8_1& bq8 = x_q8_0[q8_idx];
+                const int* u = reinterpret_cast<const int*>(bq8.qs) + u_off;
+                float d8 = __low2float(bq8.ds);
+                sd0 += d8 * (__dp4a(v1i, u[4], __dp4a(v0i, u[0], 0)) * sc);
+                sm0 += d8 * (__dp4a(0x01010101, u[4], __dp4a(0x01010101, u[0], 0)) * m);
+            }
+            { // Token 1
+                const block_q8_1& bq8 = x_q8_1[q8_idx];
+                const int* u = reinterpret_cast<const int*>(bq8.qs) + u_off;
+                float d8 = __low2float(bq8.ds);
+                sd1 += d8 * (__dp4a(v1i, u[4], __dp4a(v0i, u[0], 0)) * sc);
+                sm1 += d8 * (__dp4a(0x01010101, u[4], __dp4a(0x01010101, u[0], 0)) * m);
+            }
+        }
+        sf0 += d * sd0 - dmin * sm0;
+        sf1 += d * sd1 - dmin * sm1;
+    }
+
+    __shared__ float tmp[2][NW > 1 ? NW - 1 : 1][32];
+    if (threadIdx.y > 0) { tmp[0][threadIdx.y - 1][threadIdx.x] = sf0; tmp[1][threadIdx.y - 1][threadIdx.x] = sf1; }
+    __syncthreads();
+    if (threadIdx.y == 0) {
+        #pragma unroll
+        for (int w = 0; w < NW - 1; w++) { sf0 += tmp[0][w][threadIdx.x]; sf1 += tmp[1][w][threadIdx.x]; }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sf0 += __shfl_xor_sync(0xFFFFFFFF, sf0, offset);
+            sf1 += __shfl_xor_sync(0xFFFFFFFF, sf1, offset);
+        }
+        if (threadIdx.x == 0) {
+            y0[row] = __float2half(res0 ? sf0 + __half2float(res0[row]) : sf0);
+            y1[row] = __float2half(res1 ? sf1 + __half2float(res1[row]) : sf1);
+        }
+    }
+}
+
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
+kernel_gemv_q5_k_dp4a_batch2(const block_q5_k* __restrict__ W,
+                              const block_q8_1* __restrict__ x_q8_0,
+                              const block_q8_1* __restrict__ x_q8_1,
+                              half* __restrict__ y0, half* __restrict__ y1,
+                              const half* __restrict__ res0, const half* __restrict__ res1,
+                              int out_features, int blocks_per_row) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid = threadIdx.x + threadIdx.y * 32;
+    constexpr int QI = 32;
+    constexpr int VDR = 2;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;
+
+    float sf0 = 0.0f, sf1 = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int iqs = (tid * VDR) % QI;
+        const block_q5_k& blk = W[row * blocks_per_row + kbx];
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+
+        const int* ql = reinterpret_cast<const int*>(blk.qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        int vl0 = ql[0], vl1 = ql[4];
+        const int* qh_ptr = reinterpret_cast<const int*>(blk.qh + 4 * ((iqs / 2) % 4));
+        int vh0 = qh_ptr[0] >> bq8_offset;
+        int vh1 = qh_ptr[4] >> bq8_offset;
+
+        float d = __half2float(blk.d);
+        float dmin = __half2float(blk.dmin);
+        float sd0 = 0.0f, sm0 = 0.0f, sd1 = 0.0f, sm1 = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            int vl0i = (vl0 >> (4 * i)) & 0x0F0F0F0F;
+            int vl1i = (vl1 >> (4 * i)) & 0x0F0F0F0F;
+            int vh0i = ((vh0 >> i) << 4) & 0x10101010;
+            int vh1i = ((vh1 >> i) << 4) & 0x10101010;
+            int v0i = vl0i | vh0i;
+            int v1i = vl1i | vh1i;
+
+            int sb = bq8_offset + i;
+            int sc, m;
+            if (sb < 4) { sc = blk.scales[sb] & 0x3F; m = blk.scales[sb + 4] & 0x3F; }
+            else { sc = (blk.scales[sb + 4] & 0xF) | ((blk.scales[sb - 4] >> 6) << 4);
+                   m  = (blk.scales[sb + 4] >> 4) | ((blk.scales[sb] >> 6) << 4); }
+
+            int q8_idx = kbx * (QK_K / 32) + bq8_offset + i;
+            int u_off = (iqs / 2) % 4;
+
+            { const block_q8_1& bq8 = x_q8_0[q8_idx];
+              const int* u = reinterpret_cast<const int*>(bq8.qs) + u_off;
+              float d8 = __low2float(bq8.ds);
+              sd0 += d8 * (__dp4a(v0i, u[0], __dp4a(v1i, u[4], 0)) * sc);
+              sm0 += d8 * (__dp4a(0x01010101, u[0], __dp4a(0x01010101, u[4], 0)) * m); }
+            { const block_q8_1& bq8 = x_q8_1[q8_idx];
+              const int* u = reinterpret_cast<const int*>(bq8.qs) + u_off;
+              float d8 = __low2float(bq8.ds);
+              sd1 += d8 * (__dp4a(v0i, u[0], __dp4a(v1i, u[4], 0)) * sc);
+              sm1 += d8 * (__dp4a(0x01010101, u[0], __dp4a(0x01010101, u[4], 0)) * m); }
+        }
+        sf0 += d * sd0 - dmin * sm0;
+        sf1 += d * sd1 - dmin * sm1;
+    }
+
+    __shared__ float tmp[2][NW > 1 ? NW - 1 : 1][32];
+    if (threadIdx.y > 0) { tmp[0][threadIdx.y - 1][threadIdx.x] = sf0; tmp[1][threadIdx.y - 1][threadIdx.x] = sf1; }
+    __syncthreads();
+    if (threadIdx.y == 0) {
+        #pragma unroll
+        for (int w = 0; w < NW - 1; w++) { sf0 += tmp[0][w][threadIdx.x]; sf1 += tmp[1][w][threadIdx.x]; }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sf0 += __shfl_xor_sync(0xFFFFFFFF, sf0, offset);
+            sf1 += __shfl_xor_sync(0xFFFFFFFF, sf1, offset);
+        }
+        if (threadIdx.x == 0) {
+            y0[row] = __float2half(res0 ? sf0 + __half2float(res0[row]) : sf0);
+            y1[row] = __float2half(res1 ? sf1 + __half2float(res1[row]) : sf1);
+        }
+    }
+}
+
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
+kernel_gemv_q6_k_dp4a_batch2(const block_q6_k* __restrict__ W,
+                              const block_q8_1* __restrict__ x_q8_0,
+                              const block_q8_1* __restrict__ x_q8_1,
+                              half* __restrict__ y0, half* __restrict__ y1,
+                              const half* __restrict__ res0, const half* __restrict__ res1,
+                              int out_features, int blocks_per_row) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid = threadIdx.x + threadIdx.y * 32;
+    constexpr int QI = 32;
+    constexpr int VDR = 1;
+    constexpr int QI8_1 = 8;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;
+
+    float sf0 = 0.0f, sf1 = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int iqs = (tid * VDR) % QI;
+        const block_q6_k& blk = W[row * blocks_per_row + kbx];
+
+        const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+        const int vh_shift = 2 * ((iqs % 16) / 8);
+
+        const int vl = get_int_b2(blk.ql, iqs);
+        const int qh_idx = 8 * (iqs / 16) + iqs % 8;
+        const int vh = get_int_b2(blk.qh, qh_idx) >> vh_shift;
+
+        const int8_t* scales = blk.scales + scale_offset;
+        float d = __half2float(blk.d);
+        float ls0 = 0.0f, ls1 = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int8_t sc = scales[4 * i];
+            const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+            const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+            const int vi = __vsubss4(vil | vih, 0x20202020);
+
+            int q8_idx = kbx * 8 + bq8_offset + 2 * i;
+            int u_pos = iqs % QI8_1;
+
+            { const block_q8_1& bq8 = x_q8_0[q8_idx];
+              float d8 = __low2float(bq8.ds);
+              ls0 += d8 * (__dp4a(vi, reinterpret_cast<const int*>(bq8.qs)[u_pos], 0) * sc); }
+            { const block_q8_1& bq8 = x_q8_1[q8_idx];
+              float d8 = __low2float(bq8.ds);
+              ls1 += d8 * (__dp4a(vi, reinterpret_cast<const int*>(bq8.qs)[u_pos], 0) * sc); }
+        }
+        sf0 += d * ls0;
+        sf1 += d * ls1;
+    }
+
+    __shared__ float tmp[2][NW > 1 ? NW - 1 : 1][32];
+    if (threadIdx.y > 0) { tmp[0][threadIdx.y - 1][threadIdx.x] = sf0; tmp[1][threadIdx.y - 1][threadIdx.x] = sf1; }
+    __syncthreads();
+    if (threadIdx.y == 0) {
+        #pragma unroll
+        for (int w = 0; w < NW - 1; w++) { sf0 += tmp[0][w][threadIdx.x]; sf1 += tmp[1][w][threadIdx.x]; }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sf0 += __shfl_xor_sync(0xFFFFFFFF, sf0, offset);
+            sf1 += __shfl_xor_sync(0xFFFFFFFF, sf1, offset);
+        }
+        if (threadIdx.x == 0) {
+            y0[row] = __float2half(res0 ? sf0 + __half2float(res0[row]) : sf0);
+            y1[row] = __float2half(res1 ? sf1 + __half2float(res1[row]) : sf1);
+        }
+    }
+}
+
+// ============================================================
 // Legacy FP16 GEMV kernels (kept for fallback and Q8_0)
 // ============================================================
 
@@ -648,6 +894,71 @@ void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
 void gwen_gemv_dp4a_residual(const void* W, const void* x_q8, half* y, const half* residual,
                               int out_features, int in_features, GGMLType type, cudaStream_t stream) {
     gemv_dp4a_internal(W, x_q8, y, residual, out_features, in_features, type, stream);
+}
+
+// ============================================================
+// Launch wrappers — batch-2 dp4a (read weights once, 2 tokens)
+// ============================================================
+
+static void gemv_dp4a_batch2_internal(const void* W,
+                                       const void* x_q8_0, const void* x_q8_1,
+                                       half* y0, half* y1,
+                                       const half* res0, const half* res1,
+                                       int out_features, int in_features,
+                                       GGMLType type, cudaStream_t stream) {
+    int blocks_per_row = in_features / QK_K;
+    bool small = (blocks_per_row <= 4);
+    auto bq8_0 = static_cast<const block_q8_1*>(x_q8_0);
+    auto bq8_1 = static_cast<const block_q8_1*>(x_q8_1);
+
+    switch (type) {
+        case GGMLType::Q4_K: {
+            auto Wp = static_cast<const block_q4_k*>(W);
+            if (small)
+                kernel_gemv_q4_k_dp4a_batch2<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            else
+                kernel_gemv_q4_k_dp4a_batch2<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            break;
+        }
+        case GGMLType::Q5_K: {
+            auto Wp = static_cast<const block_q5_k*>(W);
+            if (small)
+                kernel_gemv_q5_k_dp4a_batch2<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            else
+                kernel_gemv_q5_k_dp4a_batch2<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            break;
+        }
+        case GGMLType::Q6_K: {
+            auto Wp = static_cast<const block_q6_k*>(W);
+            if (small)
+                kernel_gemv_q6_k_dp4a_batch2<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            else
+                kernel_gemv_q6_k_dp4a_batch2<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            break;
+        }
+        default:
+            GWEN_CHECK(false, "Unsupported dp4a batch2 GEMV type (Q4_K/Q5_K/Q6_K only)");
+    }
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+void gwen_gemv_dp4a_batch2(const void* W,
+                            const void* x_q8_0, const void* x_q8_1,
+                            half* y0, half* y1,
+                            int out_features, int in_features,
+                            GGMLType type, cudaStream_t stream) {
+    gemv_dp4a_batch2_internal(W, x_q8_0, x_q8_1, y0, y1, nullptr, nullptr,
+                               out_features, in_features, type, stream);
+}
+
+void gwen_gemv_dp4a_residual_batch2(const void* W,
+                                     const void* x_q8_0, const void* x_q8_1,
+                                     half* y0, half* y1,
+                                     const half* res0, const half* res1,
+                                     int out_features, int in_features,
+                                     GGMLType type, cudaStream_t stream) {
+    gemv_dp4a_batch2_internal(W, x_q8_0, x_q8_1, y0, y1, res0, res1,
+                               out_features, in_features, type, stream);
 }
 
 } // namespace gwen

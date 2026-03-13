@@ -69,6 +69,21 @@ void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
 void gwen_gemv_dp4a_residual(const void* W, const void* x_q8, half* y, const half* residual,
                               int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
 
+// Batch-2 dp4a GEMV: read quantized weights ONCE, produce 2 outputs
+// y0 = W * x_q8_0 [+ res0], y1 = W * x_q8_1 [+ res1]
+void gwen_gemv_dp4a_batch2(const void* W,
+                            const void* x_q8_0, const void* x_q8_1,
+                            half* y0, half* y1,
+                            int out_features, int in_features,
+                            GGMLType type, cudaStream_t stream = 0);
+
+void gwen_gemv_dp4a_residual_batch2(const void* W,
+                                     const void* x_q8_0, const void* x_q8_1,
+                                     half* y0, half* y1,
+                                     const half* res0, const half* res1,
+                                     int out_features, int in_features,
+                                     GGMLType type, cudaStream_t stream = 0);
+
 // ============================================================
 // FP16 GEMV (for MTP weights stored as FP16)
 // ============================================================
