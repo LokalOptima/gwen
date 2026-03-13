@@ -19,3 +19,4 @@ A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inferenc
 12. [Fine-Tuning the MTP Head for Spoken English](12-mtp-finetuning-setup.md) — 498M-token spoken English corpus, restricted vocab (20K tokens, 95.9% coverage), training infrastructure for the MTP head
 13. [Training the MTP Head](13-mtp-finetuning-training.md) — DeltaNet VRAM catastrophe (13 GB for batch=1), token-budget batching vs padding, BF16 autocast fix, full training run
 14. [Batched GEMM Hidden State Extraction](14-batched-gemm-extraction.md) — CUDA server for training data extraction, 20K tok/s at B=64, DeltaNet recurrence bottleneck (54%), optimization attempts and lessons
+15. [Re-Verifying Against Latest llama.cpp](15-re-verify-llama-cpp.md) — L2 norm fix, GEMM vs GEMV decode precision gap, FP16 tie-breaking floor, 2/4 exact match + 2/4 within 0.01 logit

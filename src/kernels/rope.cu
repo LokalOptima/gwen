@@ -156,7 +156,8 @@ kernel_l2_normalize(const half* __restrict__ x, half* __restrict__ y,
         sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
     }
 
-    float inv_norm = rsqrtf(sum_sq + 1e-12f) * extra_scale;
+    // Match llama.cpp: rsqrtf(fmaxf(sum, eps²)) with eps=1e-6
+    float inv_norm = rsqrtf(fmaxf(sum_sq, 1e-12f)) * extra_scale;
 
     for (int i = lane; i < dim; i += 32) {
         yv[i] = __float2half(__half2float(xv[i]) * inv_norm);

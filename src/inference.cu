@@ -447,7 +447,8 @@ kernel_deltanet_prefill(
             if (j == 0) sh_reduce[0] = s;
         }
         __syncthreads();
-        float q_inv = rsqrtf(sh_reduce[0] + 1e-12f) * q_scale;
+        // Match llama.cpp: fmaxf(sum, eps²) with eps=1e-6
+        float q_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f)) * q_scale;
 
         // Load and L2-normalize K
         float k_raw = __half2float(k_ptr[j]);
@@ -463,7 +464,7 @@ kernel_deltanet_prefill(
             if (j == 0) sh_reduce[0] = s;
         }
         __syncthreads();
-        float k_inv = rsqrtf(sh_reduce[0] + 1e-12f);
+        float k_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f));
 
         sh_q[j] = q_raw * q_inv;
         sh_k[j] = k_raw * k_inv;
@@ -624,7 +625,8 @@ kernel_deltanet_prefill_batch(
             if (j == 0) sh_reduce[0] = s;
         }
         __syncthreads();
-        float q_inv = rsqrtf(sh_reduce[0] + 1e-12f) * q_scale;
+        // Match llama.cpp: fmaxf(sum, eps²) with eps=1e-6
+        float q_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f)) * q_scale;
 
         // Load and L2-normalize K
         float k_raw = __half2float(k_ptr[j]);
@@ -640,7 +642,7 @@ kernel_deltanet_prefill_batch(
             if (j == 0) sh_reduce[0] = s;
         }
         __syncthreads();
-        float k_inv = rsqrtf(sh_reduce[0] + 1e-12f);
+        float k_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f));
 
         sh_q[j] = q_raw * q_inv;
         sh_k[j] = k_raw * k_inv;
@@ -2704,9 +2706,34 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
            prompt_tokens.size() / (ttft_ms / 1000.0));
 
     // Decode loop
+    // forward(): optimized GEMV + CUDA graph path (default, 6x faster).
+    // forward_prefill(N=1): verified GEMM reference path, enable with GWEN_GEMM_DECODE=1.
+    bool gemm_decode = (getenv("GWEN_GEMM_DECODE") != nullptr);
+    bool dump_logits = (getenv("GWEN_DUMP_LOGITS") != nullptr);
     for (int i = 1; i < n_predict; i++) {
-        int next = forward(model, output_tokens.back());
+        int next;
+        if (gemm_decode) {
+            next = forward_prefill(model, {output_tokens.back()});
+        } else {
+            next = forward(model, output_tokens.back());
+        }
         output_tokens.push_back(next);
+
+        if (dump_logits) {
+            // Copy logits to host and print top-5
+            std::vector<float> host_logits(model.config.n_vocab);
+            GWEN_CHECK_CUDA(cudaMemcpy(host_logits.data(), logits_f,
+                model.config.n_vocab * sizeof(float), cudaMemcpyDeviceToHost));
+            std::vector<std::pair<float,int>> scored;
+            for (int j = 0; j < (int)model.config.n_vocab; j++)
+                scored.push_back({host_logits[j], j});
+            std::sort(scored.begin(), scored.end(),
+                [](auto& a, auto& b) { return a.first > b.first; });
+            printf("  [%d] token=%d logit=%.4f  top5:", i, next, scored[0].first);
+            for (int j = 0; j < 5; j++)
+                printf(" %d(%.2f)", scored[j].second, scored[j].first);
+            printf("\n");
+        }
 
         if (next == (int)model.config.eos_token_id) break;
     }
