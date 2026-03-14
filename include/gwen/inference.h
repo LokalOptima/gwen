@@ -143,6 +143,15 @@ struct InferenceState {
     int max_batch_seqs = 0;            // max B for batch prefill
     int n_batch_dn_layers = 0;         // number of DeltaNet layers
 
+    // --- Chunkwise DeltaNet intermediate buffers ---
+    static constexpr int CHUNK_SIZE = 64;
+    float* chunk_gate_cumul = nullptr; // [max_tokens, n_heads] cumulative gate prefix sum
+    half* chunk_W = nullptr;           // [max_tokens, ssm_inner] WY W vectors (transformed beta*K)
+    half* chunk_U = nullptr;           // [max_tokens, ssm_inner] WY U vectors (transformed beta*V)
+    float* chunk_h_states = nullptr;   // [max_batch * NT_max * n_heads, dk, dv] h state per chunk boundary
+    half* chunk_v_new = nullptr;       // [max_tokens, ssm_inner] corrected values after state propagation
+    int chunk_NT_max = 0;              // max number of chunks per sequence
+
     void allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_total_tokens, int max_seqs);
 
     // Batch extract: process B independent sequences of length L, output all hidden states

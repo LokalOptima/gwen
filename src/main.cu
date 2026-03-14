@@ -3,25 +3,29 @@
 #include "gwen/tokenizer.h"
 
 #include <chrono>
+#include <fstream>
 #include <getopt.h>
 #include <sstream>
+#include <vector>
 
 using namespace gwen;
 
 static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("Options:\n");
-    printf("  --model PATH       Path to GGUF model file (required)\n");
-    printf("  --mtp PATH         Path to MTP weights file (enables speculative decoding)\n");
-    printf("  --mtp-lm-head PATH Path to reduced LM head for faster MTP (GWRL format)\n");
-    printf("  --prompt TEXT       Prompt text\n");
-    printf("  --n-predict N      Number of tokens to generate (default: 50)\n");
-    printf("  --greedy           Use greedy decoding\n");
-    printf("  --benchmark        Output benchmark timing as JSON\n");
-    printf("  --output-logits    Output raw logits\n");
-    printf("  --teacher-tokens T Comma-separated reference token IDs for teacher-forced comparison\n");
-    printf("  --info             Print model info and exit\n");
-    printf("  --help             Show this help\n");
+    printf("  --model PATH         Path to GGUF model file (required)\n");
+    printf("  --mtp PATH           Path to MTP weights file (enables speculative decoding)\n");
+    printf("  --mtp-lm-head PATH   Path to reduced LM head for faster MTP (GWRL format)\n");
+    printf("  --prompt TEXT         Prompt text\n");
+    printf("  --n-predict N        Number of tokens to generate (default: 50)\n");
+    printf("  --greedy             Use greedy decoding\n");
+    printf("  --benchmark          Output benchmark timing as JSON\n");
+    printf("  --output-logits      Output raw logits\n");
+    printf("  --teacher-tokens T   Comma-separated reference token IDs for teacher-forced comparison\n");
+    printf("  --batch-extract FILE Batch GEMM extract mode: read prompts from FILE (one per line)\n");
+    printf("  --seq-len N          Sequence length for batch-extract (pad/truncate, default: 512)\n");
+    printf("  --info               Print model info and exit\n");
+    printf("  --help               Show this help\n");
 }
 
 int main(int argc, char** argv) {
@@ -30,11 +34,13 @@ int main(int argc, char** argv) {
     std::string mtp_lm_head_path;
     std::string prompt;
     std::string teacher_tokens_str;
+    std::string batch_extract_file;
     int n_predict = 50;
     bool greedy = true;  // default greedy for now
     bool benchmark = false;
     bool output_logits = false;
     bool info_only = false;
+    int seq_len = 512;
 
     static struct option long_options[] = {
         {"model",        required_argument, nullptr, 'm'},
@@ -46,13 +52,15 @@ int main(int argc, char** argv) {
         {"benchmark",    no_argument,       nullptr, 'b'},
         {"output-logits",no_argument,       nullptr, 'l'},
         {"teacher-tokens",required_argument, nullptr, 't'},
+        {"batch-extract",required_argument, nullptr, 'B'},
+        {"seq-len",      required_argument, nullptr, 'S'},
         {"info",         no_argument,       nullptr, 'i'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:t:gblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:t:B:S:gblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
@@ -63,6 +71,8 @@ int main(int argc, char** argv) {
             case 'g': greedy = true; break;
             case 'b': benchmark = true; break;
             case 'l': output_logits = true; break;
+            case 'B': batch_extract_file = optarg; break;
+            case 'S': seq_len = atoi(optarg); break;
             case 'i': info_only = true; break;
             case 'h': print_usage(argv[0]); return 0;
             default:  print_usage(argv[0]); return 1;
@@ -122,6 +132,86 @@ int main(int argc, char** argv) {
            allocator.total_allocated() / 1024.0 / 1024.0,
            allocator.n_allocations());
 
+    // ========== Batch extract mode ==========
+    if (!batch_extract_file.empty()) {
+        // Read prompts from file (one per line)
+        std::ifstream infile(batch_extract_file);
+        if (!infile.is_open()) {
+            fprintf(stderr, "Error: cannot open %s\n", batch_extract_file.c_str());
+            return 1;
+        }
+        std::vector<std::string> prompts;
+        std::string line;
+        while (std::getline(infile, line)) {
+            if (!line.empty()) prompts.push_back(line);
+        }
+        if (prompts.empty()) {
+            fprintf(stderr, "Error: no prompts in %s\n", batch_extract_file.c_str());
+            return 1;
+        }
+
+        int B = (int)prompts.size();
+        int L = seq_len;
+        printf("\nBatch extract mode: B=%d, L=%d (from %s)\n", B, L, batch_extract_file.c_str());
+
+        // Tokenize each prompt, pad/truncate to L
+        std::vector<int32_t> all_tokens(B * L, 0);
+        for (int b = 0; b < B; b++) {
+            auto tokens = tokenizer->encode(prompts[b]);
+            int copy_len = std::min((int)tokens.size(), L);
+            for (int j = 0; j < copy_len; j++) {
+                all_tokens[b * L + j] = tokens[j];
+            }
+            printf("  [%d] %zu tok%s — %.40s%s\n", b, tokens.size(),
+                   (int)tokens.size() > L ? " (truncated)" :
+                   (int)tokens.size() < L ? " (padded)" : "",
+                   prompts[b].c_str(),
+                   prompts[b].size() > 40 ? "..." : "");
+        }
+
+        // Allocate batch state
+        printf("\nAllocating batch state...\n");
+        InferenceState state;
+        state.allocate(model->config, allocator);
+        state.allocate_batch_prefill(model->config, allocator, B * L, B);
+        printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
+
+        // Output buffer
+        int n_embed = model->config.n_embed;
+        std::vector<uint16_t> output((size_t)B * L * n_embed);
+
+        // Run extraction
+        printf("\nRunning batch extraction...\n");
+        auto t4 = std::chrono::high_resolution_clock::now();
+
+        state.extract_hidden_batch(*model, all_tokens.data(), B, L, output.data());
+
+        GWEN_CHECK_CUDA(cudaDeviceSynchronize());
+        auto t5 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
+        int total_tokens = B * L;
+        double tok_per_s = total_tokens / (ms / 1000.0);
+
+        printf("\n--- Batch Extract Timing ---\n");
+        printf("Batch size: %d\n", B);
+        printf("Seq length: %d\n", L);
+        printf("Total tokens: %d\n", total_tokens);
+        printf("Time: %.1f ms\n", ms);
+        printf("Throughput: %.0f tok/s\n", tok_per_s);
+
+        if (benchmark) {
+            fprintf(stderr,
+                "{\"batch\": %d, \"seq_len\": %d, \"total_tokens\": %d, "
+                "\"total_ms\": %.2f, \"tok_per_s\": %.2f, "
+                "\"peak_vram_mb\": %.1f}\n",
+                B, L, total_tokens, ms, tok_per_s,
+                allocator.total_allocated() / 1024.0 / 1024.0);
+        }
+
+        return 0;
+    }
+
+    // ========== Normal generation mode ==========
     if (prompt.empty()) {
         printf("\nNo prompt specified. Use --prompt to generate text.\n");
         return 0;

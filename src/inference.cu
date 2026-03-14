@@ -675,6 +675,637 @@ kernel_deltanet_prefill_batch(
     }
 }
 
+// ============================================================
+// Chunkwise DeltaNet kernels (parallel batch prefill)
+// ============================================================
+
+// Kernel 0: Cumulative gate prefix sum + L2-normalize Q and K in-place.
+// Grid: (n_heads, B), 128 threads per block.
+// Each block processes L tokens of one (batch, head) pair sequentially.
+__global__ void __launch_bounds__(128)
+kernel_cumgate_l2norm_batch(
+    half* __restrict__ qkv,            // [B*L, 3*ssm_inner] Q/K/V packed, Q and K normalized in-place
+    const float* __restrict__ gate,    // [B*L, n_heads] gate log-decay values
+    float* __restrict__ gate_cumul,    // [B*L, n_heads] output: cumulative gate prefix sum
+    int B, int L, int n_heads, int dk, int ssm_inner, float q_scale)
+{
+    int head = blockIdx.x;
+    int b = blockIdx.y;
+    if (b >= B || head >= n_heads) return;
+    int j = threadIdx.x;  // 0..127 = dimension index within head
+    int warp_id = j / 32;
+    int lane = j % 32;
+
+    __shared__ float sh_reduce[4];
+    float cum_gate = 0.0f;
+
+    for (int t = 0; t < L; t++) {
+        int global_t = b * L + t;
+
+        // Accumulate gate prefix sum (only one thread writes)
+        float g = gate[global_t * n_heads + head];
+        cum_gate += g;
+        if (j == 0) {
+            gate_cumul[global_t * n_heads + head] = cum_gate;
+        }
+
+        // L2-normalize Q (same logic as original kernel)
+        half* q_ptr = qkv + (size_t)global_t * ssm_inner * 3 + head * dk;
+        float q_raw = __half2float(q_ptr[j]);
+        float q_sq = q_raw * q_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = q_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float q_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f)) * q_scale;
+        q_ptr[j] = __float2half(q_raw * q_inv);
+
+        // L2-normalize K
+        half* k_ptr = qkv + (size_t)global_t * ssm_inner * 3 + ssm_inner + head * dk;
+        float k_raw = __half2float(k_ptr[j]);
+        float k_sq = k_raw * k_raw;
+        for (int off = 16; off > 0; off >>= 1)
+            k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, off);
+        if (lane == 0) sh_reduce[warp_id] = k_sq;
+        __syncthreads();
+        if (j < 4) {
+            float s = sh_reduce[j];
+            for (int off = 2; off > 0; off >>= 1)
+                s += __shfl_xor_sync(0xF, s, off);
+            if (j == 0) sh_reduce[0] = s;
+        }
+        __syncthreads();
+        float k_inv = rsqrtf(fmaxf(sh_reduce[0], 1e-12f));
+        k_ptr[j] = __float2half(k_raw * k_inv);
+        __syncthreads();
+    }
+}
+
+// Kernel 1: WY representation — compute A = beta*exp(g)*K@K^T, solve T=(I+A)^{-1}, then W=T@(beta*K), U=T@(beta*V).
+// Grid: (NT*B, n_heads), 128 threads per block.
+// One block per (chunk, batch, head). 128 threads = one per K/V dimension.
+// Shared memory: T[64][64] FP32 = 16KB.
+__global__ void __launch_bounds__(128, 4)
+kernel_chunkwise_wy_repr(
+    const half* __restrict__ qkv,        // [B*L, 3*ssm_inner] Q/K/V (Q,K already L2-normed)
+    const float* __restrict__ beta,      // [B*L, n_heads]
+    const float* __restrict__ gate_cumul,// [B*L, n_heads] cumulative gate
+    half* __restrict__ W_out,            // [B*L, ssm_inner] output W
+    half* __restrict__ U_out,            // [B*L, ssm_inner] output U
+    int B, int L, int NT, int n_heads, int dk, int ssm_inner)
+{
+    int cb = blockIdx.x;  // chunk_batch index: 0 .. NT*B - 1
+    int head = blockIdx.y;
+    int b = cb / NT;
+    int chunk = cb % NT;
+    if (b >= B || head >= n_heads) return;
+
+    int j = threadIdx.x;  // 0..127 = dimension index
+    int C = 64;  // chunk size
+    int chunk_start = b * L + chunk * C;
+    int chunk_len = min(C, L - chunk * C);
+    if (chunk_len <= 0) return;
+
+    // Shared memory: T matrix [64][64] FP32 = 16KB
+    __shared__ float sh_T[64][64];
+
+    // --- Phase 1: Compute A = beta*exp(g[i]-g[j]) * K[i]@K[j] (strictly lower tri) ---
+    // Store in sh_T. Each thread handles one dimension j of K, contributes to all (i,row) elements.
+    // We build A column by column in a loop over rows.
+
+    // First load K and beta and gate_cumul for this chunk into registers/shared
+    // K is at qkv + token * 3*ssm_inner + ssm_inner + head*dk + j
+    // With 128 threads (one per dim), we load K[t][j] for each t in 0..chunk_len-1
+
+    // Zero T
+    for (int i = j; i < 64 * 64; i += 128)
+        sh_T[i / 64][i % 64] = 0.0f;
+    __syncthreads();
+
+    // Compute A[i][col] for i > col, using outer-product accumulation
+    // A[i][col] = beta[i] * exp(g[i]-g[col]) * sum_d K[i][d]*K[col][d]
+    // Iterate over columns (col), for each column load K[col][j], then for each row i>col
+    // atomicAdd K[i][j]*K[col][j] contribution. But atomicAdd on shared is slow.
+
+    // Better approach: for each pair of rows (i, col) compute dot product.
+    // With 128 threads over the d dimension, use warp reductions.
+    // But 64*63/2 = 2016 pairs × 128-dim dot product is a lot.
+
+    // Most efficient for 128 threads: iterate over row pairs, each pair gets a full
+    // 128-thread reduction for the dot product.
+    // 2016 pairs → 2016 sequential reductions. Too slow.
+
+    // Alternative: accumulate A via rank-1 updates. For each d:
+    //   A[i][col] += K[i][d] * K[col][d] * beta[i] * exp(g[i]-g[col])
+    // With one thread per d, each thread contributes to all (i,col) pairs.
+    // But writing to shared A[64][64] from 128 threads needs atomics.
+
+    // Practical approach: compute A one row at a time.
+    // For row i: A[i][0..i-1] = beta[i] * exp(g[i]-g[col]) * K[i] @ K[col]^T
+    // K[i] @ K[col]^T is a 128-dim dot product, reduced across 128 threads.
+
+    // We process pairs (i, col) in batches. For each col, we can process all i > col.
+    // But each dot product needs a full 128-thread reduction.
+
+    // Let's use the following approach:
+    // For each col in 0..chunk_len-1:
+    //   Load K[col][j] into register
+    //   For each i in col+1..chunk_len-1:
+    //     Compute dot = K[i][j] * K[col][j] (per thread)
+    //     Warp reduce + cross-warp reduce → A[i][col]
+    // This is chunk_len^2/2 reductions, each taking ~10 instructions.
+    // For chunk_len=64: 2016 reductions. With 128 threads: fast in shared mem.
+
+    // Actually let's just do it more efficiently with a shared-mem K buffer.
+    // Load all K[0..63][j] values, then compute row by row.
+
+    // Register buffer for K values of this chunk
+    float K_reg[64];  // K[t][j] for t=0..63 for this thread's dimension j
+    float beta_vals[64];
+    float g_vals[64];
+
+    for (int t = 0; t < chunk_len; t++) {
+        int gt = chunk_start + t;
+        K_reg[t] = __half2float(qkv[(size_t)gt * ssm_inner * 3 + ssm_inner + head * dk + j]);
+        if (j == 0) {
+            beta_vals[t] = beta[gt * n_heads + head];
+            g_vals[t] = gate_cumul[gt * n_heads + head];
+        }
+    }
+    for (int t = chunk_len; t < 64; t++) {
+        K_reg[t] = 0.0f;
+        if (j == 0) { beta_vals[t] = 0.0f; g_vals[t] = 0.0f; }
+    }
+
+    // All threads load beta and g (they're small, global reads are fine)
+    for (int t = 0; t < chunk_len; t++) {
+        int gt = chunk_start + t;
+        beta_vals[t] = beta[gt * n_heads + head];
+        g_vals[t] = gate_cumul[gt * n_heads + head];
+    }
+    for (int t = chunk_len; t < 64; t++) {
+        beta_vals[t] = 0.0f;
+        g_vals[t] = 0.0f;
+    }
+
+    // Compute A row by row: A[i][col] for each i, all col < i
+    __shared__ float sh_dot_reduce[4];  // for cross-warp reduction
+    int warp_id = j / 32;
+    int lane = j % 32;
+
+    for (int i = 1; i < chunk_len; i++) {
+        float ki_j = K_reg[i];
+        float beta_i = beta_vals[i];
+        float g_i = g_vals[i];
+
+        for (int col = 0; col < i; col++) {
+            // Dot product: K[i] @ K[col] across 128 dimensions
+            float dot = ki_j * K_reg[col];
+            // Warp reduce
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
+            // Cross-warp reduce (4 warps)
+            if (lane == 0) sh_dot_reduce[warp_id] = dot;
+            __syncthreads();
+            if (j == 0) {
+                float total = sh_dot_reduce[0] + sh_dot_reduce[1] +
+                              sh_dot_reduce[2] + sh_dot_reduce[3];
+                // A[i][col] = beta_i * exp(g_i - g_col) * total
+                sh_T[i][col] = beta_i * expf(g_i - g_vals[col]) * total;
+            }
+            __syncthreads();
+        }
+    }
+
+    // --- Phase 2: Triangular solve T = (I + A)^{-1} via row-by-row forward substitution ---
+    // After this, sh_T contains T (lower triangular + identity diagonal).
+    // T[i][col] = -A[i][col] - sum_{k=col+1}^{i-1} T[i][k] * A_orig... no.
+    // Following fla: process row by row. For row i:
+    //   b_a[col] = -A[i][col] for col < i
+    //   b_a[col] += sum_{k=0}^{i-1} b_a[k] * T[k][col]  (T already computed for k < i)
+    //   T[i][col] = b_a[col]
+    // T[i][i] = 1
+
+    // The current sh_T contains A (positive strictly lower triangular).
+    // We'll transform it in-place to T.
+
+    // First negate all entries (A → -A)
+    for (int idx = j; idx < 64 * 64; idx += 128) {
+        int r = idx / 64, c = idx % 64;
+        if (r > c && r < chunk_len)
+            sh_T[r][c] = -sh_T[r][c];
+    }
+    __syncthreads();
+
+    // Forward substitution: row by row
+    // For row i (starting from 2 since row 0 is zero and row 1 only has T[1][0] = -A[1][0]):
+    for (int i = 2; i < chunk_len; i++) {
+        // Each thread handles one column col of this row
+        // We need all columns 0..i-1 to be updated
+        // With 128 threads, process columns in batches of 128
+        // (only 64 columns exist, so one pass is enough)
+        if (j < i) {
+            int col = j;
+            // b_a[col] is currently sh_T[i][col] = -A[i][col]
+            float b_a_col = sh_T[i][col];
+            // Accumulate: sum_{k=0}^{i-1} sh_T[i][k] * sh_T[k][col]
+            // But sh_T[i][k] is -A[i][k] (not yet corrected for rows > i).
+            // Wait — we need the ORIGINAL -A[i][k] values times the ALREADY COMPUTED T[k][col].
+            // The issue is that sh_T[k][col] for k < i has already been overwritten to T[k][col].
+            // And sh_T[i][k] for k < i is still -A[i][k] since we haven't processed row i yet.
+            // So: correction = sum_{k=0}^{i-1} (-A[i][k]) * T[k][col]
+
+            float corr = 0.0f;
+            for (int k = 0; k < i; k++) {
+                corr += sh_T[i][k] * sh_T[k][col];
+            }
+            // But sh_T[i][k] = -A[i][k] and sh_T[k][col] = T[k][col] for k < i.
+            // The formula: new_row[col] = -A[i][col] + sum_k (-A[i][k]) * T[k][col]
+            // This is: T[i][col] = -A[i][col] - sum_k A[i][k] * T[k][col]
+            // = -(A[i][col] + sum_k A[i][k] * T[k][col])
+            // = -sum_{k=col}^{i-1} (I+A)[i][k] * T[k][col] + T[i][col]*1 ... hmm
+            // Actually this is exactly (I+A)^{-1} row computation.
+            // The corr includes sh_T[i][col] * sh_T[col][col].
+            // sh_T[col][col] is 0 (we haven't set the diagonal yet).
+            // So corr = sum_{k=0, k!=col}^{i-1} sh_T[i][k] * sh_T[k][col]
+            // But sh_T[i][col] = -A[i][col], and sh_T[col][col] = 0.
+            // The sum effectively skips diagonal terms.
+
+            // Hmm, the T diagonal should be 1. Let me reconsider.
+            // In fla's approach, T starts as -A (negated) and the identity is added at the END.
+            // So during forward sub, T[k][k] = 0 (not 1 yet). The identity is only added post-loop.
+            // The formula becomes:
+            // T_final[i][col] = -A[i][col] + sum_{k=0}^{i-1} (-A[i][k]) * T_final[k][col]
+            // where T_final[k][col] = T_no_identity[k][col] for k != col, and
+            // T_final[k][k] = 1 (from identity added at end).
+            // But during the loop, T[k][k] = 0, so the sum misses the k=col term.
+            // We need to add it back: + (-A[i][col]) * 1 = -A[i][col].
+            // Wait, that's already in b_a_col...
+
+            // Let me re-derive from fla's code:
+            // b_A initially = -A (strictly lower, zero diagonal)
+            // For row i:
+            //   b_a = -A[i,:] (restricted to cols < i)
+            //   b_a += sum(b_a[:, None] * b_A, axis=rows)
+            //     = b_a[j] += sum_k b_a[k] * b_A[k][j]
+            //   b_A[i,:] = b_a
+            // Then at end: b_A += I
+
+            // So during forward sub, b_A[k][col] for k < i = T_no_identity[k][col]
+            // b_a[col] = -A[i][col] + sum_{k=0}^{i-1} (-A[i][k]) * T_no_identity[k][col]
+            // The self-term k=col: (-A[i][col]) * T_no_identity[col][col] = (-A[i][col]) * 0 = 0
+            // So no self-term issue. Just accumulate straightforwardly.
+
+            sh_T[i][col] = b_a_col + corr;
+        }
+        __syncthreads();
+    }
+
+    // Add identity to diagonal
+    if (j < chunk_len) {
+        sh_T[j][j] += 1.0f;
+    }
+    // Zero out rows/cols beyond chunk_len
+    if (j < 64) {
+        for (int c = 0; c < 64; c++) {
+            if (j >= chunk_len || c >= chunk_len)
+                sh_T[j][c] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // --- Phase 3: Compute W = T @ (beta*exp(g_local)*K) and U = T @ (beta*V) ---
+    // GATED W: W[t][j] = sum_{s=0}^{t} T[t][s] * beta[s] * exp(g_local[s]) * K[s][j]
+    // where g_local[s] = g_cumul[s] - g_offset, g_offset = g_cumul[cs-1] (0 for first chunk).
+    // The exp(g_local) factor accounts for how much h decays before token s sees it.
+    // U is unchanged: U[t][j] = sum_{s=0}^{t} T[t][s] * beta[s] * V[s][j]
+    float g_offset = (chunk > 0) ? gate_cumul[(chunk_start - 1) * n_heads + head] : 0.0f;
+
+    for (int t = 0; t < chunk_len; t++) {
+        float w_val = 0.0f;
+        for (int s = 0; s <= t; s++) {  // T is lower triangular
+            float g_local_s = g_vals[s] - g_offset;
+            w_val += sh_T[t][s] * beta_vals[s] * expf(g_local_s) * K_reg[s];
+        }
+        int gt = chunk_start + t;
+        W_out[(size_t)gt * ssm_inner + head * dk + j] = __float2half(w_val);
+    }
+
+    // For U, need V values. Load V and compute U.
+    float V_reg[64];
+    for (int t = 0; t < chunk_len; t++) {
+        int gt = chunk_start + t;
+        V_reg[t] = __half2float(qkv[(size_t)gt * ssm_inner * 3 + 2 * ssm_inner + head * dk + j]);
+    }
+    for (int t = chunk_len; t < 64; t++) V_reg[t] = 0.0f;
+
+    for (int t = 0; t < chunk_len; t++) {
+        float u_val = 0.0f;
+        for (int s = 0; s <= t; s++) {
+            u_val += sh_T[t][s] * beta_vals[s] * V_reg[s];
+        }
+        int gt = chunk_start + t;
+        U_out[(size_t)gt * ssm_inner + head * dk + j] = __float2half(u_val);
+    }
+}
+
+// Kernel 2: State propagation — sequential over chunks, parallel over V-tiles.
+// Grid: (ceil(dv/BV), B*n_heads) with BV=32 → (4, B*16), 128 threads per block.
+// Each block handles one dk×BV tile of h, iterating over NT chunks.
+// Thread tid (0..127) = row index in dk dimension, holds h[tid][v_base+0..31] in 32 registers.
+//
+// Per chunk:
+//   1. Store h at chunk boundary
+//   2. W@h matmul [C,dk]×[dk,BV]→[C,BV] via shared memory (h→shared, W tiled)
+//   3. v_new = U - W@h, store to global + shared
+//   4. Decay h, then h += K^T @ gated_v_new (per-thread, no reduction)
+__global__ void __launch_bounds__(128, 3)
+kernel_chunkwise_state_propagation(
+    float* __restrict__ S_out,           // [B*n_heads, dk, dv] final S state for this layer
+    const half* __restrict__ qkv,        // [B*L, 3*ssm_inner] for K access
+    const half* __restrict__ W,          // [B*L, ssm_inner]
+    const half* __restrict__ U,          // [B*L, ssm_inner]
+    const float* __restrict__ gate_cumul,// [B*L, n_heads]
+    float* __restrict__ h_states,        // [B*NT*n_heads, dk, dv] output h at each chunk boundary
+    half* __restrict__ v_new,            // [B*L, ssm_inner] output corrected values
+    int B, int L, int NT, int n_heads, int dk, int dv, int ssm_inner)
+{
+    const int BV = 32;
+    const int C = 64;
+    const int BK = 16;  // K-tile size for W@h matmul
+    // Thread mapping for matmul output [C=64, BV=32]:
+    // 128 threads → 16 in M (C/TM=64/4), 8 in N (BV/TN=32/4)
+    const int TM = 4, TN = 4;
+
+    int v_tile = blockIdx.x;
+    int bh = blockIdx.y;
+    int b = bh / n_heads;
+    int head = bh % n_heads;
+    if (b >= B) return;
+
+    int tid = threadIdx.x;
+    int v_base = v_tile * BV;
+    int m_idx = tid / 8;   // 0..15, covers M=64 in strides of TM=4
+    int n_idx = tid % 8;   // 0..7,  covers N=32 in strides of TN=4
+
+    // h state in registers: h[tid][v_base+0..31]
+    float h_reg[32];
+    #pragma unroll
+    for (int v = 0; v < 32; v++) h_reg[v] = 0.0f;
+
+    // Shared memory: h tile + W tile + v_new buffer
+    __shared__ float sh_h[128][32];    // [dk, BV] h tile (16 KB)
+    __shared__ float sh_W[64][16];     // [C, BK] W tile (4 KB) - reused per K-tile
+    __shared__ float sh_vnew[64][32];  // [C, BV] v_new buffer for pass 2 (8 KB)
+    // Total: 28 KB
+
+    float g_offset = 0.0f;
+
+    for (int chunk = 0; chunk < NT; chunk++) {
+        int chunk_start = b * L + chunk * C;
+        int chunk_len = min(C, L - chunk * C);
+        if (chunk_len <= 0) break;
+
+        // 1) Store h state at chunk boundary (BEFORE any modification)
+        size_t h_off = ((size_t)(b * NT + chunk) * n_heads + head) * dk * dv;
+        #pragma unroll
+        for (int v = 0; v < 32; v++)
+            h_states[h_off + tid * dv + v_base + v] = h_reg[v];
+
+        // Load h into shared memory for the matmul
+        #pragma unroll
+        for (int v = 0; v < 32; v++)
+            sh_h[tid][v] = h_reg[v];
+
+        // Load g_last — all threads read it after syncthreads
+        __shared__ float sh_g_last;
+        if (tid == 0) {
+            sh_g_last = gate_cumul[(chunk_start + chunk_len - 1) * n_heads + head];
+        }
+        __syncthreads();
+        float g_last = sh_g_last;
+
+        // === W@h matmul: [chunk_len, dk=128] × [dk=128, BV=32] → [chunk_len, BV=32] ===
+        // Thread (m_idx, n_idx) computes output tile [m_idx*TM .. +TM-1][n_idx*TN .. +TN-1]
+        float acc[TM][TN];
+        #pragma unroll
+        for (int m = 0; m < TM; m++)
+            #pragma unroll
+            for (int n = 0; n < TN; n++)
+                acc[m][n] = 0.0f;
+
+        for (int k_tile = 0; k_tile < dk; k_tile += BK) {
+            // Cooperative load of W tile: W[chunk_start+t][head*dk + k_tile + k]
+            // 64*16 = 1024 elements, 128 threads → 8 per thread
+            #pragma unroll
+            for (int i = tid; i < chunk_len * BK; i += 128) {
+                int t = i / BK;
+                int k = i % BK;
+                int gt = chunk_start + t;
+                sh_W[t][k] = __half2float(W[(size_t)gt * ssm_inner + head * dk + k_tile + k]);
+            }
+            // Zero remaining rows if chunk_len < C
+            for (int i = chunk_len * BK + tid; i < C * BK; i += 128) {
+                sh_W[i / BK][i % BK] = 0.0f;
+            }
+            __syncthreads();
+
+            // Compute tile of W@h
+            #pragma unroll
+            for (int bk = 0; bk < BK; bk++) {
+                #pragma unroll
+                for (int m = 0; m < TM; m++) {
+                    float w = sh_W[m_idx * TM + m][bk];
+                    #pragma unroll
+                    for (int n = 0; n < TN; n++) {
+                        acc[m][n] += w * sh_h[k_tile + bk][n_idx * TN + n];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // v_new[t][v] = U[t][v] - wh[t][v], store to global + shared
+        #pragma unroll
+        for (int m = 0; m < TM; m++) {
+            int t = m_idx * TM + m;
+            if (t >= chunk_len) continue;
+            int gt = chunk_start + t;
+            #pragma unroll
+            for (int n = 0; n < TN; n++) {
+                int v = n_idx * TN + n;
+                float u_val = __half2float(U[(size_t)gt * ssm_inner + head * dk + v_base + v]);
+                float vn = u_val - acc[m][n];
+                v_new[(size_t)gt * ssm_inner + head * dk + v_base + v] = __float2half(vn);
+                sh_vnew[t][v] = vn;
+            }
+        }
+        __syncthreads();
+
+        // === PASS 2: Decay h, then h += K^T @ gated_v_new ===
+        float decay = expf(g_last - g_offset);
+        #pragma unroll
+        for (int v = 0; v < 32; v++)
+            h_reg[v] *= decay;
+
+        // h[tid][v] += K[t][tid] * gated_v_new[t][v] — per-thread, no reduction needed
+        for (int t = 0; t < chunk_len; t++) {
+            int gt = chunk_start + t;
+            float k_val = __half2float(qkv[(size_t)gt * ssm_inner * 3 + ssm_inner + head * dk + tid]);
+            float g_t = gate_cumul[gt * n_heads + head];
+            float g_factor = expf(g_last - g_t);
+            #pragma unroll
+            for (int v = 0; v < 32; v++)
+                h_reg[v] += k_val * sh_vnew[t][v] * g_factor;
+        }
+        __syncthreads();
+
+        g_offset = g_last;
+    }
+
+    // Store final S state
+    size_t s_base = ((size_t)b * n_heads + head) * dk * dv;
+    #pragma unroll
+    for (int v = 0; v < 32; v++)
+        S_out[s_base + tid * dv + v_base + v] = h_reg[v];
+}
+
+// Kernel 3: Chunkwise output — per chunk, per head.
+// o[t][v] = Q[t] @ h_chunk * exp(g_local[t]) + sum_{s<=t} (Q[t]@K[s] * exp(g[t]-g[s])) * v_new[s][v]
+// q_scale already baked into Q during L2 normalization.
+//
+// Phase 1: Compute gated causal QK^T [C,C] via tiled matmul in shared memory.
+// Phase 2: For each token, compute output per-v-column independently (no reduction).
+//
+// Grid: (1, NT*B, n_heads), 128 threads.
+// Thread tid = v dimension in phase 2 (dv=128).
+__global__ void __launch_bounds__(128, 3)
+kernel_chunkwise_output(
+    const half* __restrict__ qkv,        // [B*L, 3*ssm_inner]
+    const float* __restrict__ h_states,  // [B*NT*n_heads, dk, dv]
+    const half* __restrict__ v_new,      // [B*L, ssm_inner]
+    const float* __restrict__ gate_cumul,// [B*L, n_heads]
+    half* __restrict__ output,           // [B*L, ssm_inner]
+    int B, int L, int NT, int n_heads, int dk, int dv, int ssm_inner)
+{
+    int cb = blockIdx.y;
+    int head = blockIdx.z;
+    int b = cb / NT;
+    int chunk = cb % NT;
+    if (b >= B || head >= n_heads) return;
+
+    int tid = threadIdx.x;
+    const int C = 64;
+    const int BK = 16;
+    int chunk_start = b * L + chunk * C;
+    int chunk_len = min(C, L - chunk * C);
+    if (chunk_len <= 0) return;
+
+    size_t h_off = ((size_t)(b * NT + chunk) * n_heads + head) * dk * dv;
+
+    // Shared memory for QK^T matmul
+    __shared__ float sh_Q_tile[64][16 + 1]; // [C, BK] with padding to avoid bank conflicts (4.25 KB)
+    __shared__ float sh_K_tile[64][16 + 1]; // [C, BK] with padding (4.25 KB)
+    __shared__ float sh_QK[64][64 + 1];     // [C, C] gated causal attention matrix (16.25 KB)
+    // sh_Q_row reuses sh_Q_tile space (only need 128 floats, share with first row)
+    // Total: ~25 KB
+
+    // === Phase 1: QK^T matmul [C,dk] × [dk,C] → [C,C] ===
+    // Thread layout: m_idx = tid/4 (0..31), n_idx = tid%4 (0..3)
+    // Each thread computes QK[m_idx*2..+1][n_idx*16..+15] (TM=2, TN=16, 32 elements)
+    const int TM = 2, TN = 16;
+    int m_idx = tid / 4;   // 0..31
+    int n_idx = tid % 4;   // 0..3
+    float acc[TM][TN];
+    #pragma unroll
+    for (int m = 0; m < TM; m++)
+        #pragma unroll
+        for (int n = 0; n < TN; n++)
+            acc[m][n] = 0.0f;
+
+    for (int k_tile = 0; k_tile < dk; k_tile += BK) {
+        // Cooperative load Q tile [C, BK] and K tile [C, BK]
+        // 128 threads, 64*16=1024 elements → 8 per thread
+        for (int i = tid; i < C * BK; i += 128) {
+            int row = i / BK, col = i % BK;
+            int gt = chunk_start + row;
+            if (row < chunk_len) {
+                sh_Q_tile[row][col] = __half2float(qkv[(size_t)gt * ssm_inner * 3 + head * dk + k_tile + col]);
+                sh_K_tile[row][col] = __half2float(qkv[(size_t)gt * ssm_inner * 3 + ssm_inner + head * dk + k_tile + col]);
+            } else {
+                sh_Q_tile[row][col] = 0.0f;
+                sh_K_tile[row][col] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int bk = 0; bk < BK; bk++) {
+            #pragma unroll
+            for (int m = 0; m < TM; m++) {
+                float q = sh_Q_tile[m_idx * TM + m][bk];
+                #pragma unroll
+                for (int n = 0; n < TN; n++) {
+                    acc[m][n] += q * sh_K_tile[n_idx * TN + n][bk];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Apply causal mask + gating, store to shared
+    #pragma unroll
+    for (int m = 0; m < TM; m++) {
+        int t = m_idx * TM + m;
+        float g_t = (t < chunk_len) ? gate_cumul[(chunk_start + t) * n_heads + head] : 0.0f;
+        #pragma unroll
+        for (int n = 0; n < TN; n++) {
+            int s = n_idx * TN + n;
+            float val = 0.0f;
+            if (s <= t && t < chunk_len && s < chunk_len) {
+                float g_s = gate_cumul[(chunk_start + s) * n_heads + head];
+                val = acc[m][n] * expf(g_t - g_s);
+            }
+            sh_QK[t][s] = val;
+        }
+    }
+    __syncthreads();
+
+    // === Phase 2: Compute output per column ===
+    // Thread tid = v dimension (dv=128). Each thread computes output[t][v] independently.
+    float g_offset = (chunk > 0) ? gate_cumul[(chunk_start - 1) * n_heads + head] : 0.0f;
+    int v = tid;
+
+    for (int t = 0; t < chunk_len; t++) {
+        int gt = chunk_start + t;
+        float g_t = gate_cumul[gt * n_heads + head];
+
+        // Inter-chunk: Q[t] @ h[:,v] * exp(g_local_t)
+        float o_inter = 0.0f;
+        for (int k = 0; k < dk; k++) {
+            float q_k = __half2float(qkv[(size_t)gt * ssm_inner * 3 + head * dk + k]);
+            o_inter += q_k * h_states[h_off + k * dv + v];
+        }
+        o_inter *= expf(g_t - g_offset);
+
+        // Intra-chunk: sum_{s<=t} QK[t][s] * v_new[s][v]
+        float o_intra = 0.0f;
+        for (int s = 0; s <= t; s++) {
+            int gs = chunk_start + s;
+            o_intra += sh_QK[t][s] * __half2float(v_new[(size_t)gs * ssm_inner + head * dk + v]);
+        }
+
+        output[(size_t)gt * ssm_inner + head * dk + v] = __float2half(o_inter + o_intra);
+    }
+}
+
 // Batched RoPE for prefill: apply RoPE to all B*L tokens.
 // Position for token i = i % L (each sequence starts at pos 0).
 // Grid.x: n_heads + n_kv_heads, Grid.y: B*L tokens.
@@ -1260,10 +1891,34 @@ void InferenceState::allocate_batch_prefill(const ModelConfig& cfg, CudaAllocato
     size_t conv_total = (size_t)max_seqs * n_batch_dn_layers * conv_per_layer;
     batch_dn_conv = static_cast<float*>(a(conv_total));
 
+    // --- Chunkwise DeltaNet intermediate buffers ---
+    int max_seq_len = max_total_tokens / max_seqs;  // L
+    chunk_NT_max = (max_seq_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    // Cumulative gate: [max_tokens, n_heads]
+    chunk_gate_cumul = static_cast<float*>(a(max_total_tokens * n_heads * sizeof(float)));
+
+    // W, U: [max_tokens, ssm_inner] (same layout as K, V)
+    chunk_W = static_cast<half*>(a(max_total_tokens * cfg.ssm_inner_size * sizeof(half)));
+    chunk_U = static_cast<half*>(a(max_total_tokens * cfg.ssm_inner_size * sizeof(half)));
+
+    // h_states: [max_seqs * NT_max * n_heads, dk, dv] FP32
+    size_t h_total = (size_t)max_seqs * chunk_NT_max * n_heads * dk * dv * sizeof(float);
+    chunk_h_states = static_cast<float*>(a(h_total));
+
+    // v_new: [max_tokens, ssm_inner]
+    chunk_v_new = static_cast<half*>(a(max_total_tokens * cfg.ssm_inner_size * sizeof(half)));
+
+    size_t chunk_total = max_total_tokens * n_heads * sizeof(float)  // gate_cumul
+        + 2 * max_total_tokens * cfg.ssm_inner_size * sizeof(half)   // W + U
+        + h_total                                                     // h_states
+        + max_total_tokens * cfg.ssm_inner_size * sizeof(half);       // v_new
+
     printf("Batch prefill: max_seqs=%d, max_tokens=%d\n", max_seqs, max_total_tokens);
     printf("  DeltaNet S states: %.1f MB (%d seqs × %d layers × %.0f KB/layer)\n",
            S_total / 1024.0 / 1024.0, max_seqs, n_batch_dn_layers, S_per_layer / 1024.0);
     printf("  Conv states: %.1f MB\n", conv_total / 1024.0 / 1024.0);
+    printf("  Chunkwise buffers: %.1f MB (NT_max=%d)\n", chunk_total / 1024.0 / 1024.0, chunk_NT_max);
 }
 
 // ============================================================
@@ -2862,12 +3517,42 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
                 prefill_dn_gate, prefill_dn_beta,
                 N, cfg.n_embed, n_heads);
 
-            // Persistent DeltaNet: n_heads * B blocks, each processes L tokens
-            kernel_deltanet_prefill_batch<<<n_heads * B, 128, 0, s>>>(
-                batch_S_layer, prefill_proj_qkv,
-                prefill_dn_gate, prefill_dn_beta,
-                prefill_ffn_gate,  // temp output [B*L, ssm_inner]
-                B, L, n_heads, dk, dv, cfg.ssm_inner_size, q_scale);
+            // DeltaNet kernel: chunkwise (default) or old sequential (GWEN_USE_SEQ_DN=1)
+            {
+                static int use_seq = -1;
+                if (use_seq < 0) use_seq = (getenv("GWEN_USE_SEQ_DN") != nullptr) ? 1 : 0;
+
+                if (use_seq) {
+                    kernel_deltanet_prefill_batch<<<n_heads * B, 128, 0, s>>>(
+                        batch_S_layer, prefill_proj_qkv, prefill_dn_gate, prefill_dn_beta,
+                        prefill_ffn_gate, B, L, n_heads, dk, dv, cfg.ssm_inner_size, q_scale);
+                } else {
+                    int NT = (L + 63) / 64;
+
+                    kernel_cumgate_l2norm_batch<<<dim3(n_heads, B), 128, 0, s>>>(
+                        prefill_proj_qkv, prefill_dn_gate, chunk_gate_cumul,
+                        B, L, n_heads, dk, cfg.ssm_inner_size, q_scale);
+
+                    kernel_chunkwise_wy_repr<<<dim3(NT * B, n_heads), 128, 0, s>>>(
+                        prefill_proj_qkv, prefill_dn_beta, chunk_gate_cumul,
+                        chunk_W, chunk_U,
+                        B, L, NT, n_heads, dk, cfg.ssm_inner_size);
+
+                    int BV = 32;
+                    dim3 prop_grid((dv + BV - 1) / BV, B * n_heads);
+                    kernel_chunkwise_state_propagation<<<prop_grid, 128, 0, s>>>(
+                        batch_S_layer, prefill_proj_qkv,
+                        chunk_W, chunk_U, chunk_gate_cumul,
+                        chunk_h_states, chunk_v_new,
+                        B, L, NT, n_heads, dk, dv, cfg.ssm_inner_size);
+
+                    dim3 out_grid(1, NT * B, n_heads);
+                    kernel_chunkwise_output<<<out_grid, 128, 0, s>>>(
+                        prefill_proj_qkv, chunk_h_states, chunk_v_new, chunk_gate_cumul,
+                        prefill_ffn_gate,
+                        B, L, NT, n_heads, dk, dv, cfg.ssm_inner_size);
+                }
+            }
 
             // Batch gated RMSNorm
         

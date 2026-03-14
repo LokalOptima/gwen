@@ -90,3 +90,4 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/bench/profile_forward.cu)
     target_link_libraries(profile_forward gwen_core)
     set_target_properties(profile_forward PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
+
