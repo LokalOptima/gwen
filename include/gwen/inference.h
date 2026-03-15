@@ -134,7 +134,7 @@ struct InferenceState {
     int* d_prefill_tokens = nullptr;  // [max_prefill] pre-allocated device token IDs
     int max_prefill = 0;
 
-    void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens);
+    void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens, bool f32_path = true);
 
     // --- Batch prefill state (for extract_hidden_batch) ---
     // B independent DeltaNet states and conv states, contiguous for batch kernels
@@ -152,12 +152,18 @@ struct InferenceState {
     half* chunk_v_new = nullptr;       // [max_tokens, ssm_inner] corrected values after state propagation
     int chunk_NT_max = 0;              // max number of chunks per sequence
 
-    void allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_total_tokens, int max_seqs);
+    void allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_total_tokens, int max_seqs, bool f32_path = false);
 
     // Batch extract: process B independent sequences of length L, output all hidden states
     // all_tokens: [B * L] flat array of token IDs (host)
     // output_host: [B * L * n_embed] FP16 hidden states (host)
     void extract_hidden_batch(Model& model, const int32_t* all_tokens, int B, int L, void* output_host);
+
+    // Compute main model predictions from hidden states on GPU (after extract_hidden_batch).
+    // Applies output_norm + lm_head (embed_tokens GEMV) + argmax per token.
+    // hidden_gpu: [N, n_embed] FP16 on GPU (e.g., pf_a after batch extraction)
+    // preds_host: [N] int32 predictions on host
+    void predict_from_hidden(Model& model, half* hidden_gpu, int N, int32_t* preds_host);
 
     // --- MTP (Multi-Token Prediction) state ---
     half* mtp_hidden = nullptr;     // [n_embed] saved hidden state after all layers (for MTP input)

@@ -24,6 +24,7 @@ static void print_usage(const char* prog) {
     printf("  --teacher-tokens T   Comma-separated reference token IDs for teacher-forced comparison\n");
     printf("  --batch-extract FILE Batch GEMM extract mode: read prompts from FILE (one per line)\n");
     printf("  --seq-len N          Sequence length for batch-extract (pad/truncate, default: 512)\n");
+    printf("  --compare-extract    Compare extract_hidden (F32 GEMV) vs extract_hidden_batch (B=1 GEMM)\n");
     printf("  --info               Print model info and exit\n");
     printf("  --help               Show this help\n");
 }
@@ -40,6 +41,7 @@ int main(int argc, char** argv) {
     bool benchmark = false;
     bool output_logits = false;
     bool info_only = false;
+    bool compare_extract = false;
     int seq_len = 512;
 
     static struct option long_options[] = {
@@ -54,13 +56,14 @@ int main(int argc, char** argv) {
         {"teacher-tokens",required_argument, nullptr, 't'},
         {"batch-extract",required_argument, nullptr, 'B'},
         {"seq-len",      required_argument, nullptr, 'S'},
+        {"compare-extract", no_argument,    nullptr, 'C'},
         {"info",         no_argument,       nullptr, 'i'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:t:B:S:gblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:t:B:S:Cgblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
@@ -73,6 +76,7 @@ int main(int argc, char** argv) {
             case 'l': output_logits = true; break;
             case 'B': batch_extract_file = optarg; break;
             case 'S': seq_len = atoi(optarg); break;
+            case 'C': compare_extract = true; break;
             case 'i': info_only = true; break;
             case 'h': print_usage(argv[0]); return 0;
             default:  print_usage(argv[0]); return 1;
@@ -131,6 +135,105 @@ int main(int argc, char** argv) {
            upload_ms,
            allocator.total_allocated() / 1024.0 / 1024.0,
            allocator.n_allocations());
+
+    // ========== Compare extract mode ==========
+    if (compare_extract) {
+        // Compare single-seq extract_hidden (F32 GEMV) vs batch extract_hidden_batch (B=1 GEMM)
+        const char* test_prompts[] = {
+            "The quick brown fox jumps over the lazy dog.",
+            "In the beginning, there was nothing but silence.",
+            "def fibonacci(n):\n    if n <= 1:\n        return n",
+        };
+        int n_prompts = 3;
+        int L = seq_len;
+        int n_embed = model->config.n_embed;
+
+        printf("\n=== Compare Extract: F32 GEMV (extract_hidden) vs FP16 GEMM (extract_hidden_batch, B=1) ===\n");
+        printf("Seq length: %d, n_embed: %d\n\n", L, n_embed);
+
+        // Allocate with F32 path enabled + batch buffers
+        InferenceState state;
+        state.allocate(model->config, allocator);
+        state.allocate_batch_prefill(model->config, allocator, L, 1, /*f32_path=*/true);
+        printf("Total GPU memory: %.1f MB\n\n", allocator.total_allocated() / 1024.0 / 1024.0);
+
+        int all_pass = 1;
+        for (int p = 0; p < n_prompts; p++) {
+            auto tokens = tokenizer->encode(test_prompts[p]);
+
+            // Pad/truncate to L
+            std::vector<int> tok_padded(L, 0);
+            int copy_len = std::min((int)tokens.size(), L);
+            for (int j = 0; j < copy_len; j++) tok_padded[j] = tokens[j];
+            int actual_len = copy_len;
+
+            printf("[%d] \"%s\" (%d tokens, padded to %d)\n", p, test_prompts[p], (int)tokens.size(), L);
+
+            // Run F32 GEMV path (extract_hidden)
+            std::vector<uint16_t> gemv_out((size_t)L * n_embed);
+            state.extract_hidden(*model, tok_padded, gemv_out.data());
+
+            // Run FP16 GEMM batch path (extract_hidden_batch, B=1)
+            std::vector<int32_t> tok_i32(tok_padded.begin(), tok_padded.end());
+            std::vector<uint16_t> gemm_out((size_t)L * n_embed);
+            state.extract_hidden_batch(*model, tok_i32.data(), 1, L, gemm_out.data());
+
+            // Compare per position
+            int bit_mismatches = 0;
+            float max_abs = 0.0f;
+            double sum_abs = 0.0;
+            for (int t = 0; t < actual_len; t++) {
+                float cos_num = 0, cos_den_a = 0, cos_den_b = 0;
+                float pos_max_abs = 0;
+                for (int d = 0; d < n_embed; d++) {
+                    size_t idx = (size_t)t * n_embed + d;
+                    uint16_t a_bits = gemv_out[idx], b_bits = gemm_out[idx];
+                    if (a_bits != b_bits) bit_mismatches++;
+                    // Convert to float for comparison
+                    half a_h, b_h;
+                    memcpy(&a_h, &a_bits, 2);
+                    memcpy(&b_h, &b_bits, 2);
+                    float a = __half2float(a_h), b = __half2float(b_h);
+                    float diff = fabsf(a - b);
+                    if (diff > pos_max_abs) pos_max_abs = diff;
+                    sum_abs += diff;
+                    cos_num += a * b;
+                    cos_den_a += a * a;
+                    cos_den_b += b * b;
+                }
+                float cos_sim = cos_num / (sqrtf(cos_den_a) * sqrtf(cos_den_b) + 1e-12f);
+                if (pos_max_abs > max_abs) max_abs = pos_max_abs;
+
+                if (t < 5 || t == actual_len - 1) {
+                    printf("  pos[%3d]: cos=%.6f  max_abs=%.6f\n", t, cos_sim, pos_max_abs);
+                } else if (t == 5) {
+                    printf("  ...\n");
+                }
+
+                if (cos_sim < 0.9999f) {
+                    printf("  WARN: low cosine at pos %d: %.6f\n", t, cos_sim);
+                    all_pass = 0;
+                }
+            }
+            size_t total_elems = (size_t)actual_len * n_embed;
+            float mean_abs = (float)(sum_abs / total_elems);
+            printf("  Summary: bit_mismatches=%d/%zu  max_abs=%.6f  mean_abs=%.6f\n",
+                   bit_mismatches, total_elems, max_abs, mean_abs);
+
+            // F32 vs FP16 paths: max_abs up to ~0.01 is expected (FP16 precision)
+            // Cosine < 0.9999 would indicate actual corruption
+            if (max_abs > 0.05f) {
+                printf("  FAIL: max_abs > 0.05 (likely corruption)\n");
+                all_pass = 0;
+            } else {
+                printf("  PASS\n");
+            }
+            printf("\n");
+        }
+
+        printf("=== %s ===\n", all_pass ? "ALL PASSED" : "SOME FAILED");
+        return all_pass ? 0 : 1;
+    }
 
     // ========== Batch extract mode ==========
     if (!batch_extract_file.empty()) {

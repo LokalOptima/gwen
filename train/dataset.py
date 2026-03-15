@@ -175,6 +175,7 @@ class TokenBatchSampler(Sampler):
         self,
         lengths: list[int],
         max_tokens: int,
+        max_seqs: int = 64,
         shuffle: bool = True,
         seed: int = 42,
         drop_last: bool = True,
@@ -188,15 +189,15 @@ class TokenBatchSampler(Sampler):
         # Sort indices by length (longest first for greedy packing)
         sorted_indices = sorted(range(len(lengths)), key=lambda i: -lengths[i])
 
-        # Greedily pack into batches targeting max_tokens
+        # Greedily pack into batches targeting max_tokens, capped at max_seqs
         self.batches = []
         batch = []
         batch_max_len = 0
         for idx in sorted_indices:
             seq_len = lengths[idx]
             new_max = max(batch_max_len, seq_len)
-            # If adding this sequence would exceed budget, flush
-            if batch and new_max * (len(batch) + 1) > max_tokens:
+            # Flush if adding this sequence would exceed token budget or seq count
+            if batch and (new_max * (len(batch) + 1) > max_tokens or len(batch) >= max_seqs):
                 self.batches.append(batch)
                 batch = [idx]
                 batch_max_len = seq_len

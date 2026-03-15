@@ -125,6 +125,27 @@ def load_embeddings(model_dir: Path, device: str) -> torch.Tensor:
     return embed_weight
 
 
+def load_main_model_norm(model_dir: Path) -> torch.Tensor:
+    """Load main model's output RMSNorm weight (for acceptance rate computation).
+
+    Returns [n_embed] F32 weight with +1 convention applied.
+    """
+    from safetensors import safe_open
+
+    model_dir = Path(model_dir)
+    norm_keys = ["model.language_model.norm.weight", "model.norm.weight"]
+
+    for sf_path in sorted(model_dir.glob("*.safetensors")):
+        with safe_open(str(sf_path), framework="pt") as f:
+            for k in norm_keys:
+                if k in f.keys():
+                    w = f.get_tensor(k).float() + 1.0  # Qwen3.5 (1+w) convention
+                    log(f"  Main model output norm: {list(w.shape)}, key={k}")
+                    return w
+
+    raise KeyError(f"Cannot find output norm weight in {model_dir}")
+
+
 # ---------------------------------------------------------------------------
 # GWEN server client for hidden state extraction
 # ---------------------------------------------------------------------------
@@ -191,13 +212,107 @@ class GwenClient:
 
         data = resp.read()
         B2, L2, d = struct.unpack('<III', data[:12])
-        hidden = np.frombuffer(data[12:], dtype=np.float16).reshape(B2, L2, d).copy()
+        hidden_bytes = B2 * L2 * d * 2
+        hidden = np.frombuffer(data[12:12 + hidden_bytes], dtype=np.float16).reshape(B2, L2, d).copy()
         return torch.from_numpy(hidden)
+
+    def batch_extract_with_preds(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract hidden states AND main model predictions.
+
+        Args:
+            token_ids: [B, L] int tensor
+
+        Returns:
+            (hidden [B, L, n_embed] float16, predictions [B, L] int32)
+        """
+        token_np = token_ids.cpu().numpy().astype(np.int32)
+        B, L = token_np.shape
+
+        body = struct.pack('<II', B, L) + token_np.tobytes()
+
+        try:
+            self.conn.request("POST", "/batch_extract?preds=1", body=body,
+                              headers={"Content-Type": "application/octet-stream"})
+            resp = self.conn.getresponse()
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+            self._reconnect()
+            self.conn.request("POST", "/batch_extract?preds=1", body=body,
+                              headers={"Content-Type": "application/octet-stream"})
+            resp = self.conn.getresponse()
+
+        if resp.status != 200:
+            raise RuntimeError(f"GWEN server error {resp.status}: {resp.read().decode()}")
+
+        data = resp.read()
+        B2, L2, d = struct.unpack('<III', data[:12])
+        hidden_bytes = B2 * L2 * d * 2
+        hidden = np.frombuffer(data[12:12 + hidden_bytes], dtype=np.float16).reshape(B2, L2, d).copy()
+        preds = np.frombuffer(data[12 + hidden_bytes:], dtype=np.int32).reshape(B2, L2).copy()
+        return torch.from_numpy(hidden), torch.from_numpy(preds)
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+def compute_acceptance(
+    mtp_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    main_norm_w: torch.Tensor,
+    embed_weight: torch.Tensor,
+    vocab_top_k_ids: np.ndarray,
+    eps: float = 1e-6,
+) -> tuple[int, int]:
+    """Compute speculative decoding acceptance rate.
+
+    Acceptance = MTP's full-vocab prediction matches main model's prediction.
+
+    Args:
+        mtp_logits: [B, L-2, K] MTP output logits over restricted vocab
+        hidden_states: [B, L, n_embed] full hidden states from batch extraction
+        main_norm_w: [n_embed] main model output RMSNorm weight (with +1)
+        embed_weight: [vocab_size, n_embed] embedding matrix (= tied lm_head)
+        vocab_top_k_ids: [K] mapping from restricted index to full vocab ID
+        eps: RMSNorm epsilon
+
+    Returns:
+        (n_accepted, n_total)
+    """
+    B, Lm2, K = mtp_logits.shape
+    L = Lm2 + 2
+    device = mtp_logits.device
+
+    # MTP prediction at position i predicts token[i+2].
+    # Main model at position i+1: hidden[i+1] -> norm -> embed.T -> predicts token[i+2].
+    # So compare MTP argmax at i against main model argmax from hidden[i+1].
+
+    # Main model predictions from hidden[1:L-1] (positions 1..L-2)
+    h = hidden_states[:, 1:L-1].float().to(device)  # [B, L-2, n_embed]
+    norm_w = main_norm_w.to(device)
+    rms = h.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+    normed = h * rms * norm_w  # [B, L-2, n_embed]
+
+    # Compute main model predictions in chunks to avoid OOM (248K vocab)
+    n_accepted = 0
+    n_total = 0
+    chunk_size = 32  # sequences per chunk
+    embed_t = embed_weight.float().to(device).T  # [n_embed, vocab_size]
+
+    for ci in range(0, B, chunk_size):
+        ce = min(ci + chunk_size, B)
+        main_logits = normed[ci:ce] @ embed_t  # [chunk, L-2, vocab_size]
+        main_preds = main_logits.argmax(dim=-1)  # [chunk, L-2] full vocab IDs
+
+        # MTP predictions mapped to full vocab
+        mtp_preds_restricted = mtp_logits[ci:ce].argmax(dim=-1)  # [chunk, L-2]
+        top_k_ids_t = torch.from_numpy(vocab_top_k_ids.astype(np.int64)).to(device)
+        mtp_preds_full = top_k_ids_t[mtp_preds_restricted]  # [chunk, L-2] full vocab IDs
+
+        n_accepted += (mtp_preds_full == main_preds).sum().item()
+        n_total += main_preds.numel()
+
+    return n_accepted, n_total
+
 
 def train(args: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -262,7 +377,8 @@ def train(args: argparse.Namespace) -> None:
     # MTP head
     log("Initializing MTP head...")
     if args.from_pretrained:
-        mtp = MTPHead.from_pretrained(args.model_dir, vocab_size=args.top_k, device=device)
+        mtp = MTPHead.from_pretrained(args.model_dir, vocab_size=args.top_k, device=device,
+                                       vocab_ids=vocab.top_k_ids.tolist())
     else:
         mtp = MTPHead(vocab_size=args.top_k).to(device)
         log("  Initialized from scratch (no pre-trained weights)")
@@ -283,7 +399,7 @@ def train(args: argparse.Namespace) -> None:
 
     # Scheduler: linear warmup + cosine decay
     total_steps = len(train_sampler) * args.epochs
-    warmup_steps = int(total_steps * 0.05)
+    warmup_steps = args.warmup_steps
 
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
@@ -347,7 +463,7 @@ def train(args: argparse.Namespace) -> None:
             "seq_len": args.seq_len,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
-            "warmup_frac": 0.05,
+            "warmup_steps": warmup_steps,
             "grad_clip": args.grad_clip,
             "amp_dtype": "bfloat16",
             "from_pretrained": args.from_pretrained,
@@ -373,13 +489,24 @@ def train(args: argparse.Namespace) -> None:
         json.dump(setup, f, indent=2)
     log(f"Setup saved to {out_dir / 'train_setup.json'}")
 
-    # CSV log
+    # CSV log — train_loss logged every batch, val columns filled at eval points
     log_path = out_dir / "train_log.csv"
     log_exists = log_path.exists() and start_epoch > 0
     log_file = open(log_path, "a" if log_exists else "w")
     if not log_exists:
-        log_file.write("epoch,train_loss,val_loss,oov_frac,accept_est,lr,secs\n")
+        log_file.write("step,epoch,batch_loss,avg_loss,val_loss,accept_rate,gt_acc,lr\n")
         log_file.flush()
+    global_step = start_epoch * len(train_sampler)
+
+    # Load val cache (pre-extracted hidden states from scratch/cache_val.py)
+    val_cache_dir = out_dir / "val_cache"
+    val_cache_files = sorted(val_cache_dir.glob("*.pt")) if val_cache_dir.exists() else []
+    if val_cache_files:
+        log(f"Val cache: {len(val_cache_files)} batches in {val_cache_dir}")
+    else:
+        log(f"WARNING: No val cache found at {val_cache_dir}")
+        log(f"  Run: uv run --with 'torch>=2.7' --with safetensors --with numpy --with tqdm --with packaging scratch/cache_val.py")
+        log(f"  Falling back to live server eval (slow)")
 
     # Training loop
     best_val = float("inf")
@@ -399,22 +526,28 @@ def train(args: argparse.Namespace) -> None:
                     unit="batch", file=sys.stderr, dynamic_ncols=True)
         for batch in pbar:
             token_ids = batch["token_ids"]
-            targets = batch["targets"].to(device, non_blocking=True)
-
             B, L = token_ids.shape
 
             # Embeddings: CPU lookup (fast indexing, saves ~500MB GPU)
             with torch.no_grad():
                 embeddings = F.embedding(token_ids, embed_weight)  # [B, L, 1024] CPU
 
-            # Hidden states: from GWEN server (GPU-accelerated prefill)
+            # Hidden states + main model predictions from GWEN server
             with torch.no_grad():
-                hidden = gwen.batch_extract(token_ids)  # [B, L, 1024] FP16 CPU
+                hidden, main_preds = gwen.batch_extract_with_preds(token_ids)
+                # hidden: [B, L, 1024] FP16 CPU
+                # main_preds: [B, L] int32 CPU — main model's argmax per position
 
             # MTP inputs: embed[1:L-1] and hidden[0:L-2]
             embed_input = embeddings[:, 1 : L - 1]   # [B, L-2, 1024]
             hidden_input = hidden[:, : L - 2]         # [B, L-2, 1024]
-            mtp_targets = targets  # [B, L-2]
+
+            # MTP targets: main model predictions from h[1:L-1], mapped to restricted vocab.
+            # MTP[i] should predict what main model predicts from h[i+1] = main_preds[i+1].
+            mtp_target_ids = main_preds[:, 1:L-1].numpy()  # [B, L-2] full vocab IDs
+            mtp_targets = torch.from_numpy(
+                vocab.map_targets(mtp_target_ids)
+            ).long().to(device, non_blocking=True)
 
             # Chunked forward/backward to bound GPU memory.
             # With K=20K vocab, logits [chunk, L-2, 20K] in FP32 dominate.
@@ -455,100 +588,136 @@ def train(args: argparse.Namespace) -> None:
             scheduler.step()
 
             total_loss += batch_loss
-            total_oov += (targets == -100).sum().item()
-            total_targets += targets.numel()
+            total_oov += (mtp_targets == -100).sum().item()
+            total_targets += mtp_targets.numel()
             n_batches += 1
 
-            # Update progress bar
+            # Update progress bar + log
             avg = total_loss / n_batches
             lr_val = optimizer.param_groups[0]["lr"]
             pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{lr_val:.1e}",
                              B=B, L=L)
+            global_step += 1
+            frac_epoch = epoch + n_batches / len(train_sampler)
+            log_file.write(f"{global_step},{frac_epoch:.4f},{batch_loss:.6f},{avg:.6f},,,,{lr_val:.6e}\n")
+            if global_step % 100 == 0:
+                log_file.flush()
+
+            # --- Intra-epoch eval + checkpoint every eval_every batches ---
+            if n_batches % args.eval_every == 0:
+                mtp.eval()
+                val_loss = 0.0
+                val_accept = 0
+                val_total = 0
+                val_batches = 0
+
+                with torch.no_grad():
+                    if val_cache_files:
+                        # Fast path: load pre-cached hidden states + main model preds
+                        for vf in val_cache_files:
+                            vc = torch.load(str(vf), map_location="cpu", weights_only=True)
+                            vh = vc["hidden_input"]  # [B, L-2, n_embed]
+                            vtgt = vc["targets"].to(device, non_blocking=True)  # [B, L-2] main model preds (restricted)
+                            vtids = vc["token_ids"]
+                            vB, vL = vtids.shape
+                            ve = F.embedding(vtids, embed_weight)[:, 1:vL-1]
+
+                            seq_logit_bytes_v = max(ve.shape[1], 1) * args.top_k * 4
+                            max_chunk_v = max(1, int(500_000_000 / seq_logit_bytes_v))
+                            max_chunk_v = min(max_chunk_v, vB)
+                            for ci in range(0, vB, max_chunk_v):
+                                ce = min(ci + max_chunk_v, vB)
+                                ec = ve[ci:ce].to(device, non_blocking=True)
+                                hc = vh[ci:ce].to(device, dtype=torch.bfloat16, non_blocking=True)
+                                tc = vtgt[ci:ce]
+
+                                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                                    vlogits = mtp(ec, hc)
+                                    vloss = loss_fn(vlogits.reshape(-1, args.top_k), tc.reshape(-1))
+                                val_loss += vloss.item()
+
+                                # Acceptance = MTP argmax matches main model prediction
+                                vpreds = vlogits.argmax(dim=-1)
+                                vmask = tc != -100
+                                if vmask.any():
+                                    val_accept += (vpreds[vmask] == tc[vmask]).sum().item()
+                                    val_total += vmask.sum().item()
+                                val_batches += 1
+                    else:
+                        # Slow path: call GWEN server for each val batch
+                        for vbatch in val_dl:
+                            vtids = vbatch["token_ids"]
+                            vB, vL = vtids.shape
+                            ve = F.embedding(vtids, embed_weight)[:, 1:vL-1]
+
+                            # Get hidden + main model predictions
+                            vh_full, vpreds_full = gwen.batch_extract_with_preds(vtids)
+                            vh = vh_full[:, :vL-2]
+
+                            # Build targets from main model predictions
+                            vt_ids = vpreds_full[:, 1:vL-1].numpy()
+                            vtgt = torch.from_numpy(
+                                vocab.map_targets(vt_ids)
+                            ).long().to(device, non_blocking=True)
+
+                            ec = ve.to(device)
+                            hc = vh.to(device, dtype=torch.bfloat16)
+                            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                                vlogits = mtp(ec, hc)
+                                vloss = loss_fn(vlogits.reshape(-1, args.top_k), vtgt.reshape(-1))
+                            val_loss += vloss.item()
+
+                            vpreds = vlogits.argmax(dim=-1)
+                            vmask = vtgt != -100
+                            if vmask.any():
+                                val_accept += (vpreds[vmask] == vtgt[vmask]).sum().item()
+                                val_total += vmask.sum().item()
+                            val_batches += 1
+
+                avg_val = val_loss / max(val_batches, 1)
+                accept_rate = val_accept / max(val_total, 1)
+                avg_train_so_far = total_loss / max(n_batches, 1)
+                lr_val = optimizer.param_groups[0]["lr"]
+                oov_frac_so_far = total_oov / max(total_targets, 1)
+
+                log(
+                    f"  [{epoch+1}:{n_batches}/{len(train_sampler)}]  "
+                    f"train={avg_train_so_far:.4f}  val={avg_val:.4f}  "
+                    f"accept={accept_rate:.1%}  "
+                    f"oov={oov_frac_so_far:.1%}  lr={lr_val:.1e}"
+                )
+
+                # CSV log
+                frac_epoch = epoch + n_batches / len(train_sampler)
+                log_file.write(
+                    f"{global_step},{frac_epoch:.4f},{avg_train_so_far:.6f},{avg_train_so_far:.6f},"
+                    f"{avg_val:.6f},{accept_rate:.4f},,{lr_val:.6e}\n"
+                )
+                log_file.flush()
+
+                # Checkpoint
+                ckpt = {
+                    "model": mtp.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "batch": n_batches,
+                    "val_loss": avg_val,
+                    "accept_rate": accept_rate,
+                    "vocab_k": args.top_k,
+                    "setup": setup,
+                }
+                if avg_val < best_val:
+                    best_val = avg_val
+                    torch.save(ckpt, out_dir / "best.pt")
+                    log(f"  -> saved best (val={avg_val:.4f}, accept={accept_rate:.1%})")
+
+                torch.save(ckpt, out_dir / "latest.pt")
+                mtp.train()
 
         avg_train = total_loss / max(n_batches, 1)
         oov_frac = total_oov / max(total_targets, 1)
-
-        # Validation
-        mtp.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        val_batches = 0
-
-        with torch.no_grad():
-            val_pbar = tqdm(val_dl, desc="  Validating", unit="batch",
-                            file=sys.stderr, dynamic_ncols=True)
-            for batch in val_pbar:
-                token_ids = batch["token_ids"]
-                targets = batch["targets"].to(device, non_blocking=True)
-
-                B, L = token_ids.shape
-                embeddings = F.embedding(token_ids, embed_weight)
-                hidden = gwen.batch_extract(token_ids)
-
-                embed_input = embeddings[:, 1 : L - 1]
-                hidden_input = hidden[:, : L - 2]
-
-                # Chunked validation (same memory-budget approach as training)
-                seq_logit_bytes = max(L - 2, 1) * args.top_k * 4
-                max_chunk = max(1, int(500_000_000 / seq_logit_bytes))
-                max_chunk = min(max_chunk, B)
-                for ci in range(0, B, max_chunk):
-                    ce = min(ci + max_chunk, B)
-                    e_chunk = embed_input[ci:ce].to(device)
-                    h_chunk = hidden_input[ci:ce].to(device, dtype=torch.bfloat16)
-                    t_chunk = targets[ci:ce]
-
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                        logits = mtp(e_chunk, h_chunk)
-                        loss = loss_fn(logits.reshape(-1, args.top_k), t_chunk.reshape(-1))
-                    val_loss += loss.item()
-
-                    preds = logits.argmax(dim=-1)
-                    mask = t_chunk != -100
-                    if mask.any():
-                        val_correct += (preds[mask] == targets[ci:ce][mask]).sum().item()
-                        val_total += mask.sum().item()
-
-                val_batches += (B + max_chunk - 1) // max_chunk
-
-        avg_val = val_loss / max(val_batches, 1)
-        accept_est = val_correct / max(val_total, 1)
-        lr = optimizer.param_groups[0]["lr"]
-        dt = time.time() - t0
-
-        log(
-            f"Epoch {epoch + 1:3d}/{args.epochs}  "
-            f"train={avg_train:.4f}  val={avg_val:.4f}  "
-            f"accept={accept_est:.1%}  oov={oov_frac:.1%}  "
-            f"lr={lr:.1e}  {dt:.1f}s"
-        )
-
-        # CSV log
-        log_file.write(
-            f"{epoch + 1},{avg_train:.6f},{avg_val:.6f},"
-            f"{oov_frac:.4f},{accept_est:.4f},{lr:.6e},{dt:.1f}\n"
-        )
-        log_file.flush()
-
-        # Checkpoint (includes optimizer/scheduler for clean restart)
-        ckpt = {
-            "model": mtp.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch": epoch,
-            "val_loss": avg_val,
-            "accept_est": accept_est,
-            "vocab_k": args.top_k,
-            "setup": setup,
-        }
-        if avg_val < best_val:
-            best_val = avg_val
-            torch.save(ckpt, out_dir / "best.pt")
-            log(f"  → saved best (val={avg_val:.4f}, accept={accept_est:.1%})")
-
-        # Save latest every epoch
-        torch.save(ckpt, out_dir / "latest.pt")
+        log(f"Epoch {epoch+1}/{args.epochs} done: train={avg_train:.4f} oov={oov_frac:.1%}")
 
     log_file.close()
     log(f"\nTraining complete. Best val loss: {best_val:.4f}")
@@ -640,9 +809,11 @@ def export(args: argparse.Namespace) -> None:
 
     file_size = output.stat().st_size
     log(f"\nSaved: {output} ({file_size / 1024 / 1024:.2f} MB)")
+    accept = ckpt.get('accept_rate', ckpt.get('accept_est', None))
+    accept_str = f"{accept:.1%}" if accept is not None else "?"
     log(f"  Vocab K={vocab_k}, epoch={ckpt.get('epoch', '?')}, "
         f"val_loss={ckpt.get('val_loss', '?'):.4f}, "
-        f"accept_est={ckpt.get('accept_est', '?'):.1%}")
+        f"accept_rate={accept_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +843,10 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--warmup-steps", type=int, default=0,
+                    help="Linear warmup steps (default: 0, not needed for pretrained)")
+    p.add_argument("--eval-every", type=int, default=2000,
+                    help="Run validation and checkpoint every N training batches")
     p.add_argument("--micro-batch", type=int, default=128,
                     help="Max sequences per MTP forward/backward chunk (bounds GPU memory)")
     p.add_argument("--val-fraction", type=float, default=0.05)

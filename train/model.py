@@ -32,8 +32,52 @@ class RMSNorm(nn.Module):
         return (x.float() * rms).to(x.dtype) * self.weight
 
 
+def apply_rope(x: torch.Tensor, positions: torch.Tensor,
+               theta: float = 10000000.0, rope_dim: int = 64) -> torch.Tensor:
+    """Apply interleaved RoPE to first rope_dim dims of each head.
+
+    Args:
+        x: [B, n_heads, L, head_dim]
+        positions: [B, L] or [L] int positions
+    Returns:
+        x with RoPE applied to first rope_dim dimensions.
+    """
+    B, H, L, D = x.shape
+    n_pairs = rope_dim // 2
+
+    if positions.dim() == 1:
+        positions = positions.unsqueeze(0).expand(B, -1)
+
+    # freq[pair] = pos * theta^(-2*pair/rope_dim)
+    pair_idx = torch.arange(n_pairs, device=x.device, dtype=torch.float32)
+    freq_exp = -2.0 * pair_idx / rope_dim  # [n_pairs]
+    inv_freq = theta ** freq_exp  # [n_pairs]
+
+    # [B, L] x [n_pairs] → [B, L, n_pairs]
+    freqs = positions.float().unsqueeze(-1) * inv_freq.unsqueeze(0).unsqueeze(0)
+    cos_val = freqs.cos()  # [B, L, n_pairs]
+    sin_val = freqs.sin()
+
+    # Reshape for broadcast: [B, 1, L, n_pairs]
+    cos_val = cos_val.unsqueeze(1)
+    sin_val = sin_val.unsqueeze(1)
+
+    # Interleaved pairs: (0,1), (2,3), ...
+    x_rope = x[..., :rope_dim].reshape(B, H, L, n_pairs, 2)
+    x0 = x_rope[..., 0]  # [B, H, L, n_pairs]
+    x1 = x_rope[..., 1]
+
+    r0 = x0 * cos_val - x1 * sin_val
+    r1 = x0 * sin_val + x1 * cos_val
+
+    rotated = torch.stack([r0, r1], dim=-1).reshape(B, H, L, rope_dim)
+    out = x.clone()
+    out[..., :rope_dim] = rotated
+    return out
+
+
 class GatedSelfAttention(nn.Module):
-    """Qwen3.5-style gated GQA attention (attn_output_gate=True)."""
+    """Qwen3.5-style gated GQA attention (attn_output_gate=True, with RoPE)."""
 
     def __init__(
         self,
@@ -59,16 +103,15 @@ class GatedSelfAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, eps=eps)
         self.k_norm = RMSNorm(head_dim, eps=eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
         B, L, _ = x.shape
         h, d = self.num_q_heads, self.head_dim
 
-        # Q + gate (interleaved in the 4096-dim output)
-        qg = self.q_proj(x)  # [B, L, 2*h*d]
-        q, gate = qg.split(h * d, dim=-1)  # each [B, L, h*d]
-
-        q = q.view(B, L, h, d)
-        gate = gate.view(B, L, h, d)
+        # Q + gate: interleaved as [Q_h0(256), G_h0(256), Q_h1(256), G_h1(256), ...]
+        qg = self.q_proj(x)  # [B, L, 2*h*d = 4096]
+        qg = qg.view(B, L, h, 2, d)  # [B, L, h, 2, d]
+        q = qg[:, :, :, 0, :]     # [B, L, h, d]
+        gate = qg[:, :, :, 1, :]   # [B, L, h, d]
 
         k = self.k_proj(x).view(B, L, self.num_kv_heads, d)
         v = self.v_proj(x).view(B, L, self.num_kv_heads, d)
@@ -86,6 +129,12 @@ class GatedSelfAttention(nn.Module):
 
         # [B, heads, L, head_dim]
         q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+
+        # RoPE (interleaved, first 64 of 256 dims)
+        if positions is None:
+            positions = torch.arange(L, device=x.device)
+        q = apply_rope(q, positions)
+        k = apply_rope(k, positions)
 
         # Scaled dot-product attention with causal mask
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -200,11 +249,13 @@ class MTPHead(nn.Module):
         model_dir: str | Path,
         vocab_size: int,
         device: str = "cpu",
+        vocab_ids: list[int] | None = None,
     ) -> "MTPHead":
         """Load pre-trained MTP weights from Qwen3.5-0.8B safetensors.
 
-        Initializes all layers from pre-trained weights except lm_head,
-        which is randomly initialized for the restricted vocab.
+        If vocab_ids is provided (list of full-vocab token IDs for the restricted
+        vocab), initializes lm_head from the corresponding rows of the pre-trained
+        lm_head. Otherwise lm_head is randomly initialized.
         """
         from safetensors import safe_open
 
@@ -272,8 +323,33 @@ class MTPHead(nn.Module):
                 state_dict[our_name] = tensor
             loaded += 1
 
+        # Initialize lm_head from pre-trained weights if vocab mapping provided.
+        # Qwen3.5 ties lm_head = embed_tokens, and MTP shares it with the main model.
+        # So we load from embed_tokens and slice to the restricted vocab.
+        if vocab_ids is not None:
+            # Find embedding tensor
+            emb_keys = ["model.language_model.embed_tokens.weight", "model.embed_tokens.weight"]
+            full_lm_head = None
+            for st_path in paths:
+                with safe_open(str(st_path), framework="pt") as f:
+                    for ek in emb_keys:
+                        if ek in f.keys():
+                            full_lm_head = f.get_tensor(ek)
+                            break
+                if full_lm_head is not None:
+                    break
+            if full_lm_head is not None:
+                import numpy as np
+                ids = np.array(vocab_ids, dtype=np.int64)
+                state_dict["lm_head.weight"] = full_lm_head[ids]  # [K, 1024]
+                loaded += 1
+                print(f"Loaded {loaded}/16 pre-trained MTP tensors (lm_head from embed_tokens top-{vocab_size} slice)")
+            else:
+                print(f"Loaded {loaded}/15 pre-trained MTP tensors (lm_head: embed_tokens not found, random init)")
+        else:
+            print(f"Loaded {loaded}/15 pre-trained MTP tensors (lm_head initialized randomly)")
+
         model.load_state_dict(state_dict, strict=False)
-        print(f"Loaded {loaded}/15 pre-trained MTP tensors (lm_head initialized randomly)")
         return model.to(device)
 
     def param_count(self) -> dict[str, int]:

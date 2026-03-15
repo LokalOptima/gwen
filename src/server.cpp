@@ -97,6 +97,7 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char** argv) {
     std::string model_path;
+    std::string mtp_path;
     std::string host = "127.0.0.1";
     int port = 8090;
     int max_seq = 512;
@@ -104,6 +105,7 @@ int main(int argc, char** argv) {
 
     static struct option long_options[] = {
         {"model",     required_argument, nullptr, 'm'},
+        {"mtp",       required_argument, nullptr, 'M'},
         {"host",      required_argument, nullptr, 'H'},
         {"port",      required_argument, nullptr, 'p'},
         {"max-seq",   required_argument, nullptr, 's'},
@@ -113,9 +115,10 @@ int main(int argc, char** argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:H:p:s:b:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:H:p:s:b:h", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
+            case 'M': mtp_path = optarg; break;
             case 'H': host = optarg; break;
             case 'p': port = atoi(optarg); break;
             case 's': max_seq = atoi(optarg); break;
@@ -140,6 +143,11 @@ int main(int argc, char** argv) {
            std::chrono::duration<double, std::milli>(t1 - t0).count());
     model->print_info();
 
+    // Load MTP weights if provided (must be before upload_weights)
+    if (!mtp_path.empty()) {
+        model->load_mtp(mtp_path);
+    }
+
     // Upload weights to GPU
     printf("\nUploading weights to GPU...\n");
     auto t2 = std::chrono::high_resolution_clock::now();
@@ -162,6 +170,9 @@ int main(int argc, char** argv) {
     InferenceState state;
     state.allocate(model->config, allocator, max_seq);
     state.allocate_batch_prefill(model->config, allocator, max_total_tokens, max_batch);
+    if (model->has_mtp) {
+        state.allocate_mtp(model->config, allocator, max_seq);
+    }
     printf("Total GPU memory: %.1f MB\n\n",
            allocator.total_allocated() / 1024.0 / 1024.0);
 
@@ -295,24 +306,37 @@ int main(int argc, char** argv) {
 
         const int32_t* all_tokens = (const int32_t*)(req.body.data() + 8);
         int n_embed = model->config.n_embed;
+        int N = B * L;
 
-        size_t data_bytes = (size_t)B * L * n_embed * sizeof(uint16_t);
-        std::string body(12 + data_bytes, '\0');
+        // Check if predictions requested (query param ?preds=1)
+        bool want_preds = (req.get_param_value("preds") == "1");
+
+        size_t hidden_bytes = (size_t)N * n_embed * sizeof(uint16_t);
+        size_t preds_bytes = want_preds ? (size_t)N * sizeof(int32_t) : 0;
+        std::string body(12 + hidden_bytes + preds_bytes, '\0');
         uint32_t header[3] = {B, L, (uint32_t)n_embed};
         memcpy(&body[0], header, 12);
 
         std::lock_guard<std::mutex> lock(gpu_mtx);
         auto t_start = std::chrono::high_resolution_clock::now();
 
-        // Single call: GEMM-batched forward, reads each weight matrix once
+        // Batch extraction: GEMM-batched forward, reads each weight matrix once
         state.extract_hidden_batch(*model, all_tokens, B, L, &body[12]);
+
+        // Compute main model predictions from hidden states (per-token GEMV + argmax)
+        if (want_preds) {
+            // pf_a still holds hidden states on GPU after extract_hidden_batch
+            state.predict_from_hidden(*model, state.prefill_x, N,
+                                       (int32_t*)&body[12 + hidden_bytes]);
+        }
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         request_count += B;
 
-        printf("[%ld] batch_extract: %u×%u=%u tok → %.1f ms (%.0f tok/s)\n",
-               request_count, B, L, B * L, ms, (double)(B * L) / (ms / 1000.0));
+        printf("[%ld] batch_extract%s: %u×%u=%u tok → %.1f ms (%.0f tok/s)\n",
+               request_count, want_preds ? "+preds" : "",
+               B, L, B * L, ms, (double)(B * L) / (ms / 1000.0));
         fflush(stdout);
 
         res.set_header("X-Batch", std::to_string(B));
@@ -369,6 +393,74 @@ int main(int argc, char** argv) {
                L, mismatches, gemv_output.size());
         fflush(stdout);
     });
+
+    // /test_mtp: Run CUDA MTP on batch-extracted hidden states, return per-position predictions.
+    // For verifying PyTorch MTP matches CUDA MTP.
+    // Binary input: [uint32 L][int32 tokens[L]]
+    // Binary output: [uint32 n_preds][int32 preds[n_preds]]
+    if (model->has_mtp) {
+        svr.Post("/test_mtp", [&](const httplib::Request& req, httplib::Response& res) {
+            if (req.body.size() < 4) {
+                res.status = 400;
+                res.set_content("{\"error\":\"body too short\"}", "application/json");
+                return;
+            }
+
+            uint32_t L;
+            memcpy(&L, req.body.data(), 4);
+            if (req.body.size() < 4 + L * sizeof(int32_t) || L < 3) {
+                res.status = 400;
+                res.set_content("{\"error\":\"need at least 3 tokens\"}", "application/json");
+                return;
+            }
+
+            const int32_t* token_data = (const int32_t*)(req.body.data() + 4);
+            int n_embed = model->config.n_embed;
+            int n_preds = L - 2;  // MTP predicts positions 2..L-1
+
+            std::lock_guard<std::mutex> lock(gpu_mtx);
+
+            // 1. Batch extract hidden states (B=1, L tokens)
+            std::vector<uint16_t> hidden_host(L * n_embed);
+            state.extract_hidden_batch(*model, token_data, 1, L, hidden_host.data());
+
+            // 2. Run CUDA MTP sequentially: for each position t, set mtp_hidden = hidden[t],
+            //    call forward_mtp(token[t+1]) to get MTP prediction for position t+2.
+            //    This matches how MTP runs during speculative decode.
+            std::vector<int32_t> preds(n_preds);
+
+            // Reset MTP KV cache
+            state.mtp_pos = 0;
+            auto& cache = state.mtp_kv_cache;
+            // Zero KV cache (mtp_pos=0 means fresh start)
+
+            cudaStream_t s = state.compute_stream ? state.compute_stream : 0;
+
+            for (int t = 0; t < n_preds; t++) {
+                // Copy hidden[t] to mtp_hidden on GPU
+                GWEN_CHECK_CUDA(cudaMemcpy(
+                    state.mtp_hidden,
+                    hidden_host.data() + (size_t)t * n_embed,
+                    n_embed * sizeof(uint16_t),
+                    cudaMemcpyHostToDevice));
+
+                // Run MTP forward with token[t+1]
+                int pred = state.forward_mtp(*model, token_data[t + 1]);
+                preds[t] = pred;
+            }
+
+            // Build response
+            std::string body(4 + n_preds * 4, '\0');
+            uint32_t np = n_preds;
+            memcpy(&body[0], &np, 4);
+            memcpy(&body[4], preds.data(), n_preds * 4);
+
+            printf("[test_mtp] L=%u, %d MTP predictions\n", L, n_preds);
+            fflush(stdout);
+
+            res.set_content(body, "application/octet-stream");
+        });
+    }
 
     printf("GWEN server starting on %s:%d\n", host.c_str(), port);
     printf("Endpoints:\n");

@@ -1809,7 +1809,8 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     pos = 0;
 }
 
-void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens) {
+void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
+                                      int max_tokens, bool f32_path) {
     auto a = [&](size_t bytes) -> void* { return alloc.alloc(bytes); };
     max_prefill = max_tokens;
 
@@ -1818,18 +1819,20 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     prefill_out   = static_cast<half*>(a(max_tokens * cfg.n_embed * sizeof(half)));
     prefill_norm  = static_cast<half*>(a(max_tokens * cfg.n_embed * sizeof(half)));
 
-    // F32 buffers for verified reference path (GWEN_GEMM_DECODE=1)
-    // Eliminates FP16 truncation throughout the computation, matching llama.cpp's F32 precision.
-    prefill_x_f32   = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
-    prefill_out_f32 = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
+    // F32 buffers for verified reference path (GWEN_GEMM_DECODE=1 / extract_hidden)
+    // Only needed for single-sequence forward_prefill, not for batch extraction.
+    if (f32_path) {
+        prefill_x_f32   = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
+        prefill_out_f32 = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
 
-    size_t qkv_dim_total = cfg.ssm_inner_size * 3;  // 6144
-    prefill_proj_qkv_f32  = static_cast<float*>(a(max_tokens * qkv_dim_total * sizeof(float)));
-    prefill_proj_gate_f32 = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
-    prefill_dn_out_f32    = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
-    prefill_ffn_gate_f32  = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
-    prefill_ffn_up_f32    = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
-    prefill_ffn_out_f32   = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
+        size_t qkv_dim_total = cfg.ssm_inner_size * 3;
+        prefill_proj_qkv_f32  = static_cast<float*>(a(max_tokens * qkv_dim_total * sizeof(float)));
+        prefill_proj_gate_f32 = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
+        prefill_dn_out_f32    = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
+        prefill_ffn_gate_f32  = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
+        prefill_ffn_up_f32    = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
+        prefill_ffn_out_f32   = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
+    }
 
     // Dequantized weight scratch — large enough for biggest weight matrix
     // Biggest: QKV (6144 × 1024) or Q+gate (4096 × 1024) or FFN gate/up (3584 × 1024)
@@ -1843,6 +1846,8 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     prefill_temp_w = static_cast<half*>(a(max_weight_elems * sizeof(half)));
 
     // Batch FFN buffers: [max_tokens, n_ff]
+    // Cannot alias ffn_up/ffn_out with proj_qkv: full attention layers use ffn_up for V
+    // projection and ffn_out for deinterleaved gate while proj_qkv still holds Q+gate.
     prefill_ffn_gate = static_cast<half*>(a(max_tokens * cfg.n_ff * sizeof(half)));
     prefill_ffn_up   = static_cast<half*>(a(max_tokens * cfg.n_ff * sizeof(half)));
     prefill_ffn_out  = static_cast<half*>(a(max_tokens * cfg.n_ff * sizeof(half)));
@@ -1863,9 +1868,9 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
 // ============================================================
 
 void InferenceState::allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
-                                             int max_total_tokens, int max_seqs) {
-    // Allocate prefill buffers for max_total_tokens (= max_seqs * max_seq_len)
-    allocate_prefill(cfg, alloc, max_total_tokens);
+                                             int max_total_tokens, int max_seqs, bool f32_path) {
+    // Allocate prefill buffers for max_total_tokens
+    allocate_prefill(cfg, alloc, max_total_tokens, f32_path);
     max_batch_seqs = max_seqs;
 
     auto a = [&](size_t bytes) -> void* { return alloc.alloc(bytes); };
@@ -2113,6 +2118,7 @@ __global__ void kernel_f32_to_half(const float* __restrict__ in, half* __restric
 // ============================================================
 
 void InferenceState::extract_hidden(Model& model, const std::vector<int>& tokens, void* output_host) {
+    GWEN_CHECK(prefill_x_f32 != nullptr, "extract_hidden requires F32 prefill buffers (not available in batch-only mode)");
     reset_state();
     forward_prefill(model, tokens);
     // After forward_prefill, prefill_x_f32 holds [N, n_embed] hidden states (F32)
@@ -3744,6 +3750,49 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
     GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
     size_t bytes = (size_t)N * cfg.n_embed * sizeof(half);
     GWEN_CHECK_CUDA(cudaMemcpy(output_host, pf_a, bytes, cudaMemcpyDeviceToHost));
+}
+
+// ============================================================
+// Batch predictions from hidden states
+// ============================================================
+
+void InferenceState::predict_from_hidden(Model& model, half* hidden_gpu, int N, int32_t* preds_host) {
+    const auto& cfg = model.config;
+    cudaStream_t s = 0;
+
+    // 1. Batch RMSNorm: hidden → prefill_norm [N, n_embed]
+    kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
+        hidden_gpu, static_cast<const float*>(model.output_norm.device_data),
+        prefill_norm, N, cfg.n_embed, cfg.rms_norm_eps);
+
+    // 2. Per-token: Q8_1 quantize + GEMV + argmax
+    // Reuses single-token scratch buffers (x_q8_a, logits_h, logits_f, argmax_*)
+    for (int t = 0; t < N; t++) {
+        half* norm_t = prefill_norm + (size_t)t * cfg.n_embed;
+
+        // Quantize normed hidden to Q8_1
+        gwen_quantize_q8_1(norm_t, x_q8_a, cfg.n_embed, s);
+
+        // GEMV: embed_tokens × normed → logits [n_vocab]
+        gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
+                       cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
+
+        // FP16 → FP32 for argmax
+        int logit_blocks = (cfg.n_vocab + 255) / 256;
+        kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
+
+        // Argmax
+        kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(
+            logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
+        kernel_argmax_reduce<<<1, 256, 0, s>>>(
+            argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
+
+        // Copy single prediction to host
+        GWEN_CHECK_CUDA(cudaMemcpyAsync(&preds_host[t], d_argmax_token,
+                                          sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+    }
+
+    GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
 }
 
 // ============================================================
