@@ -350,6 +350,8 @@ class MTPHead(nn.Module):
             print(f"Loaded {loaded}/15 pre-trained MTP tensors (lm_head initialized randomly)")
 
         model.load_state_dict(state_dict, strict=False)
+        # Convert to FP16 to match CUDA inference precision (GWMT export does BF16→FP16)
+        model = model.half()
         return model.to(device)
 
     def param_count(self) -> dict[str, int]:

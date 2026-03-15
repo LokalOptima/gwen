@@ -98,6 +98,7 @@ static void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     std::string model_path;
     std::string mtp_path;
+    std::string mtp_lm_head_path;
     std::string host = "127.0.0.1";
     int port = 8090;
     int max_seq = 512;
@@ -106,6 +107,7 @@ int main(int argc, char** argv) {
     static struct option long_options[] = {
         {"model",     required_argument, nullptr, 'm'},
         {"mtp",       required_argument, nullptr, 'M'},
+        {"mtp-lm-head", required_argument, nullptr, 'L'},
         {"host",      required_argument, nullptr, 'H'},
         {"port",      required_argument, nullptr, 'p'},
         {"max-seq",   required_argument, nullptr, 's'},
@@ -115,10 +117,11 @@ int main(int argc, char** argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:H:p:s:b:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:L:H:p:s:b:h", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
+            case 'L': mtp_lm_head_path = optarg; break;
             case 'H': host = optarg; break;
             case 'p': port = atoi(optarg); break;
             case 's': max_seq = atoi(optarg); break;
@@ -146,6 +149,9 @@ int main(int argc, char** argv) {
     // Load MTP weights if provided (must be before upload_weights)
     if (!mtp_path.empty()) {
         model->load_mtp(mtp_path);
+    }
+    if (!mtp_lm_head_path.empty()) {
+        model->load_reduced_lm_head(mtp_lm_head_path);
     }
 
     // Upload weights to GPU
@@ -394,9 +400,10 @@ int main(int argc, char** argv) {
         fflush(stdout);
     });
 
-    // /test_mtp: Run CUDA MTP on batch-extracted hidden states, return per-position predictions.
-    // For verifying PyTorch MTP matches CUDA MTP.
-    // Binary input: [uint32 L][int32 tokens[L]]
+    // /test_mtp: Run CUDA MTP on pre-extracted hidden states.
+    // Binary input: [uint32 L][int32 tokens[L]][half hidden[L * n_embed]]
+    //   tokens: the original token sequence (needed for embed lookup of t+1)
+    //   hidden: pre-extracted hidden states (from /batch_extract, same call used by PyTorch)
     // Binary output: [uint32 n_preds][int32 preds[n_preds]]
     if (model->has_mtp) {
         svr.Post("/test_mtp", [&](const httplib::Request& req, httplib::Response& res) {
@@ -408,54 +415,66 @@ int main(int argc, char** argv) {
 
             uint32_t L;
             memcpy(&L, req.body.data(), 4);
-            if (req.body.size() < 4 + L * sizeof(int32_t) || L < 3) {
+            int n_embed = model->config.n_embed;
+            size_t expected = 4 + L * sizeof(int32_t) + L * n_embed * sizeof(uint16_t);
+            if (req.body.size() < expected || L < 3) {
                 res.status = 400;
-                res.set_content("{\"error\":\"need at least 3 tokens\"}", "application/json");
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "{\"error\":\"need [L][tokens[L]][hidden[L*%d]], got %zu bytes, expected %zu\"}",
+                    n_embed, req.body.size(), expected);
+                res.set_content(buf, "application/json");
                 return;
             }
 
             const int32_t* token_data = (const int32_t*)(req.body.data() + 4);
-            int n_embed = model->config.n_embed;
-            int n_preds = L - 2;  // MTP predicts positions 2..L-1
+            const uint16_t* hidden_data = (const uint16_t*)(req.body.data() + 4 + L * sizeof(int32_t));
+            int n_preds = L - 2;
 
             std::lock_guard<std::mutex> lock(gpu_mtx);
 
-            // 1. Batch extract hidden states (B=1, L tokens)
-            std::vector<uint16_t> hidden_host(L * n_embed);
-            state.extract_hidden_batch(*model, token_data, 1, L, hidden_host.data());
-
-            // 2. Run CUDA MTP sequentially: for each position t, set mtp_hidden = hidden[t],
-            //    call forward_mtp(token[t+1]) to get MTP prediction for position t+2.
-            //    This matches how MTP runs during speculative decode.
-            std::vector<int32_t> preds(n_preds);
-
-            // Reset MTP KV cache
+            // Reset MTP state
             state.mtp_pos = 0;
             auto& cache = state.mtp_kv_cache;
-            // Zero KV cache (mtp_pos=0 means fresh start)
+            size_t kv_bytes = (size_t)cache.max_seq * cache.n_kv_heads * cache.head_dim * sizeof(uint16_t);
+            GWEN_CHECK_CUDA(cudaMemset(cache.k_cache, 0, kv_bytes));
+            GWEN_CHECK_CUDA(cudaMemset(cache.v_cache, 0, kv_bytes));
+            if (state.mtp_graph_captured) {
+                cudaGraphExecDestroy(state.mtp_graph_exec);
+                state.mtp_graph_captured = false;
+            }
 
             cudaStream_t s = state.compute_stream ? state.compute_stream : 0;
+            std::vector<int32_t> preds(n_preds);
 
             for (int t = 0; t < n_preds; t++) {
-                // Copy hidden[t] to mtp_hidden on GPU
+                // Copy hidden[t] from the caller's pre-extracted data
                 GWEN_CHECK_CUDA(cudaMemcpy(
                     state.mtp_hidden,
-                    hidden_host.data() + (size_t)t * n_embed,
+                    hidden_data + (size_t)t * n_embed,
                     n_embed * sizeof(uint16_t),
                     cudaMemcpyHostToDevice));
 
-                // Run MTP forward with token[t+1]
-                int pred = state.forward_mtp(*model, token_data[t + 1]);
+                int mtp_params[2] = {token_data[t + 1], state.mtp_pos};
+                GWEN_CHECK_CUDA(cudaMemcpy(state.d_mtp_token, mtp_params,
+                                            2 * sizeof(int), cudaMemcpyHostToDevice));
+
+                state.forward_mtp_body(*model, s);
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+
+                int pred;
+                GWEN_CHECK_CUDA(cudaMemcpy(&pred, state.d_argmax_token,
+                                            sizeof(int), cudaMemcpyDeviceToHost));
+                state.mtp_pos++;
                 preds[t] = pred;
             }
 
-            // Build response
             std::string body(4 + n_preds * 4, '\0');
             uint32_t np = n_preds;
             memcpy(&body[0], &np, 4);
             memcpy(&body[4], preds.data(), n_preds * 4);
 
-            printf("[test_mtp] L=%u, %d MTP predictions\n", L, n_preds);
+            printf("[test_mtp] L=%u, %d preds\n", L, n_preds);
             fflush(stdout);
 
             res.set_content(body, "application/octet-stream");

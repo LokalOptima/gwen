@@ -120,7 +120,15 @@ def load_embeddings(model_dir: Path, device: str) -> torch.Tensor:
 
     # Keep on CPU — F.embedding is just indexing, fast on CPU.
     # Saves ~500 MB GPU memory vs loading to device.
-    embed_weight = embed_weight.to(dtype=torch.bfloat16)
+    # Use Q6_K-dequantized embeddings from GGUF (matches CUDA runtime exactly).
+    # Falls back to safetensors if Q6K file not available.
+    q6k_path = Path("data/embed_tokens_q6k.npy")
+    if q6k_path.exists():
+        log(f"Loading Q6K-dequantized embeddings from {q6k_path} (matches CUDA runtime)")
+        embed_weight = torch.from_numpy(np.load(str(q6k_path))).to(dtype=torch.float16)
+    else:
+        log(f"WARNING: {q6k_path} not found, using safetensors embeddings (won't match CUDA)")
+        embed_weight = embed_weight.to(dtype=torch.float16)
     log(f"  Embedding matrix: {list(embed_weight.shape)}, {embed_weight.dtype} (CPU)")
     return embed_weight
 
@@ -409,8 +417,9 @@ def train(args: argparse.Namespace) -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # AMP — BF16 has same exponent range as FP32, no GradScaler needed
+    # AMP — FP16 needs GradScaler to prevent underflow in gradients
     use_amp = device == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Loss
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
@@ -465,7 +474,7 @@ def train(args: argparse.Namespace) -> None:
             "weight_decay": args.weight_decay,
             "warmup_steps": warmup_steps,
             "grad_clip": args.grad_clip,
-            "amp_dtype": "bfloat16",
+            "amp_dtype": "float16",
             "from_pretrained": args.from_pretrained,
             "val_fraction": args.val_fraction,
         },
@@ -563,10 +572,10 @@ def train(args: argparse.Namespace) -> None:
             for ci in range(0, B, max_chunk):
                 ce = min(ci + max_chunk, B)
                 e_chunk = embed_input[ci:ce].to(device, non_blocking=True)
-                h_chunk = hidden_input[ci:ce].to(device, dtype=torch.bfloat16, non_blocking=True)
+                h_chunk = hidden_input[ci:ce].to(device, dtype=torch.float16, non_blocking=True)
                 t_chunk = mtp_targets[ci:ce]
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                     logits = mtp(e_chunk, h_chunk)  # [chunk, L-2, K]
                     loss = loss_fn(logits.reshape(-1, args.top_k), t_chunk.reshape(-1))
                     loss = loss / n_chunks  # scale for gradient accumulation
@@ -576,15 +585,17 @@ def train(args: argparse.Namespace) -> None:
                     skip = True
                     break
 
-                loss.backward()
+                scaler.scale(loss).backward()
                 batch_loss += loss.item()  # already divided by n_chunks
 
             if skip:
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(mtp.parameters(), args.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             total_loss += batch_loss
@@ -628,10 +639,10 @@ def train(args: argparse.Namespace) -> None:
                             for ci in range(0, vB, max_chunk_v):
                                 ce = min(ci + max_chunk_v, vB)
                                 ec = ve[ci:ce].to(device, non_blocking=True)
-                                hc = vh[ci:ce].to(device, dtype=torch.bfloat16, non_blocking=True)
+                                hc = vh[ci:ce].to(device, dtype=torch.float16, non_blocking=True)
                                 tc = vtgt[ci:ce]
 
-                                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                                with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                                     vlogits = mtp(ec, hc)
                                     vloss = loss_fn(vlogits.reshape(-1, args.top_k), tc.reshape(-1))
                                 val_loss += vloss.item()
@@ -661,8 +672,8 @@ def train(args: argparse.Namespace) -> None:
                             ).long().to(device, non_blocking=True)
 
                             ec = ve.to(device)
-                            hc = vh.to(device, dtype=torch.bfloat16)
-                            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                            hc = vh.to(device, dtype=torch.float16)
+                            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                                 vlogits = mtp(ec, hc)
                                 vloss = loss_fn(vlogits.reshape(-1, args.top_k), vtgt.reshape(-1))
                             val_loss += vloss.item()

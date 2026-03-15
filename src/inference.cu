@@ -4056,8 +4056,17 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
         // Reduced LM head: only score top-K tokens (massive bandwidth reduction)
         const auto& rl = model.reduced_lm_head;
         int K = rl.K;
-        gwen_gemv_dp4a(rl.weights.device_data, x_q8_a, logits_h,
-                  K, cfg.n_embed, rl.type, s);
+        if (rl.type == GGMLType::F16) {
+            // FP16 reduced lm_head: use RMSNorm output directly (not Q8_1)
+            half* norm_out = x_norm;
+            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(mtp_w.output_norm.device_data),
+                              norm_out, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_gemv_fp16(static_cast<const half*>(rl.weights.device_data),
+                           norm_out, logits_h, K, cfg.n_embed, s);
+        } else {
+            gwen_gemv_dp4a(rl.weights.device_data, x_q8_a, logits_h,
+                      K, cfg.n_embed, rl.type, s);
+        }
 
         int logit_blocks = (K + 255) / 256;
         kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, K);
