@@ -322,19 +322,159 @@ kernel_gated_rmsnorm_quantize_q8_1_batch2(
 }
 
 // ============================================================
-// Fused DeltaNet state update: L2-norm(Q,K) + gate/beta + S update
+// DeltaNet state update — split into prep + decode for occupancy
 // ============================================================
-// Replaces 4 separate kernels (2× l2_normalize, compute_gate_beta, deltanet_decode)
-// with a single launch: 16 blocks × 128 threads (one block per head).
-//
-// Phase 1: L2-normalize Q and K (128 threads, 1 element each for dk=128)
-// Phase 2: Compute gate and beta (128 threads over 1024 x_norm elements)
-// Phase 3: DeltaNet S matrix update + output (128 threads, 1 column each)
+
+// Prep kernel: L2-normalize Q,K + compute gate/beta → write to global
+// 16 blocks × 128 threads (one per head). Fast (<1 μs).
+__global__ void __launch_bounds__(128)
+kernel_deltanet_prep(
+    half* __restrict__ q_in,
+    half* __restrict__ k_in,
+    const half* __restrict__ x_norm,
+    const void* __restrict__ alpha_w,
+    const void* __restrict__ beta_w,
+    const float* __restrict__ ssm_a,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ decay_out,
+    float* __restrict__ beta_out,
+    float q_scale,
+    int n_heads, int dk, int n_embed)
+{
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+
+    half* q = q_in + head * dk;
+    half* k = k_in + head * dk;
+
+    float q_val = __half2float(q[tid]);
+    float k_val = __half2float(k[tid]);
+
+    // Q L2 norm
+    float q_sq = q_val * q_val;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, o);
+    __shared__ float warp_buf[4];
+    if (lane == 0) warp_buf[warp_id] = q_sq;
+    __syncthreads();
+    __shared__ float s_q_inv, s_k_inv;
+    if (tid == 0) {
+        float total = warp_buf[0] + warp_buf[1] + warp_buf[2] + warp_buf[3];
+        s_q_inv = rsqrtf(fmaxf(total, 1e-12f)) * q_scale;
+    }
+    __syncthreads();
+
+    // K L2 norm
+    float k_sq = k_val * k_val;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, o);
+    if (lane == 0) warp_buf[warp_id] = k_sq;
+    __syncthreads();
+    if (tid == 0) {
+        float total = warp_buf[0] + warp_buf[1] + warp_buf[2] + warp_buf[3];
+        s_k_inv = rsqrtf(fmaxf(total, 1e-12f));
+    }
+    __syncthreads();
+
+    q[tid] = __float2half(q_val * s_q_inv);
+    k[tid] = __float2half(k_val * s_k_inv);
+
+    // Gate and beta dot products
+    const block_q8_0* ab = static_cast<const block_q8_0*>(alpha_w);
+    const block_q8_0* bb = static_cast<const block_q8_0*>(beta_w);
+    int bph = n_embed / 32;
+    float aa = 0.0f, ba = 0.0f;
+    for (int i = tid; i < n_embed; i += 128) {
+        int blk = i / 32, elem = i % 32, idx = head * bph + blk;
+        float x_val = __half2float(x_norm[i]);
+        aa += (__half2float(ab[idx].d) * (float)ab[idx].qs[elem]) * x_val;
+        ba += (__half2float(bb[idx].d) * (float)bb[idx].qs[elem]) * x_val;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        aa += __shfl_xor_sync(0xFFFFFFFF, aa, o);
+        ba += __shfl_xor_sync(0xFFFFFFFF, ba, o);
+    }
+    __shared__ float sh_a[4], sh_b[4];
+    if (lane == 0) { sh_a[warp_id] = aa; sh_b[warp_id] = ba; }
+    __syncthreads();
+    if (tid == 0) {
+        float ta = sh_a[0]+sh_a[1]+sh_a[2]+sh_a[3];
+        float tb = sh_b[0]+sh_b[1]+sh_b[2]+sh_b[3];
+        float biased = ta + dt_bias[head];
+        float sp = (biased > 20.0f) ? biased : logf(1.0f + expf(biased));
+        decay_out[head] = expf(ssm_a[head] * sp);
+        beta_out[head] = 1.0f / (1.0f + expf(-tb));
+    }
+}
+
+// Decode kernel: S matrix update, 32 blocks × 64 threads for 2× occupancy.
+// blockIdx.x = head * 2 + col_group. Each block handles 64 columns.
+__global__ void __launch_bounds__(64, 8)
+kernel_deltanet_decode_v2(
+    float* __restrict__ S,
+    const half* __restrict__ q_in,
+    const half* __restrict__ k_in,
+    const half* __restrict__ v_in,
+    const float* __restrict__ decay_in,
+    const float* __restrict__ beta_in,
+    half* __restrict__ output,
+    int n_heads, int dk)
+{
+    int head = blockIdx.x / 2;
+    int col_group = blockIdx.x % 2;
+    if (head >= n_heads) return;
+    int tid = threadIdx.x;  // 0..63
+    int col = col_group * 64 + tid;
+
+    float decay = decay_in[head];
+    float b = beta_in[head];
+    float* S_head = S + head * dk * dk;
+
+    // Load all 128 q,k values into shared memory
+    __shared__ float sh_k[128], sh_q[128];
+    sh_k[col] = __half2float(k_in[head * dk + col]);
+    sh_q[col] = __half2float(q_in[head * dk + col]);
+    int other = (1 - col_group) * 64 + tid;
+    sh_k[other] = __half2float(k_in[head * dk + other]);
+    sh_q[other] = __half2float(q_in[head * dk + other]);
+    __syncthreads();
+
+    // Pass 1: Decay S and compute sk[col]
+    float sk_j = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; i++) {
+        float val = S_head[i * 128 + col] * decay;
+        S_head[i * 128 + col] = val;
+        sk_j += val * sh_k[i];
+    }
+
+    // Pass 2: Update S and compute output[col]
+    float d_j = (__half2float(v_in[head * dk + col]) - sk_j) * b;
+    float o_j = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; i++) {
+        float updated = S_head[i * 128 + col] + sh_k[i] * d_j;
+        S_head[i * 128 + col] = updated;
+        o_j += updated * sh_q[i];
+    }
+
+    output[head * dk + col] = __float2half(o_j);
+}
+
+// Fused kernel with S matrix in shared memory.
+// Loads 64 KB S into shared, operates at ~4 cycle latency instead of ~200 (L2).
+// 16 blocks × 128 threads, 66 KB shared memory per block.
 __global__ void __launch_bounds__(128)
 kernel_deltanet_fused(
     float* __restrict__ S,              // [n_heads, dk, dk] recurrent state
-    half* __restrict__ q_in,            // [n_heads * dk] Q from conv1d (modified in-place)
-    half* __restrict__ k_in,            // [n_heads * dk] K from conv1d (modified in-place)
+    half* __restrict__ q_in,            // [n_heads * dk] Q from conv1d
+    half* __restrict__ k_in,            // [n_heads * dk] K from conv1d
     const half* __restrict__ v_in,      // [n_heads * dk] V from conv1d
     const half* __restrict__ x_norm,    // [n_embed] pre-attention norm (for gate/beta)
     const void* __restrict__ alpha_w,   // Q8_0 [n_heads * n_embed/32 blocks]
@@ -350,37 +490,43 @@ kernel_deltanet_fused(
     int tid = threadIdx.x;  // 0..127
     int warp_id = tid / 32;
     int lane = tid % 32;
-
     half* q = q_in + head * dk;
     half* k = k_in + head * dk;
+
+    // Dynamic shared memory: S matrix [128][128] = 64 KB
+    extern __shared__ float sh_S[];
+    // Static shared for small buffers
+    __shared__ float sh_q[128], sh_k[128];
+    __shared__ float warp_buf[4];
+    __shared__ float s_q_inv, s_k_inv, s_decay, s_beta;
+
+    // ---- Load S from global → shared memory ----
+    float* S_head = S + head * dk * dk;
+    for (int i = 0; i < 128 * 128; i += 128) {
+        sh_S[i + tid] = S_head[i + tid];
+    }
 
     // ---- Phase 1: L2-normalize Q and K ----
     float q_val = __half2float(q[tid]);
     float k_val = __half2float(k[tid]);
 
-    // Q: sum-of-squares reduction (128 threads → 4 warps)
     float q_sq = q_val * q_val;
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
         q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, o);
-
-    __shared__ float warp_buf[4];
     if (lane == 0) warp_buf[warp_id] = q_sq;
     __syncthreads();
 
-    __shared__ float s_q_inv, s_k_inv;
     if (tid == 0) {
         float total = warp_buf[0] + warp_buf[1] + warp_buf[2] + warp_buf[3];
         s_q_inv = rsqrtf(fmaxf(total, 1e-12f)) * q_scale;
     }
     __syncthreads();
 
-    // K: sum-of-squares reduction
     float k_sq = k_val * k_val;
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
         k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, o);
-
     if (lane == 0) warp_buf[warp_id] = k_sq;
     __syncthreads();
 
@@ -390,23 +536,17 @@ kernel_deltanet_fused(
     }
     __syncthreads();
 
-    // Normalize and store to shared memory for Phase 3
-    __shared__ float sh_q[128], sh_k[128];
     sh_q[tid] = q_val * s_q_inv;
     sh_k[tid] = k_val * s_k_inv;
 
     // ---- Phase 2: Compute gate and beta ----
-    // Dot product x_norm[1024] with Q8_0 alpha/beta weights
-    // 128 threads each handle 8 elements (1024/128)
     const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
     const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
     int blocks_per_head = n_embed / 32;
 
-    float alpha_acc = 0.0f;
-    float beta_acc = 0.0f;
+    float alpha_acc = 0.0f, beta_acc = 0.0f;
     for (int i = tid; i < n_embed; i += 128) {
-        int blk = i / 32;
-        int elem = i % 32;
+        int blk = i / 32, elem = i % 32;
         int blk_idx = head * blocks_per_head + blk;
         float ad = __half2float(alpha_blocks[blk_idx].d);
         float bd = __half2float(beta_blocks[blk_idx].d);
@@ -415,25 +555,19 @@ kernel_deltanet_fused(
         beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
     }
 
-    // 128-thread reduction
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         alpha_acc += __shfl_xor_sync(0xFFFFFFFF, alpha_acc, o);
         beta_acc += __shfl_xor_sync(0xFFFFFFFF, beta_acc, o);
     }
 
-    __shared__ float sh_alpha[4], sh_beta[4];
-    if (lane == 0) {
-        sh_alpha[warp_id] = alpha_acc;
-        sh_beta[warp_id] = beta_acc;
-    }
+    __shared__ float sh_alpha[4], sh_beta_arr[4];
+    if (lane == 0) { sh_alpha[warp_id] = alpha_acc; sh_beta_arr[warp_id] = beta_acc; }
     __syncthreads();
 
-    __shared__ float s_decay, s_beta;
     if (tid == 0) {
         float total_alpha = sh_alpha[0] + sh_alpha[1] + sh_alpha[2] + sh_alpha[3];
-        float total_beta = sh_beta[0] + sh_beta[1] + sh_beta[2] + sh_beta[3];
-
+        float total_beta = sh_beta_arr[0] + sh_beta_arr[1] + sh_beta_arr[2] + sh_beta_arr[3];
         float alpha_biased = total_alpha + dt_bias[head];
         float sp = (alpha_biased > 20.0f) ? alpha_biased : logf(1.0f + expf(alpha_biased));
         s_decay = expf(ssm_a[head] * sp);
@@ -441,31 +575,36 @@ kernel_deltanet_fused(
     }
     __syncthreads();
 
-    // ---- Phase 3: DeltaNet S update ----
+    // ---- Phase 3: S update in shared memory (~4 cycle access vs ~200 from L2) ----
     float decay = s_decay;
     float b = s_beta;
-    float* S_head = S + head * dk * dk;
 
-    // Pass 1: Decay S and compute sk[j] = sum_i (decay * S[i][j]) * k[i]
+    // Pass 1: Decay S and compute sk[j]
     float sk_j = 0.0f;
     #pragma unroll 8
     for (int i = 0; i < 128; i++) {
-        float val = S_head[i * 128 + tid] * decay;
-        S_head[i * 128 + tid] = val;
+        float val = sh_S[i * 128 + tid] * decay;
+        sh_S[i * 128 + tid] = val;
         sk_j += val * sh_k[i];
     }
 
-    // Pass 2: Update S and compute o[j] = sum_i S_updated[i][j] * q[i]
+    // Pass 2: Update S and compute output
     float d_j = (__half2float(v_in[head * dk + tid]) - sk_j) * b;
     float o_j = 0.0f;
     #pragma unroll 8
     for (int i = 0; i < 128; i++) {
-        float updated = S_head[i * 128 + tid] + sh_k[i] * d_j;
-        S_head[i * 128 + tid] = updated;
+        float updated = sh_S[i * 128 + tid] + sh_k[i] * d_j;
+        sh_S[i * 128 + tid] = updated;
         o_j += updated * sh_q[i];
     }
 
     output[head * dk + tid] = __float2half(o_j);
+
+    // ---- Write S back to global ----
+    __syncthreads();
+    for (int i = 0; i < 128 * 128; i += 128) {
+        S_head[i + tid] = sh_S[i + tid];
+    }
 }
 
 // ============================================================
@@ -2030,6 +2169,11 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     }
 
     pos = 0;
+
+    // Allow 64 KB dynamic shared memory for kernel_deltanet_fused (S matrix in shared)
+    GWEN_CHECK_CUDA(cudaFuncSetAttribute(
+        (const void*)kernel_deltanet_fused,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
 }
 
 void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
@@ -2400,7 +2544,7 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             half* v = qkv + 2 * cfg.ssm_inner_size;
 
             // Fused: L2-norm(Q,K) + gate/beta + S update
-            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 0, s>>>(
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
                 state.S, q, k, v, x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
@@ -2585,7 +2729,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             half *qa = qkv, *ka = qkv + cfg.ssm_inner_size, *va = qkv + 2 * cfg.ssm_inner_size;
 
             // --- Fused: L2-norm(Q,K) + gate/beta + S update for token A ---
-            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 0, s>>>(
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
                 state.S, qa, ka, va, x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
@@ -2620,7 +2764,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             half *qb = b2_qkv, *kb = b2_qkv + cfg.ssm_inner_size, *vb = b2_qkv + 2 * cfg.ssm_inner_size;
 
             // --- Fused: L2-norm(Q,K) + gate/beta + S update for token B ---
-            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 0, s>>>(
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
                 state.S, qb, kb, vb, b2_x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
