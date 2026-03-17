@@ -103,6 +103,9 @@ struct InferenceState {
 
     // CUDA Graph state
     cudaStream_t compute_stream = nullptr;
+    cudaStream_t overlap_stream = nullptr;   // secondary stream for DeltaNet pipelining
+    cudaEvent_t ev_conv_done = nullptr;      // signals conv1d A + conv_snap finished
+    cudaEvent_t ev_overlap_done = nullptr;   // signals conv1d B finished on overlap_stream
     cudaGraphExec_t graph_exec = nullptr;
     bool graph_captured = false;
     cudaGraphExec_t graph_2tok_exec = nullptr;

@@ -2132,8 +2132,11 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     d_pos = d_token_id + 1;
     max_seq_alloc = max_seq;
 
-    // Create non-blocking stream for graph capture
+    // Create non-blocking streams for graph capture + overlap
     GWEN_CHECK_CUDA(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
+    GWEN_CHECK_CUDA(cudaStreamCreateWithFlags(&overlap_stream, cudaStreamNonBlocking));
+    GWEN_CHECK_CUDA(cudaEventCreate(&ev_conv_done));
+    GWEN_CHECK_CUDA(cudaEventCreate(&ev_overlap_done));
 
     // DeltaNet states (18 layers)
     for (uint32_t i = 0; i < cfg.n_layers; i++) {
@@ -2728,33 +2731,13 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             int qkv_dim = cfg.ssm_inner_size * 3;
             int conv_blocks = (qkv_dim + 255) / 256;
 
-            // --- Sequential: Conv1D + state ops for token A ---
+            // --- Conv1D for token A ---
             kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
                 qkv, qkv, state.conv_state,
                 static_cast<const float*>(w.ssm_conv1d.device_data),
                 qkv_dim, cfg.ssm_conv_kernel);
 
-            half *qa = qkv, *ka = qkv + cfg.ssm_inner_size, *va = qkv + 2 * cfg.ssm_inner_size;
-
-            // --- Fused: L2-norm(Q,K) + gate/beta + S update for token A ---
-            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
-                state.S, qa, ka, va, x_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                static_cast<const float*>(w.ssm_a.device_data),
-                static_cast<const float*>(w.ssm_dt_bias.device_data),
-                attn_out, q_scale,
-                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
-
-            // --- Save S snapshot after token A, before token B ---
-            // 1 MB D2D per layer (baked into CUDA graph, ~1 μs each)
-            if (dn_idx < (int)dn_S_snapshot.size()) {
-                size_t S_bytes = (size_t)cfg.ssm_n_heads * cfg.ssm_state_size * cfg.ssm_state_size * sizeof(float);
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                    dn_S_snapshot[dn_idx], state.S, S_bytes,
-                    cudaMemcpyDeviceToDevice, s));
-            }
-
-            // --- Save conv_state[0] before token B's conv1d shifts it out ---
+            // --- Save conv_state[0] right after conv1d A (before B shifts it) ---
             if (dn_replay_conv_row) {
                 GWEN_CHECK_CUDA(cudaMemcpyAsync(
                     dn_replay_conv_row + dn_idx * qkv_dim,
@@ -2763,15 +2746,39 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                     cudaMemcpyDeviceToDevice, s));
             }
 
-            // --- Sequential: Conv1D + state ops for token B (uses updated state) ---
-            kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
+            // --- Fork: conv1d B on overlap_stream (overlaps with deltanet A) ---
+            GWEN_CHECK_CUDA(cudaEventRecord(ev_conv_done, s));
+            GWEN_CHECK_CUDA(cudaStreamWaitEvent(overlap_stream, ev_conv_done));
+            kernel_conv1d_silu<<<conv_blocks, 256, 0, overlap_stream>>>(
                 b2_qkv, b2_qkv, state.conv_state,
                 static_cast<const float*>(w.ssm_conv1d.device_data),
                 qkv_dim, cfg.ssm_conv_kernel);
+            GWEN_CHECK_CUDA(cudaEventRecord(ev_overlap_done, overlap_stream));
+
+            // --- Deltanet A on main stream (runs in parallel with conv1d B) ---
+            half *qa = qkv, *ka = qkv + cfg.ssm_inner_size, *va = qkv + 2 * cfg.ssm_inner_size;
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
+                state.S, qa, ka, va, x_norm,
+                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                static_cast<const float*>(w.ssm_a.device_data),
+                static_cast<const float*>(w.ssm_dt_bias.device_data),
+                attn_out, q_scale,
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
+
+            // --- Save S snapshot after deltanet A ---
+            if (dn_idx < (int)dn_S_snapshot.size()) {
+                size_t S_bytes = (size_t)cfg.ssm_n_heads * cfg.ssm_state_size * cfg.ssm_state_size * sizeof(float);
+                GWEN_CHECK_CUDA(cudaMemcpyAsync(
+                    dn_S_snapshot[dn_idx], state.S, S_bytes,
+                    cudaMemcpyDeviceToDevice, s));
+            }
+
+            // --- Join: wait for conv1d B to finish before deltanet B ---
+            GWEN_CHECK_CUDA(cudaStreamWaitEvent(s, ev_overlap_done));
 
             half *qb = b2_qkv, *kb = b2_qkv + cfg.ssm_inner_size, *vb = b2_qkv + 2 * cfg.ssm_inner_size;
 
-            // --- Fused: L2-norm(Q,K) + gate/beta + S update for token B ---
+            // --- Deltanet B (needs both deltanet A and conv1d B done) ---
             kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
                 state.S, qb, kb, vb, b2_x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
