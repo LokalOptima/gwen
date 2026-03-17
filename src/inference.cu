@@ -616,6 +616,259 @@ kernel_deltanet_fused(
 }
 
 // ============================================================
+// Fused 2-token DeltaNet decode kernel
+// ============================================================
+// Processes token A then token B in a single kernel launch.
+// S stays in shared memory across both tokens — no global round-trip.
+// S snapshot is written from shared → global between A and B, overlapped
+// with B's Phase 1-2 (L2-norm + gate/beta which don't touch S).
+//
+// Saves per DeltaNet layer vs 2 separate kernel_deltanet_fused calls:
+//   - 1 kernel launch eliminated (~5 μs)
+//   - S reload from global eliminated (64 KB L2 read)
+//   - S snapshot overlapped with B's Phase 1-2
+
+__global__ void __launch_bounds__(128)
+kernel_deltanet_fused_2tok(
+    float* __restrict__ S,              // [n_heads, dk, dk] recurrent state
+    // Token A inputs
+    half* __restrict__ q_in_a,          // [n_heads * dk]
+    half* __restrict__ k_in_a,          // [n_heads * dk]
+    const half* __restrict__ v_in_a,    // [n_heads * dk]
+    const half* __restrict__ x_norm_a,  // [n_embed]
+    // Token B inputs
+    half* __restrict__ q_in_b,          // [n_heads * dk]
+    half* __restrict__ k_in_b,          // [n_heads * dk]
+    const half* __restrict__ v_in_b,    // [n_heads * dk]
+    const half* __restrict__ x_norm_b,  // [n_embed]
+    // Shared weights
+    const void* __restrict__ alpha_w,   // Q8_0 [n_heads * n_embed/32 blocks]
+    const void* __restrict__ beta_w,    // Q8_0 [n_heads * n_embed/32 blocks]
+    const float* __restrict__ ssm_a,    // [n_heads]
+    const float* __restrict__ dt_bias,  // [n_heads]
+    // Outputs
+    half* __restrict__ output_a,        // [n_heads * dk]
+    half* __restrict__ output_b,        // [n_heads * dk]
+    // S snapshot buffer (written between A and B)
+    float* __restrict__ S_snapshot,     // [n_heads * dk * dk] or nullptr
+    float q_scale,
+    int n_heads, int dk, int n_embed)
+{
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+
+    // Dynamic shared memory: S matrix [128][128] = 64 KB
+    extern __shared__ float sh_S[];
+    __shared__ float sh_q[128], sh_k[128];
+    __shared__ float warp_buf[4];
+    __shared__ float s_q_inv, s_k_inv, s_decay, s_beta;
+
+    float* S_head = S + head * dk * dk;
+    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
+    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
+    int blocks_per_head = n_embed / 32;
+
+    // ================================================================
+    // TOKEN A
+    // ================================================================
+
+    // Async load S from global → shared (overlapped with A's Phase 1-2)
+    #pragma unroll 4
+    for (int i = 0; i < 128 * 128; i += 128) {
+        uint32_t smem_addr_val = __cvta_generic_to_shared(&sh_S[i + tid]);
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                     :: "r"(smem_addr_val), "l"(&S_head[i + tid]));
+    }
+    asm volatile("cp.async.commit_group;\n");
+
+    // Phase 1: L2-normalize Q_a and K_a
+    {
+        half* q = q_in_a + head * dk;
+        half* k = k_in_a + head * dk;
+        float q_val = __half2float(q[tid]);
+        float k_val = __half2float(k[tid]);
+
+        float q_sq = q_val * q_val;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, o);
+        if (lane == 0) warp_buf[warp_id] = q_sq;
+        __syncthreads();
+        if (tid == 0) s_q_inv = rsqrtf(fmaxf(warp_buf[0]+warp_buf[1]+warp_buf[2]+warp_buf[3], 1e-12f)) * q_scale;
+        __syncthreads();
+
+        float k_sq = k_val * k_val;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, o);
+        if (lane == 0) warp_buf[warp_id] = k_sq;
+        __syncthreads();
+        if (tid == 0) s_k_inv = rsqrtf(fmaxf(warp_buf[0]+warp_buf[1]+warp_buf[2]+warp_buf[3], 1e-12f));
+        __syncthreads();
+
+        sh_q[tid] = q_val * s_q_inv;
+        sh_k[tid] = k_val * s_k_inv;
+    }
+
+    // Phase 2: Gate and beta for token A
+    {
+        float alpha_acc = 0.0f, beta_acc = 0.0f;
+        for (int i = tid; i < n_embed; i += 128) {
+            int blk = i / 32, elem = i % 32;
+            int blk_idx = head * blocks_per_head + blk;
+            float ad = __half2float(alpha_blocks[blk_idx].d);
+            float bd = __half2float(beta_blocks[blk_idx].d);
+            float x_val = __half2float(x_norm_a[i]);
+            alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
+            beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            alpha_acc += __shfl_xor_sync(0xFFFFFFFF, alpha_acc, o);
+            beta_acc += __shfl_xor_sync(0xFFFFFFFF, beta_acc, o);
+        }
+        __shared__ float sh_alpha[4], sh_beta_arr[4];
+        if (lane == 0) { sh_alpha[warp_id] = alpha_acc; sh_beta_arr[warp_id] = beta_acc; }
+        __syncthreads();
+        if (tid == 0) {
+            float total_alpha = sh_alpha[0]+sh_alpha[1]+sh_alpha[2]+sh_alpha[3];
+            float total_beta = sh_beta_arr[0]+sh_beta_arr[1]+sh_beta_arr[2]+sh_beta_arr[3];
+            float alpha_biased = total_alpha + dt_bias[head];
+            float sp = (alpha_biased > 20.0f) ? alpha_biased : logf(1.0f + expf(alpha_biased));
+            s_decay = expf(ssm_a[head] * sp);
+            s_beta = 1.0f / (1.0f + expf(-total_beta));
+        }
+    }
+
+    // Wait for async S load
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+
+    // Phase 3A: S update for token A (2 passes over S in shared memory)
+    {
+        float decay = s_decay;
+        float b = s_beta;
+        float sk_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float val = sh_S[i * 128 + tid] * decay;
+            sh_S[i * 128 + tid] = val;
+            sk_j += val * sh_k[i];
+        }
+        float d_j = (__half2float(v_in_a[head * dk + tid]) - sk_j) * b;
+        float o_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float updated = sh_S[i * 128 + tid] + sh_k[i] * d_j;
+            sh_S[i * 128 + tid] = updated;
+            o_j += updated * sh_q[i];
+        }
+        output_a[head * dk + tid] = __float2half(o_j);
+    }
+
+    // ================================================================
+    // S SNAPSHOT (overlapped with B's Phase 1-2)
+    // ================================================================
+    // Write S from shared → snapshot buffer (global stores, non-blocking)
+    __syncthreads();
+    if (S_snapshot) {
+        float* snap_head = S_snapshot + head * dk * dk;
+        for (int i = 0; i < 128 * 128; i += 128)
+            snap_head[i + tid] = sh_S[i + tid];
+    }
+
+    // ================================================================
+    // TOKEN B (S is still in shared memory — no reload needed)
+    // ================================================================
+
+    // Phase 1: L2-normalize Q_b and K_b (runs while snapshot writes are in flight)
+    {
+        half* q = q_in_b + head * dk;
+        half* k = k_in_b + head * dk;
+        float q_val = __half2float(q[tid]);
+        float k_val = __half2float(k[tid]);
+
+        float q_sq = q_val * q_val;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, o);
+        if (lane == 0) warp_buf[warp_id] = q_sq;
+        __syncthreads();
+        if (tid == 0) s_q_inv = rsqrtf(fmaxf(warp_buf[0]+warp_buf[1]+warp_buf[2]+warp_buf[3], 1e-12f)) * q_scale;
+        __syncthreads();
+
+        float k_sq = k_val * k_val;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, o);
+        if (lane == 0) warp_buf[warp_id] = k_sq;
+        __syncthreads();
+        if (tid == 0) s_k_inv = rsqrtf(fmaxf(warp_buf[0]+warp_buf[1]+warp_buf[2]+warp_buf[3], 1e-12f));
+        __syncthreads();
+
+        sh_q[tid] = q_val * s_q_inv;
+        sh_k[tid] = k_val * s_k_inv;
+    }
+
+    // Phase 2: Gate and beta for token B
+    {
+        float alpha_acc = 0.0f, beta_acc = 0.0f;
+        for (int i = tid; i < n_embed; i += 128) {
+            int blk = i / 32, elem = i % 32;
+            int blk_idx = head * blocks_per_head + blk;
+            float ad = __half2float(alpha_blocks[blk_idx].d);
+            float bd = __half2float(beta_blocks[blk_idx].d);
+            float x_val = __half2float(x_norm_b[i]);
+            alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
+            beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            alpha_acc += __shfl_xor_sync(0xFFFFFFFF, alpha_acc, o);
+            beta_acc += __shfl_xor_sync(0xFFFFFFFF, beta_acc, o);
+        }
+        __shared__ float sh_alpha_b[4], sh_beta_arr_b[4];
+        if (lane == 0) { sh_alpha_b[warp_id] = alpha_acc; sh_beta_arr_b[warp_id] = beta_acc; }
+        __syncthreads();
+        if (tid == 0) {
+            float total_alpha = sh_alpha_b[0]+sh_alpha_b[1]+sh_alpha_b[2]+sh_alpha_b[3];
+            float total_beta = sh_beta_arr_b[0]+sh_beta_arr_b[1]+sh_beta_arr_b[2]+sh_beta_arr_b[3];
+            float alpha_biased = total_alpha + dt_bias[head];
+            float sp = (alpha_biased > 20.0f) ? alpha_biased : logf(1.0f + expf(alpha_biased));
+            s_decay = expf(ssm_a[head] * sp);
+            s_beta = 1.0f / (1.0f + expf(-total_beta));
+        }
+    }
+    __syncthreads();
+
+    // Phase 3B: S update for token B
+    {
+        float decay = s_decay;
+        float b = s_beta;
+        float sk_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float val = sh_S[i * 128 + tid] * decay;
+            sh_S[i * 128 + tid] = val;
+            sk_j += val * sh_k[i];
+        }
+        float d_j = (__half2float(v_in_b[head * dk + tid]) - sk_j) * b;
+        float o_j = 0.0f;
+        #pragma unroll 8
+        for (int i = 0; i < 128; i++) {
+            float updated = sh_S[i * 128 + tid] + sh_k[i] * d_j;
+            sh_S[i * 128 + tid] = updated;
+            o_j += updated * sh_q[i];
+        }
+        output_b[head * dk + tid] = __float2half(o_j);
+    }
+
+    // Write final S back to global
+    __syncthreads();
+    for (int i = 0; i < 128 * 128; i += 128)
+        S_head[i + tid] = sh_S[i + tid];
+}
+
+// ============================================================
 // Gate/Beta computation for DeltaNet (standalone, for prefill path)
 // ============================================================
 // gate_i = ssm_a_i * softplus(alpha_proj_i + dt_bias_i)
@@ -2182,9 +2435,12 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
 
     pos = 0;
 
-    // Allow 64 KB dynamic shared memory for kernel_deltanet_fused (S matrix in shared)
+    // Allow 64 KB dynamic shared memory for DeltaNet fused kernels (S matrix in shared)
     GWEN_CHECK_CUDA(cudaFuncSetAttribute(
         (const void*)kernel_deltanet_fused,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+    GWEN_CHECK_CUDA(cudaFuncSetAttribute(
+        (const void*)kernel_deltanet_fused_2tok,
         cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
 }
 
@@ -2757,37 +3013,25 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 qkv_dim, cfg.ssm_conv_kernel);
             GWEN_CHECK_CUDA(cudaEventRecord(ev_overlap_done, overlap_stream));
 
-            // --- Deltanet A on main stream (runs in parallel with conv1d B) ---
-            half *qa = qkv, *ka = qkv + cfg.ssm_inner_size, *va = qkv + 2 * cfg.ssm_inner_size;
-            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
-                state.S, qa, ka, va, x_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                static_cast<const float*>(w.ssm_a.device_data),
-                static_cast<const float*>(w.ssm_dt_bias.device_data),
-                attn_out, q_scale,
-                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
-
-            // --- Save S snapshot after deltanet A ---
-            if (dn_idx < (int)dn_S_snapshot.size()) {
-                size_t S_bytes = (size_t)cfg.ssm_n_heads * cfg.ssm_state_size * cfg.ssm_state_size * sizeof(float);
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                    dn_S_snapshot[dn_idx], state.S, S_bytes,
-                    cudaMemcpyDeviceToDevice, s));
-            }
-
-            // --- Join: wait for conv1d B to finish before deltanet B ---
+            // --- Join: wait for conv1d B before fused 2-token deltanet ---
             GWEN_CHECK_CUDA(cudaStreamWaitEvent(s, ev_overlap_done));
 
+            // --- Fused 2-token DeltaNet: A + snapshot + B in one kernel launch ---
+            // S stays in shared memory across both tokens. Snapshot is written
+            // between A and B, overlapped with B's Phase 1-2 (L2-norm + gate/beta).
+            half *qa = qkv, *ka = qkv + cfg.ssm_inner_size, *va = qkv + 2 * cfg.ssm_inner_size;
             half *qb = b2_qkv, *kb = b2_qkv + cfg.ssm_inner_size, *vb = b2_qkv + 2 * cfg.ssm_inner_size;
+            float* snap = (dn_idx < (int)dn_S_snapshot.size()) ? dn_S_snapshot[dn_idx] : nullptr;
 
-            // --- Deltanet B (needs both deltanet A and conv1d B done) ---
-            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
-                state.S, qb, kb, vb, b2_x_norm,
+            kernel_deltanet_fused_2tok<<<cfg.ssm_n_heads, 128, 65536, s>>>(
+                state.S,
+                qa, ka, va, x_norm,
+                qb, kb, vb, b2_x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
-                b2_attn_out, q_scale,
-                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
+                attn_out, b2_attn_out, snap,
+                q_scale, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
 
             // --- Batch2 Gated RMSNorm + Q8_1 for both tokens ---
             {
@@ -4562,8 +4806,6 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
                                                        const std::vector<int>& prompt_tokens,
                                                        int n_predict) {
     std::vector<int> output_tokens;
-    int accepted = 0, rejected = 0, total_mtp = 0;
-    std::string ar_sequence;  // accept/reject pattern for diagnostics
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -4595,95 +4837,64 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
 
     // Generate first MTP draft
     int draft = forward_mtp(model, output_tokens.back());
-    total_mtp++;
 
-    // Speculative decode loop with batch2 GEMV + activation replay
-    // Invariant: output_tokens.back() has been emitted but NOT yet processed.
-    //            draft = MTP's prediction. mtp_hidden is set.
-    while ((int)output_tokens.size() < n_predict) {
-        int last_token = output_tokens.back();
+    if (!batch2_allocated) {
+        // === FALLBACK: CPU-driven speculative decode (no batch2 buffers) ===
+        while ((int)output_tokens.size() < n_predict) {
+            int last_token = output_tokens.back();
+            int pred = forward(model, last_token);
+            if (pred == draft) {
+                output_tokens.push_back(draft);
+            } else {
+                output_tokens.push_back(pred);
+            }
+            int emitted = output_tokens.back();
+            if (emitted == (int)model.config.eos_token_id) break;
+            if ((int)output_tokens.size() >= n_predict) break;
+            int bonus = forward(model, emitted);
+            output_tokens.push_back(bonus);
+            if (bonus == (int)model.config.eos_token_id) break;
+            draft = forward_mtp(model, bonus);
+        }
+        if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
+        return output_tokens;
+    }
 
-        if (batch2_allocated) {
-            // === BATCH2 + ACTIVATION REPLAY ===
-            // forward_body_2tok saves token B's DeltaNet activations to replay buffers
-            // and saves both tokens' mtp_hidden (A→mtp_hidden_b, B→mtp_hidden)
+    // Speculative decode loop: forward_2tok verifies draft + gets bonus token in one pass.
+    // CPU dispatches two CUDA graphs per cycle (forward_2tok + MTP) with one int comparison
+    // between them. CPU overhead is ~30 μs per 1.6 ms cycle (~2% of wall time).
+    {
+        int accepted = 0, rejected = 0;
+        while ((int)output_tokens.size() < n_predict) {
+            int last_token = output_tokens.back();
             auto [pred_a, pred_b] = forward_2tok(model, last_token, draft);
-
             if (pred_a == draft) {
-                // Draft accepted — state is correct, both tokens processed
                 output_tokens.push_back(draft);
                 output_tokens.push_back(pred_b);
                 accepted++;
-                ar_sequence += 'A';
-
                 if (pred_b == (int)model.config.eos_token_id) break;
                 if ((int)output_tokens.size() >= n_predict) break;
-
-                // mtp_hidden already holds token B's hidden state
                 draft = forward_mtp(model, pred_b);
-                total_mtp++;
             } else {
-                // Draft rejected — undo token B's state update via activation replay
                 rejected++;
-                ar_sequence += 'R';
-
-                // Undo DeltaNet S matrices and conv1d state for token B (~0.05 ms)
                 undo_deltanet_token_b(compute_stream);
-
-                // Undo position: forward_2tok advanced by 2, keep only token A's
                 pos -= 1;
-
-                // Swap mtp_hidden to token A's hidden (saved in mtp_hidden_b)
                 GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, mtp_hidden_b,
                     model.config.n_embed * sizeof(half),
                     cudaMemcpyDeviceToDevice, compute_stream));
                 GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
-
                 output_tokens.push_back(pred_a);
                 if (pred_a == (int)model.config.eos_token_id) break;
                 if ((int)output_tokens.size() >= n_predict) break;
-
-                // Draft next token using token A's correct hidden state
                 draft = forward_mtp(model, pred_a);
-                total_mtp++;
             }
-        } else {
-            // === FALLBACK: two sequential forwards ===
-            int pred = forward(model, last_token);
-            if (pred == draft) {
-                output_tokens.push_back(draft);
-                accepted++;
-            } else {
-                output_tokens.push_back(pred);
-                rejected++;
-            }
-
-            int emitted = output_tokens.back();
-            if (emitted == (int)model.config.eos_token_id) break;
-            if ((int)output_tokens.size() >= n_predict) break;
-
-            int bonus = forward(model, emitted);
-            output_tokens.push_back(bonus);
-
-            if (bonus == (int)model.config.eos_token_id) break;
-
-            draft = forward_mtp(model, bonus);
-            total_mtp++;
         }
+        if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
+        int total = accepted + rejected;
+        printf("MTP stats: %d accepted, %d rejected (%.1f%% acceptance rate), %d cycles\n",
+               accepted, rejected, total > 0 ? 100.0 * accepted / total : 0.0, total);
+        return output_tokens;
     }
-
-    // Trim to n_predict if we overshot
-    if ((int)output_tokens.size() > n_predict) {
-        output_tokens.resize(n_predict);
-    }
-
-    printf("MTP stats: %d accepted, %d rejected (%.1f%% acceptance rate), %d MTP calls\n",
-           accepted, rejected,
-           (accepted + rejected) > 0 ? 100.0 * accepted / (accepted + rejected) : 0.0,
-           total_mtp);
-    printf("MTP sequence: %s\n", ar_sequence.c_str());
-
-    return output_tokens;
 }
 
 } // namespace gwen
