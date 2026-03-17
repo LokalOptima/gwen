@@ -265,4 +265,20 @@ void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
                      int out_features, int in_features, int seq_len,
                      cudaStream_t stream = 0);
 
+// ============================================================
+// Reduction: logsumexp + p_idk (for training server p_idk)
+// ============================================================
+
+// Row-wise logsumexp: x[n_rows, n_cols] FP16 → log_Z[n_rows] F32
+// One block (256 threads) per row. Used for 248K vocab logits.
+void gwen_logsumexp_rows(const half* x, float* log_Z,
+                          int n_rows, int n_cols, cudaStream_t stream = 0);
+
+// Compute p_idk from restricted logits + log_Z (partition function)
+// restricted_logits[n_rows, K] FP16, log_Z[n_rows] F32 → p_idk[n_rows] F32
+// p_idk = clamp(1 - sum(exp(restricted_logits - log_Z)), 0, 1)
+void gwen_p_idk_from_logits(const half* restricted_logits, const float* log_Z,
+                              float* p_idk, int n_rows, int K, cudaStream_t stream = 0);
+
+
 } // namespace gwen

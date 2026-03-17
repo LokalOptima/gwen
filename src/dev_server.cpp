@@ -159,6 +159,28 @@ int main(int argc, char** argv) {
     printf("Dequantized in %.1f ms\n",
            std::chrono::duration<double, std::milli>(t5 - t4).count());
 
+    // --- Dequant full token_embd → FP16 on GPU (for p_idk computation) ---
+    int n_vocab = model->config.n_vocab;  // 248320
+    half* d_full_embed_fp16 = static_cast<half*>(
+        allocator.alloc((size_t)n_vocab * n_embed * sizeof(half)));
+    printf("Full token_embd: %d × %d = %.1f MB FP16 (for p_idk)\n",
+           n_vocab, n_embed, (double)n_vocab * n_embed * 2 / 1024 / 1024);
+    gwen_dequant_q6_k(model->token_embd.device_data, d_full_embed_fp16,
+                       n_vocab * n_embed);
+    GWEN_CHECK_CUDA(cudaDeviceSynchronize());
+
+    // --- Allocate p_idk scratch buffers ---
+    int pidk_chunk = 512;  // tokens per chunk for the 248K GEMM
+    half* d_full_logits_chunk = static_cast<half*>(
+        allocator.alloc((size_t)pidk_chunk * n_vocab * sizeof(half)));
+    float* d_log_Z = static_cast<float*>(
+        allocator.alloc((size_t)max_total_tokens * sizeof(float)));
+    float* d_p_idk = static_cast<float*>(
+        allocator.alloc((size_t)max_total_tokens * sizeof(float)));
+    printf("p_idk buffers: chunk=%d (%.1f MB), log_Z+p_idk (%.1f KB each)\n",
+           pidk_chunk, (double)pidk_chunk * n_vocab * 2 / 1024 / 1024,
+           (double)max_total_tokens * 4 / 1024);
+
     printf("Total GPU memory: %.1f MB\n\n",
            allocator.total_allocated() / 1024.0 / 1024.0);
 
@@ -226,11 +248,14 @@ int main(int argc, char** argv) {
 
         const int32_t* all_tokens = (const int32_t*)(req.body.data() + 8);
 
-        // Prepare output buffer: header + hidden + logits
+        bool want_p_idk = (req.get_param_value("p_idk") == "1");
+
+        // Prepare output buffer: header + hidden + logits [+ p_idk]
         size_t hidden_bytes = (size_t)N * n_embed * sizeof(uint16_t);
         size_t logits_bytes = (size_t)N * K * sizeof(uint16_t);
+        size_t pidk_bytes = want_p_idk ? (size_t)N * sizeof(float) : 0;
         size_t header_bytes = 12;
-        std::string body(header_bytes + hidden_bytes + logits_bytes, '\0');
+        std::string body(header_bytes + hidden_bytes + logits_bytes + pidk_bytes, '\0');
 
         uint32_t header[3] = {B, L, (uint32_t)K};
         memcpy(&body[0], header, 12);
@@ -261,14 +286,38 @@ int main(int argc, char** argv) {
             GWEN_CHECK_CUDA(cudaMemcpy(&body[header_bytes + hidden_bytes],
                                         d_logits_buf, logits_bytes,
                                         cudaMemcpyDeviceToHost));
+
+            // Compute p_idk if requested
+            if (want_p_idk) {
+                // Chunked 248K GEMM + logsumexp + p_idk
+                for (int ci = 0; ci < N; ci += pidk_chunk) {
+                    int chunk = std::min(pidk_chunk, N - ci);
+                    // Full vocab logits: prefill_norm[ci..] × full_embed^T → [chunk, 248K]
+                    gwen_gemm_fp16(d_full_embed_fp16,
+                                   &state.prefill_norm[ci * n_embed],
+                                   d_full_logits_chunk,
+                                   n_vocab, n_embed, chunk, s);
+                    // logsumexp over 248K → log_Z[chunk]
+                    gwen_logsumexp_rows(d_full_logits_chunk, &d_log_Z[ci],
+                                         chunk, n_vocab, s);
+                    // p_idk from restricted logits (already in d_logits_buf) + log_Z
+                    gwen_p_idk_from_logits(&d_logits_buf[(size_t)ci * K], &d_log_Z[ci],
+                                            &d_p_idk[ci], chunk, K, s);
+                }
+                // Copy p_idk to host
+                GWEN_CHECK_CUDA(cudaMemcpy(&body[header_bytes + hidden_bytes + logits_bytes],
+                                            d_p_idk, pidk_bytes,
+                                            cudaMemcpyDeviceToHost));
+            }
         }
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         request_count++;
 
-        printf("[%ld] batch_logits: %u×%u=%d tok, K=%d → %.1f ms (%.0f tok/s)\n",
-               request_count, B, L, N, K, ms, (double)N / (ms / 1000.0));
+        printf("[%ld] batch_logits%s: %u×%u=%d tok, K=%d → %.1f ms (%.0f tok/s)\n",
+               request_count, want_p_idk ? "+p_idk" : "",
+               B, L, N, K, ms, (double)N / (ms / 1000.0));
         fflush(stdout);
 
         res.set_header("X-Batch", std::to_string(B));

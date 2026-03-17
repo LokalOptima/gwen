@@ -30,7 +30,6 @@ Usage:
 
 import argparse
 import hashlib
-import http.client
 import json
 import math
 import os
@@ -50,6 +49,7 @@ from tqdm import tqdm
 # Add parent to path so we can import from train/
 sys.path.insert(0, str(Path(__file__).parent))
 from dataset import RestrictedVocab, TokenBatchSampler, TokenSequenceDataset, make_splits, mtp_collate
+from gwen_client import GwenClient
 from model import MTPHead
 
 
@@ -143,89 +143,6 @@ def _load_output_norm(model_dir: Path) -> torch.Tensor:
     raise KeyError(f"Cannot find output norm weight in {model_dir}")
 
 
-# ---------------------------------------------------------------------------
-# GWEN server client
-# ---------------------------------------------------------------------------
-
-class GwenClient:
-    """Client for GWEN inference server's batch hidden state extraction."""
-
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.conn = http.client.HTTPConnection(host, port, timeout=300)
-        self._check_health()
-
-    def _check_health(self):
-        try:
-            self.conn.request("GET", "/health")
-            resp = self.conn.getresponse()
-            data = json.loads(resp.read().decode())
-            log(f"GWEN server: {data.get('model', '?')}, "
-                f"n_embed={data.get('n_embed', '?')}, "
-                f"max_seq={data.get('max_seq', '?')}")
-        except ConnectionRefusedError:
-            raise RuntimeError(
-                f"Cannot connect to GWEN server at {self.host}:{self.port}. "
-                f"Start it first: build/gwen_server --model <path.gguf> --port {self.port}"
-            )
-
-    def _reconnect(self):
-        self.conn.close()
-        self.conn = http.client.HTTPConnection(self.host, self.port, timeout=300)
-
-    def _post(self, path, body):
-        headers = {"Content-Type": "application/octet-stream"}
-        try:
-            self.conn.request("POST", path, body=body, headers=headers)
-            resp = self.conn.getresponse()
-        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
-            self._reconnect()
-            self.conn.request("POST", path, body=body, headers=headers)
-            resp = self.conn.getresponse()
-        if resp.status != 200:
-            raise RuntimeError(f"GWEN server error {resp.status}: {resp.read().decode()}")
-        return resp.read()
-
-    def batch_extract_with_preds(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract hidden states AND main model predictions.
-
-        Returns: (hidden [B, L, n_embed] float16, predictions [B, L] int32)
-        """
-        token_np = token_ids.cpu().numpy().astype(np.int32)
-        B, L = token_np.shape
-        body = struct.pack('<II', B, L) + token_np.tobytes()
-        data = self._post("/batch_extract?preds=1", body)
-        B2, L2, d = struct.unpack('<III', data[:12])
-        hidden_bytes = B2 * L2 * d * 2
-        hidden = np.frombuffer(data[12:12 + hidden_bytes], dtype=np.float16).reshape(B2, L2, d).copy()
-        preds = np.frombuffer(data[12 + hidden_bytes:], dtype=np.int32).reshape(B2, L2).copy()
-        return torch.from_numpy(hidden), torch.from_numpy(preds)
-
-    def batch_logits(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract hidden states AND teacher logits over restricted vocab.
-
-        Calls the dev_server's /batch_logits endpoint.
-        Returns: (hidden [B, L, n_embed] float16, teacher_logits [B, L, K] float16)
-        """
-        token_np = token_ids.cpu().numpy().astype(np.int32)
-        B, L = token_np.shape
-        body = struct.pack('<II', B, L) + token_np.tobytes()
-        data = self._post("/batch_logits", body)
-        B2, L2, K = struct.unpack('<III', data[:12])
-        N = B2 * L2
-        # Derive n_embed from total data size:
-        # total = N * n_embed * 2 + N * K * 2 = N * 2 * (n_embed + K)
-        total_data = len(data) - 12
-        n_embed = total_data // (N * 2) - K
-        assert n_embed == 1024, f"Expected n_embed=1024, got {n_embed} (data={total_data}, N={N}, K={K})"
-        hidden_bytes = N * n_embed * 2
-        logits_bytes = N * K * 2
-        hidden = np.frombuffer(data[12:12 + hidden_bytes], dtype=np.float16).reshape(B2, L2, n_embed).copy()
-        logits = np.frombuffer(data[12 + hidden_bytes:12 + hidden_bytes + logits_bytes],
-                               dtype=np.float16).reshape(B2, L2, K).copy()
-        return torch.from_numpy(hidden), torch.from_numpy(logits)
-
 
 # ---------------------------------------------------------------------------
 # Distillation loss (v3)
@@ -262,6 +179,60 @@ def distillation_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor
     return F.kl_div(student_log_probs, teacher_probs, reduction='sum') * (T ** 2) / n_tokens
 
 
+
+def distillation_loss_idk(
+    student_logits: torch.Tensor,
+    teacher_probs: torch.Tensor,
+    T: float = 2.0,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """KL divergence loss with split temperature for IDK training.
+
+    Temperature T softens the K restricted token probabilities for gradient flow,
+    while IDK probability stays at T=1 (true OOV mass, always calibrated).
+
+    Args:
+        student_logits: [*, K+1] raw logits from MTP head
+        teacher_probs: [*, K+1] F32 teacher probabilities (from server p_idk + restricted logits)
+        T: temperature for restricted tokens (decays T=2→1 over training)
+        mask: optional [*] bool mask
+
+    Returns:
+        Scalar loss (per-token averaged KL divergence)
+    """
+    if mask is not None:
+        student_logits = student_logits[mask]
+        teacher_probs = teacher_probs[mask]
+        if student_logits.numel() == 0:
+            return student_logits.sum()  # zero loss, preserves grad
+
+    # Flatten to [N, K+1]
+    shape = student_logits.shape
+    K_plus_1 = shape[-1]
+    K = K_plus_1 - 1
+    student_flat = student_logits.reshape(-1, K_plus_1)
+    teacher_flat = teacher_probs.reshape(-1, K_plus_1).float()
+    n_tokens = student_flat.shape[0]
+
+    # Split temperature: soften restricted probs, keep IDK at T=1
+    p_restricted = teacher_flat[:, :K]   # [N, K] — sums to (1 - p_idk)
+    p_idk = teacher_flat[:, K:]          # [N, 1] — true OOV mass
+
+    if T != 1.0:
+        p_soft = p_restricted.pow(1.0 / T)
+        p_soft_sum = p_soft.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        p_soft = p_soft / p_soft_sum * (1.0 - p_idk)  # re-scale to preserve IDK mass
+    else:
+        p_soft = p_restricted
+
+    teacher_target = torch.cat([p_soft, p_idk], dim=-1)  # [N, K+1] sums to 1.0
+    teacher_target = teacher_target.clamp(min=1e-8)
+    teacher_target = teacher_target / teacher_target.sum(dim=-1, keepdim=True)
+
+    student_log_probs = F.log_softmax(student_flat, dim=-1)
+    return F.kl_div(student_log_probs, teacher_target, reduction='sum') / n_tokens
+
+
 # ---------------------------------------------------------------------------
 # Evaluation (shared by intra-epoch, end-of-epoch, and initial eval)
 # ---------------------------------------------------------------------------
@@ -280,23 +251,37 @@ def run_eval(
     restricted_embed: torch.Tensor | None = None,
     output_norm_weight: torch.Tensor | None = None,
     output_norm_eps: float = 1e-6,
-) -> tuple[float, float, int]:
+    idk: bool = False,
+) -> tuple[float, float, int] | tuple[float, float, int, dict]:
     """Run validation with KL distillation loss.
 
     For v3 val cache: stores (token_ids, hidden_input). Teacher logits are
     recomputed on-the-fly: RMSNorm(hidden) @ restricted_embed.T (~ms in PyTorch).
 
+    For v4 val cache (IDK): stores (token_ids, hidden_input, p_idk).
+    Teacher distribution uses server-computed p_idk.
+
     Args:
         restricted_embed: [K, n_embed] FP16 on CPU (for computing teacher logits)
         output_norm_weight: [n_embed] F32 on CPU (output RMSNorm weight)
+        idk: if True, use IDK teacher distribution and metrics
 
-    Returns: (val_loss, accept_rate, n_tokens_evaluated)
+    Returns:
+        Without idk: (val_loss, accept_rate, n_tokens_evaluated)
+        With idk: (val_loss, accept_rate, n_tokens_evaluated, idk_metrics)
     """
     mtp.eval()
     total_loss = 0.0
     total_accept = 0
     total_tokens = 0
     n_batches = 0
+
+    # IDK metrics accumulators
+    total_idk_preds = 0      # student predicted IDK
+    total_teacher_oov = 0    # teacher argmax was OOV (IDK)
+    total_idk_correct = 0    # student IDK and teacher was OOV (true positive)
+    total_non_idk_accept = 0 # non-IDK predictions that match teacher
+    total_non_idk_tokens = 0 # total non-IDK predictions
 
     # Move restricted_embed and output_norm to GPU once for fast teacher logit computation
     d_restricted_embed = restricted_embed.to(device)
@@ -308,6 +293,18 @@ def run_eval(
         rms = h.pow(2).mean(-1, keepdim=True).add(output_norm_eps).rsqrt()
         normed = ((h * rms) * d_output_norm_weight).half()
         return normed @ d_restricted_embed.T  # [*, K]
+
+    def build_teacher_probs_from_p_idk(teacher_logits_gpu, p_idk_gpu, T):
+        """Build K+1 teacher distribution from restricted logits + p_idk.
+
+        teacher[:K] = softmax(logits/T) * (1 - p_idk)
+        teacher[K]  = p_idk
+        """
+        p_restricted = F.softmax(teacher_logits_gpu.float() / T, dim=-1)
+        p_restricted = p_restricted * (1.0 - p_idk_gpu.unsqueeze(-1))
+        return torch.cat([p_restricted, p_idk_gpu.unsqueeze(-1)], dim=-1)
+
+    K = top_k
 
     with torch.no_grad():
         if val_cache_files:
@@ -321,6 +318,16 @@ def run_eval(
                 vh_mtp = vh_all[:, :vL-2]     # hidden[t] for MTP input (positions 0..L-3)
                 vh_teacher = vh_all[:, 1:vL-1] # hidden[t+1] for teacher logits (positions 1..L-2)
 
+                # v4 val cache includes p_idk
+                has_p_idk = "p_idk" in vc
+                if idk and has_p_idk:
+                    vc_p_idk = vc["p_idk"]  # [B, L-2]
+                elif idk and not has_p_idk:
+                    raise RuntimeError(
+                        "IDK mode requires v4 val cache with p_idk. "
+                        "Re-extract with: uv run scripts/02_extract_val_cache.py --p-idk ..."
+                    )
+
                 # Chunk to bound GPU memory
                 seq_bytes = max(ve.shape[1], 1) * top_k * 4
                 chunk = max(1, min(vB, int(500_000_000 / seq_bytes)))
@@ -333,13 +340,42 @@ def run_eval(
                             ve[ci:ce].to(device, non_blocking=True),
                             vh_mtp_gpu,
                         )
-                        # Teacher logits from shifted hidden states
-                        vteacher_gpu = compute_teacher_logits_gpu(vh_teacher_gpu)
-                        vloss = distillation_loss(vlogits, vteacher_gpu, T=temperature)
+
+                        # Recompute teacher logits from cached hidden states
+                        vteacher_logits = compute_teacher_logits_gpu(vh_teacher_gpu)
+
+                        if idk:
+                            vp_idk = vc_p_idk[ci:ce].to(device, non_blocking=True)
+                            vteacher_probs = build_teacher_probs_from_p_idk(
+                                vteacher_logits, vp_idk, temperature)
+                            vloss = distillation_loss_idk(vlogits, vteacher_probs, T=temperature)
+                        else:
+                            vloss = distillation_loss(vlogits, vteacher_logits, T=temperature)
+
                     total_loss += vloss.item()
-                    vpreds = vlogits.argmax(dim=-1)
-                    vteacher_argmax = vteacher_gpu.argmax(dim=-1)
-                    total_accept += (vpreds == vteacher_argmax).sum().item()
+
+                    if idk:
+                        vpreds = vlogits.argmax(dim=-1)  # [B, L]
+                        vteacher_argmax = vteacher_probs.argmax(dim=-1)  # [B, L]
+
+                        student_idk = (vpreds == K)
+                        teacher_oov = (vteacher_argmax == K)
+                        total_idk_preds += student_idk.sum().item()
+                        total_teacher_oov += teacher_oov.sum().item()
+                        total_idk_correct += (student_idk & teacher_oov).sum().item()
+
+                        non_idk = ~student_idk
+                        total_non_idk_accept += (vpreds[non_idk] == vteacher_argmax[non_idk]).sum().item()
+                        total_non_idk_tokens += non_idk.sum().item()
+
+                        # Overall accept: non-IDK match + correct IDK abstentions
+                        total_accept += (vpreds[non_idk] == vteacher_argmax[non_idk]).sum().item()
+                        total_accept += (student_idk & teacher_oov).sum().item()
+                    else:
+                        vpreds = vlogits.argmax(dim=-1)
+                        vteacher_argmax = vteacher_logits.argmax(dim=-1)
+                        total_accept += (vpreds == vteacher_argmax).sum().item()
+
                     total_tokens += vpreds.numel()
                     n_batches += 1
         elif val_dl is not None and gwen is not None:
@@ -366,6 +402,24 @@ def run_eval(
 
     val_loss = total_loss / max(n_batches, 1)
     accept_rate = total_accept / max(total_tokens, 1)
+
+    if idk:
+        p_idk = total_idk_preds / max(total_tokens, 1)
+        p_accept = total_non_idk_accept / max(total_non_idk_tokens, 1)
+        # Estimated ms/tok from cycle timing model:
+        #   IDK skip: 1.68ms/tok, accept: 1.125ms/tok, reject: 2.30ms/tok
+        ms_per_tok = (p_idk * 1.68 +
+                      (1 - p_idk) * (p_accept * 1.125 + (1 - p_accept) * 2.30))
+        idk_metrics = {
+            "idk_rate": p_idk,
+            "idk_precision": total_idk_correct / max(total_idk_preds, 1),
+            "idk_recall": total_idk_correct / max(total_teacher_oov, 1),
+            "accept_rate_non_idk": p_accept,
+            "accept_rate_overall": accept_rate,
+            "est_tok_per_sec": 1000.0 / ms_per_tok,
+        }
+        return val_loss, accept_rate, total_tokens, idk_metrics
+
     return val_loss, accept_rate, total_tokens
 
 
@@ -431,13 +485,37 @@ def train(args: argparse.Namespace) -> None:
     gwen = GwenClient(host, int(port))
 
     # MTP head
-    log("Initializing MTP head...")
+    use_idk = args.idk
+    log("Initializing MTP head..." + (" (IDK mode)" if use_idk else ""))
     if args.from_pretrained:
         mtp = MTPHead.from_pretrained(args.model_dir, vocab_size=args.top_k, device=device,
-                                       vocab_ids=vocab.top_k_ids.tolist())
+                                       vocab_ids=vocab.top_k_ids.tolist(), idk=use_idk)
     else:
-        mtp = MTPHead(vocab_size=args.top_k).to(device)
+        mtp = MTPHead(vocab_size=args.top_k, idk=use_idk).to(device)
         log("  Initialized from scratch (no pre-trained weights)")
+
+    # Warm-start from existing checkpoint (e.g. v3 → v4 IDK)
+    if args.init_from:
+        init_ckpt = torch.load(str(args.init_from), map_location=device, weights_only=False)
+        init_sd = init_ckpt["model"]
+        current_sd = mtp.state_dict()
+        loaded_keys = 0
+        for key in init_sd:
+            if key in current_sd:
+                if init_sd[key].shape == current_sd[key].shape:
+                    current_sd[key] = init_sd[key]
+                    loaded_keys += 1
+                elif key == "lm_head.weight" and use_idk:
+                    # v3 [K, 1024] → v4 [K+1, 1024]: copy K rows, leave IDK row as zeros
+                    K_src = init_sd[key].shape[0]
+                    current_sd[key][:K_src] = init_sd[key]
+                    loaded_keys += 1
+                    log(f"  lm_head: copied {K_src} rows from init checkpoint, IDK row = zeros")
+                else:
+                    log(f"  Warning: shape mismatch for {key}: "
+                        f"{init_sd[key].shape} vs {current_sd[key].shape}, skipping")
+        mtp.load_state_dict(current_sd)
+        log(f"  Warm-started from {args.init_from} ({loaded_keys}/{len(init_sd)} keys loaded)")
 
     params = mtp.param_count()
     log(f"  MTP params: {params['total']:,} ({params['total'] * 4 / 1e6:.1f} MB FP32)")
@@ -450,6 +528,9 @@ def train(args: argparse.Namespace) -> None:
     # Stage 2: unfreeze all params
     stage1_steps = args.stage1_steps
     T = args.temperature
+    # IDK mode: temperature decay T_start → T_end over training
+    T_start = args.temp_start if use_idk else T
+    T_end = args.temp_end if use_idk else T
 
     # Restricted embed + output norm for on-the-fly teacher logit computation
     # (used by val cache eval path — recompute teacher logits from cached hidden states)
@@ -459,6 +540,10 @@ def train(args: argparse.Namespace) -> None:
     # Load output norm weight from safetensors
     output_norm_weight = _load_output_norm(Path(args.model_dir))  # [1024] F32
     output_norm_eps = 1e-6
+
+    # IDK mode: p_idk is computed live by dev_server (no full embed needed on training GPU)
+    if use_idk:
+        log("  IDK mode: p_idk computed live by dev_server (/batch_logits?p_idk=1)")
 
     # Build optimizer — stage 1 trains only lm_head
     def make_optimizer(stage: int) -> torch.optim.Optimizer:
@@ -568,9 +653,12 @@ def train(args: argparse.Namespace) -> None:
             "params": params,
         },
         "training": {
-            "version": 3,
-            "loss": "kl_divergence",
+            "version": 4 if use_idk else 3,
+            "loss": "kl_divergence_idk" if use_idk else "kl_divergence",
+            "idk": use_idk,
             "temperature": T,
+            "temp_start": T_start if use_idk else None,
+            "temp_end": T_end if use_idk else None,
             "stage1_steps": stage1_steps,
             "stage1_lr": args.stage1_lr,
             "epochs": args.epochs,
@@ -618,12 +706,19 @@ def train(args: argparse.Namespace) -> None:
     log_exists = log_path.exists() and start_epoch > 0
     log_file = open(log_path, "a" if log_exists else "w")
     if not log_exists:
-        log_file.write("step,epoch,tokens_seen,batch_loss,avg_loss,val_loss,accept_rate,lr\n")
+        header = "step,epoch,tokens_seen,batch_loss,avg_loss,val_loss,accept_rate,lr"
+        if use_idk:
+            header += ",idk_rate,idk_precision,idk_recall,accept_rate_non_idk"
+        log_file.write(header + "\n")
         log_file.flush()
 
     # Load val cache
     val_cache_dir = out_dir / "val_cache"
     val_cache_files = sorted(val_cache_dir.glob("*.pt")) if val_cache_dir.exists() else []
+    if val_cache_files and args.eval_batches > 0 and args.eval_batches < len(val_cache_files):
+        # Deterministic subsample for faster eval
+        step = len(val_cache_files) // args.eval_batches
+        val_cache_files = val_cache_files[::step][:args.eval_batches]
     if val_cache_files:
         log(f"Val cache: {len(val_cache_files)} batches in {val_cache_dir}")
     else:
@@ -636,20 +731,37 @@ def train(args: argparse.Namespace) -> None:
         device=device, use_amp=use_amp, temperature=T,
         restricted_embed=restricted_embed, output_norm_weight=output_norm_weight,
         output_norm_eps=output_norm_eps,
+        idk=use_idk,
     )
-    log("\nRunning initial eval (baseline)...")
-    val_loss, accept_rate, _ = run_eval(
-        mtp, val_cache_files, val_dl if not val_cache_files else None,
-        gwen if not val_cache_files else None, **eval_kwargs,
-    )
-    log(f"  Baseline: val_loss={val_loss:.4f}, accept={accept_rate:.1%}")
-    log_file.write(f"0,0.0000,0,,,{val_loss:.6f},{accept_rate:.4f},{args.lr:.6e}\n")
-    log_file.flush()
 
-    if val_loss < best_val:
-        best_val = val_loss
-    if accept_rate > best_accept:
-        best_accept = accept_rate
+    if (args.init_from and use_idk) or args.resume:
+        # Skip initial eval: meaningless when IDK is zeros (init-from), or redundant (resume)
+        log("\nSkipping initial eval")
+    else:
+        log("\nRunning initial eval (baseline)...")
+        eval_result = run_eval(
+            mtp, val_cache_files, val_dl if not val_cache_files else None,
+            gwen if not val_cache_files else None, **eval_kwargs,
+        )
+        if use_idk:
+            val_loss, accept_rate, _, idk_m = eval_result
+            log(f"  Baseline: val_loss={val_loss:.4f}, accept={accept_rate:.1%}")
+            log(f"  IDK: rate={idk_m['idk_rate']:.1%}, prec={idk_m['idk_precision']:.1%}, "
+                f"rec={idk_m['idk_recall']:.1%}, non-idk accept={idk_m['accept_rate_non_idk']:.1%}")
+            log_file.write(f"0,0.0000,0,,,{val_loss:.6f},{accept_rate:.4f},{args.lr:.6e},"
+                           f"{idk_m['idk_rate']:.4f},{idk_m['idk_precision']:.4f},"
+                           f"{idk_m['idk_recall']:.4f},{idk_m['accept_rate_non_idk']:.4f}\n")
+        else:
+            val_loss, accept_rate, _ = eval_result
+            log(f"  Baseline: val_loss={val_loss:.4f}, accept={accept_rate:.1%}")
+            log_file.write(f"0,0.0000,0,,,{val_loss:.6f},{accept_rate:.4f},{args.lr:.6e}\n")
+        log_file.flush()
+
+    if not ((args.init_from and use_idk) or args.resume):
+        if val_loss < best_val:
+            best_val = val_loss
+        if accept_rate > best_accept:
+            best_accept = accept_rate
 
     # Early stopping
     patience_counter = 0
@@ -668,7 +780,7 @@ def train(args: argparse.Namespace) -> None:
     t_start = time.time()
     tokens_at_start = tokens_seen
 
-    def save_checkpoint(val_loss, accept_rate, epoch):
+    def save_checkpoint(val_loss, accept_rate, epoch, idk_metrics=None):
         nonlocal best_val, best_accept, patience_counter
         ckpt = {
             "model": mtp.state_dict(),
@@ -683,21 +795,30 @@ def train(args: argparse.Namespace) -> None:
             "temperature": T,
             "stage": current_stage,
             "timestamp": time.time(),
+            "has_idk": use_idk,
         }
         torch.save(ckpt, out_dir / "latest.pt")
 
         if val_loss < best_val:
             best_val = val_loss
             torch.save(ckpt, out_dir / "best.pt")
-            log(f"  -> saved best (val={val_loss:.4f}, accept={accept_rate:.1%})")
+            log(f"  -> saved best (val={val_loss:.4f})")
             patience_counter = 0
         else:
             patience_counter += 1
 
-        if accept_rate > best_accept:
-            best_accept = accept_rate
-            torch.save(ckpt, out_dir / "best_accept.pt")
-            log(f"  -> saved best_accept ({accept_rate:.1%})")
+        # For IDK: save best by estimated tok/s; otherwise by accept_rate
+        if use_idk and idk_metrics:
+            score = idk_metrics["est_tok_per_sec"]
+            if score > best_accept:
+                best_accept = score
+                torch.save(ckpt, out_dir / "best_accept.pt")
+                log(f"  -> saved best_accept (est {score:.0f} tok/s)")
+        else:
+            if accept_rate > best_accept:
+                best_accept = accept_rate
+                torch.save(ckpt, out_dir / "best_accept.pt")
+                log(f"  -> saved best_accept ({accept_rate:.1%})")
 
     for epoch in range(start_epoch, total_epochs):
 
@@ -725,24 +846,42 @@ def train(args: argparse.Namespace) -> None:
             with torch.no_grad():
                 embeddings = F.embedding(token_ids, embed_weight)
 
-            # Hidden states + teacher logits from dev server
-            with torch.no_grad():
-                hidden, teacher_logits = gwen.batch_logits(token_ids)
+            if use_idk:
+                # IDK mode: get hidden + logits + p_idk from dev server in one call
+                with torch.no_grad():
+                    hidden, teacher_logits, batch_p_idk = gwen.batch_logits_with_p_idk(token_ids)
 
-            # MTP inputs: embed[t+1], hidden[t] → predict token[t+2]
-            # Teacher target: main model's prediction at t+1 (which predicts token[t+2])
-            embed_input = embeddings[:, 1:L-1]      # [B, L-2, 1024]
-            hidden_input = hidden[:, :L-2]            # [B, L-2, 1024]
-            teacher_input = teacher_logits[:, 1:L-1]  # [B, L-2, K] — shifted: teacher[t+1] predicts token[t+2]
+                embed_input = embeddings[:, 1:L-1]           # [B, L-2, 1024]
+                hidden_input = hidden[:, :L-2]                # [B, L-2, 1024]
+                teacher_input = teacher_logits[:, 1:L-1]      # [B, L-2, K] — shifted
+                teacher_p_idk = batch_p_idk[:, 1:L-1]         # [B, L-2] — shifted
+            else:
+                # Standard mode: get hidden states + teacher logits from dev server
+                with torch.no_grad():
+                    hidden, teacher_logits = gwen.batch_logits(token_ids)
+
+                embed_input = embeddings[:, 1:L-1]      # [B, L-2, 1024]
+                hidden_input = hidden[:, :L-2]            # [B, L-2, 1024]
+                teacher_input = teacher_logits[:, 1:L-1]  # [B, L-2, K] — shifted
 
             # Hidden state noise injection (EAGLE regularization technique)
             if args.hidden_noise > 0 and mtp.training:
                 noise = torch.empty_like(hidden_input).uniform_(-args.hidden_noise, args.hidden_noise)
                 hidden_input = hidden_input + noise
 
+            # IDK temperature decay: linear interpolation over training steps
+            if use_idk:
+                progress = global_step / max(total_steps, 1)
+                T_cur = T_start + (T_end - T_start) * progress
+            else:
+                T_cur = T
+
             # Chunked forward/backward to bound GPU memory
-            seq_logit_bytes = max(L - 2, 1) * args.top_k * 4
-            max_chunk = max(1, min(B, int(500_000_000 / seq_logit_bytes)))
+            # IDK needs more memory: teacher probs (F32) + student logits + KL intermediates
+            lm_out_size = args.top_k + 1 if use_idk else args.top_k
+            mem_budget = 150_000_000 if use_idk else 500_000_000
+            seq_logit_bytes = max(L - 2, 1) * lm_out_size * 4
+            max_chunk = max(1, min(B, int(mem_budget / seq_logit_bytes)))
             n_chunks = (B + max_chunk - 1) // max_chunk
             optimizer.zero_grad(set_to_none=True)
             batch_loss = 0.0
@@ -752,11 +891,24 @@ def train(args: argparse.Namespace) -> None:
                 ce = min(ci + max_chunk, B)
                 e_chunk = embed_input[ci:ce].to(device, non_blocking=True)
                 h_chunk = hidden_input[ci:ce].to(device, dtype=torch.float16, non_blocking=True)
-                t_chunk = teacher_input[ci:ce].to(device, non_blocking=True)
+
+                if use_idk:
+                    # Build K+1 teacher distribution from server logits + p_idk
+                    t_logits = teacher_input[ci:ce].to(device, non_blocking=True)
+                    p_idk_chunk = teacher_p_idk[ci:ce].to(device, non_blocking=True)
+                    with torch.no_grad():
+                        p_restricted = F.softmax(t_logits.float() / T_cur, dim=-1)
+                        p_restricted = p_restricted * (1.0 - p_idk_chunk.unsqueeze(-1))
+                        t_chunk = torch.cat([p_restricted, p_idk_chunk.unsqueeze(-1)], dim=-1)
+                else:
+                    t_chunk = teacher_input[ci:ce].to(device, non_blocking=True)
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                     logits = mtp(e_chunk, h_chunk)
-                    loss = distillation_loss(logits, t_chunk, T=T)
+                    if use_idk:
+                        loss = distillation_loss_idk(logits, t_chunk, T=T_cur)
+                    else:
+                        loss = distillation_loss(logits, t_chunk, T=T_cur)
                     loss = loss / n_chunks
 
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -766,6 +918,12 @@ def train(args: argparse.Namespace) -> None:
 
                 scaler.scale(loss).backward()
                 batch_loss += loss.item()
+
+                # Track batch IDK rate (cheap — reuses logits already computed)
+                if use_idk:
+                    with torch.no_grad():
+                        batch_idk_count = (logits.detach().argmax(dim=-1) == args.top_k).sum().item()
+                        batch_idk_total = logits.shape[0] * logits.shape[1] if logits.dim() == 3 else logits.shape[0]
 
             if skip:
                 optimizer.zero_grad(set_to_none=True)
@@ -798,15 +956,25 @@ def train(args: argparse.Namespace) -> None:
             elapsed = time.time() - t_start
             tok_per_sec = (tokens_seen - tokens_at_start) / max(elapsed, 1)
             pbar.update(batch_tokens / 1e6)
-            pbar.set_postfix_str(
-                f"step {global_step}, loss={avg:.4f} lr={lr_val:.1e} "
-                f"({tok_per_sec/1e3:.1f}K tok/s)"
-            )
+            if use_idk:
+                batch_idk_rate = batch_idk_count / max(batch_idk_total, 1)
+                pbar.set_postfix_str(
+                    f"step {global_step}, loss={avg:.4f} lr={lr_val:.1e} "
+                    f"idk={batch_idk_rate:.1%} ({tok_per_sec/1e3:.1f}K tok/s)"
+                )
+            else:
+                pbar.set_postfix_str(
+                    f"step {global_step}, loss={avg:.4f} lr={lr_val:.1e} "
+                    f"({tok_per_sec/1e3:.1f}K tok/s)"
+                )
 
             # CSV: every batch
             frac_epoch = epoch + n_batches / len(train_sampler)
-            log_file.write(f"{global_step},{frac_epoch:.4f},{tokens_seen},"
-                           f"{batch_loss:.6f},{avg:.6f},,,{lr_val:.6e}\n")
+            csv_line = (f"{global_step},{frac_epoch:.4f},{tokens_seen},"
+                        f"{batch_loss:.6f},{avg:.6f},,,{lr_val:.6e}")
+            if use_idk:
+                csv_line += f",{batch_idk_rate:.4f},,,"
+            log_file.write(csv_line + "\n")
             if global_step % 100 == 0:
                 log_file.flush()
 
@@ -825,24 +993,43 @@ def train(args: argparse.Namespace) -> None:
                     "temperature": T,
                     "stage": current_stage,
                     "timestamp": time.time(),
+                    "has_idk": use_idk,
                 }, out_dir / "latest.pt")
 
             # --- Periodic eval ---
             if steps_since_eval >= args.eval_every:
-                val_loss, accept_rate, _ = run_eval(
+                # Update eval temperature for IDK mode
+                if use_idk:
+                    eval_kwargs["temperature"] = T_cur
+
+                eval_result = run_eval(
                     mtp, val_cache_files, val_dl if not val_cache_files else None,
                     gwen if not val_cache_files else None, **eval_kwargs,
                 )
 
-                log(f"  [{stage_label}:{epoch+1}:{n_batches}/{len(train_sampler)}]  "
-                    f"train={avg:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
-                    f"lr={lr_val:.1e}  tokens={tokens_seen/1e6:.0f}M")
-
-                log_file.write(f"{global_step},{frac_epoch:.4f},{tokens_seen},"
-                               f"{avg:.6f},{avg:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e}\n")
+                if use_idk:
+                    val_loss, accept_rate, _, idk_m = eval_result
+                    log(f"  [{stage_label}:{epoch+1}:{n_batches}/{len(train_sampler)}]  "
+                        f"train={avg:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
+                        f"lr={lr_val:.1e}  T={T_cur:.2f}  tokens={tokens_seen/1e6:.0f}M")
+                    log(f"    IDK: rate={idk_m['idk_rate']:.1%}, prec={idk_m['idk_precision']:.1%}, "
+                        f"rec={idk_m['idk_recall']:.1%}, non-idk accept={idk_m['accept_rate_non_idk']:.1%}, "
+                        f"est {idk_m['est_tok_per_sec']:.0f} tok/s")
+                    log_file.write(f"{global_step},{frac_epoch:.4f},{tokens_seen},"
+                                   f"{avg:.6f},{avg:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e},"
+                                   f"{idk_m['idk_rate']:.4f},{idk_m['idk_precision']:.4f},"
+                                   f"{idk_m['idk_recall']:.4f},{idk_m['accept_rate_non_idk']:.4f}\n")
+                else:
+                    val_loss, accept_rate, _ = eval_result
+                    log(f"  [{stage_label}:{epoch+1}:{n_batches}/{len(train_sampler)}]  "
+                        f"train={avg:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
+                        f"lr={lr_val:.1e}  tokens={tokens_seen/1e6:.0f}M")
+                    log_file.write(f"{global_step},{frac_epoch:.4f},{tokens_seen},"
+                                   f"{avg:.6f},{avg:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e}\n")
                 log_file.flush()
 
-                save_checkpoint(val_loss, accept_rate, epoch)
+                save_checkpoint(val_loss, accept_rate, epoch,
+                                idk_metrics=idk_m if use_idk else None)
 
                 steps_since_eval = 0
 
@@ -862,27 +1049,49 @@ def train(args: argparse.Namespace) -> None:
         # --- End-of-epoch eval ---
         avg_train = epoch_loss / max(n_batches, 1)
 
-        val_loss, accept_rate, _ = run_eval(
+        if use_idk:
+            eval_kwargs["temperature"] = T_cur
+
+        eval_result = run_eval(
             mtp, val_cache_files, val_dl if not val_cache_files else None,
             gwen if not val_cache_files else None, **eval_kwargs,
         )
 
         lr_val = optimizer.param_groups[0]["lr"]
-        log(f"[{stage_label}] Epoch {epoch+1}/{total_epochs} done: "
-            f"train={avg_train:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
-            f"tokens={tokens_seen/1e6:.0f}M")
 
-        log_file.write(f"{global_step},{epoch+1:.4f},{tokens_seen},"
-                       f"{avg_train:.6f},{avg_train:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e}\n")
+        if use_idk:
+            val_loss, accept_rate, _, idk_m = eval_result
+            log(f"[{stage_label}] Epoch {epoch+1}/{total_epochs} done: "
+                f"train={avg_train:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
+                f"tokens={tokens_seen/1e6:.0f}M")
+            log(f"  IDK: rate={idk_m['idk_rate']:.1%}, prec={idk_m['idk_precision']:.1%}, "
+                f"rec={idk_m['idk_recall']:.1%}, non-idk accept={idk_m['accept_rate_non_idk']:.1%}, "
+                f"est {idk_m['est_tok_per_sec']:.0f} tok/s")
+            log_file.write(f"{global_step},{epoch+1:.4f},{tokens_seen},"
+                           f"{avg_train:.6f},{avg_train:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e},"
+                           f"{idk_m['idk_rate']:.4f},{idk_m['idk_precision']:.4f},"
+                           f"{idk_m['idk_recall']:.4f},{idk_m['accept_rate_non_idk']:.4f}\n")
+        else:
+            val_loss, accept_rate, _ = eval_result
+            log(f"[{stage_label}] Epoch {epoch+1}/{total_epochs} done: "
+                f"train={avg_train:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
+                f"tokens={tokens_seen/1e6:.0f}M")
+            log_file.write(f"{global_step},{epoch+1:.4f},{tokens_seen},"
+                           f"{avg_train:.6f},{avg_train:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e}\n")
         log_file.flush()
 
-        save_checkpoint(val_loss, accept_rate, epoch)
+        save_checkpoint(val_loss, accept_rate, epoch,
+                        idk_metrics=idk_m if use_idk else None)
         mtp.train()
 
     elapsed = time.time() - t_start
     log_file.close()
-    log(f"\nTraining complete in {elapsed/60:.1f} min. "
-        f"Best val_loss={best_val:.4f}, best accept={best_accept:.1%}")
+    if use_idk:
+        log(f"\nTraining complete in {elapsed/60:.1f} min. "
+            f"Best val_loss={best_val:.4f}, best est_tok_s={best_accept:.0f}")
+    else:
+        log(f"\nTraining complete in {elapsed/60:.1f} min. "
+            f"Best val_loss={best_val:.4f}, best accept={best_accept:.1%}")
     log(f"Checkpoints: {out_dir}/best.pt, {out_dir}/best_accept.pt, {out_dir}/latest.pt")
 
 
@@ -891,21 +1100,22 @@ def train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def export(args: argparse.Namespace) -> None:
-    """Export trained MTP weights to GWMT v3 format for GWEN inference.
+    """Export trained MTP weights to GWMT v3/v4 format for GWEN inference.
 
     GWMT v3 format:
         Header: "GWMT" [uint32 version=3] [uint32 n_tensors]
         Tensors: for each tensor: [name_len][name][dtype][ndims][shape...][data_size][data]
         Footer: [uint32 K] [int32 restricted_ids[K]]
 
-    The footer embeds the restricted vocab mapping so the CUDA loader knows
-    which token IDs the lm_head indices map to.
+    GWMT v4 format (IDK):
+        Same as v3, but lm_head is [K+1, 1024] and footer has extra [uint8 has_idk=1]
     """
 
     ckpt_path = Path(args.checkpoint)
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     state_dict = ckpt["model"]
     vocab_k = ckpt.get("vocab_k", 20000)
+    has_idk = ckpt.get("has_idk", False)
 
     output = Path(args.output) if args.output else ckpt_path.parent / "mtp_finetuned.bin"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -917,6 +1127,9 @@ def export(args: argparse.Namespace) -> None:
 
     DTYPE_F32 = 0
     DTYPE_F16 = 1
+
+    # Version: 4 if IDK, 3 otherwise
+    version = 4 if has_idk else 3
 
     name_map = {
         "fc.weight": "mtp.fc.weight",
@@ -952,11 +1165,12 @@ def export(args: argparse.Namespace) -> None:
         lm_data = state_dict["lm_head.weight"].half().numpy()
         tensors.append(("mtp.lm_head.weight", lm_data, DTYPE_F16))
 
-    log(f"Exporting {len(tensors)} tensors to {output} (GWMT v3, K={vocab_k})")
+    log(f"Exporting {len(tensors)} tensors to {output} (GWMT v{version}, K={vocab_k}"
+        f"{', IDK' if has_idk else ''})")
 
     with open(output, "wb") as f:
         f.write(b"GWMT")
-        f.write(struct.pack("<I", 3))  # version 3
+        f.write(struct.pack("<I", version))
         f.write(struct.pack("<I", len(tensors)))
 
         total_bytes = 0
@@ -975,18 +1189,29 @@ def export(args: argparse.Namespace) -> None:
             size_str = f"{len(raw) / 1024:.1f} KB" if len(raw) < 1024 * 1024 else f"{len(raw) / 1024 / 1024:.2f} MB"
             log(f"  {name:<55} {str(data.shape):<20} {size_str}")
 
-        # v3 footer: restricted vocab mapping
+        # Footer: restricted vocab mapping
         f.write(struct.pack("<I", vocab_k))
         f.write(restricted_ids.astype(np.int32).tobytes())
         log(f"  restricted_ids                                        [{vocab_k}]              "
             f"{vocab_k * 4 / 1024:.1f} KB")
+
+        # v4 footer: has_idk flag
+        if version >= 4:
+            f.write(struct.pack("<B", 1))  # has_idk = true
+            log(f"  has_idk                                               1")
 
     file_size = output.stat().st_size
     log(f"\nSaved: {output} ({file_size / 1024 / 1024:.2f} MB)")
     accept = ckpt.get('accept_rate', None)
     accept_str = f"{accept:.1%}" if accept is not None else "?"
     log(f"  Vocab K={vocab_k}, epoch={ckpt.get('epoch', '?')}, "
-        f"val_loss={ckpt.get('val_loss', '?'):.4f}, accept_rate={accept_str}")
+        f"val_loss={ckpt.get('val_loss', '?'):.4f}, accept_rate={accept_str}"
+        f"{', IDK=true' if has_idk else ''}")
+
+
+# ---------------------------------------------------------------------------
+# Pre-compute IDK cache
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -1028,12 +1253,22 @@ def main():
                     help="Uniform noise on hidden state inputs (EAGLE regularization)")
     p.add_argument("--patience", type=int, default=3,
                     help="Early stopping patience (evals without val_loss improvement)")
-    p.add_argument("--eval-every", type=int, default=500,
+    p.add_argument("--eval-every", type=int, default=1000,
                     help="Eval + checkpoint every N optimizer steps")
+    p.add_argument("--eval-batches", type=int, default=0,
+                    help="Limit eval to N val cache batches (0 = use all)")
     p.add_argument("--val-fraction", type=float, default=0.05)
     p.add_argument("--from-pretrained", action="store_true", default=True)
     p.add_argument("--no-pretrained", dest="from_pretrained", action="store_false")
     p.add_argument("--resume", type=Path, help="Resume from checkpoint")
+    p.add_argument("--idk", action="store_true", default=False,
+                    help="Enable IDK token (K+1 output, absorbs OOV mass)")
+    p.add_argument("--temp-start", type=float, default=2.0,
+                    help="IDK mode: starting temperature (decays linearly)")
+    p.add_argument("--temp-end", type=float, default=1.0,
+                    help="IDK mode: ending temperature")
+    p.add_argument("--init-from", type=Path, default=None,
+                    help="Initialize weights from a checkpoint (e.g. v3 best.pt for IDK warm-start)")
 
     # --- export ---
     p = sub.add_parser("export", help="Export trained MTP to GWMT v3 binary")
