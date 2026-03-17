@@ -181,6 +181,95 @@ void gwen_rmsnorm_quantize_q8_1(const half* x, const float* weight, void* y_q8, 
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 
+// Batch2: process two independent vectors in a single launch (2 blocks × 256 threads)
+// blockIdx.x selects token A (0) or B (1). Weight is shared.
+__global__ void __launch_bounds__(256)
+kernel_rmsnorm_quantize_q8_1_batch2(
+        const half* __restrict__ x_a, const half* __restrict__ x_b,
+        const float* __restrict__ weight,
+        block_q8_1* __restrict__ y_q8_a, block_q8_1* __restrict__ y_q8_b,
+        half* __restrict__ y_fp16_a, half* __restrict__ y_fp16_b,
+        int dim, float eps) {
+    const half* x = (blockIdx.x == 0) ? x_a : x_b;
+    block_q8_1* y_q8 = (blockIdx.x == 0) ? y_q8_a : y_q8_b;
+    half* y_fp16 = (blockIdx.x == 0) ? y_fp16_a : y_fp16_b;
+
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += 256) {
+        float val = __half2float(x[i]);
+        sum_sq += val * val;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    __shared__ float warp_sums[8];
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        sum_sq = (lane < 8) ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1)
+            sum_sq += __shfl_xor_sync(0xFF, sum_sq, offset);
+    }
+
+    __shared__ float s_rms_inv;
+    if (tid == 0) s_rms_inv = rsqrtf(sum_sq / dim + eps);
+    __syncthreads();
+    float rms_inv = s_rms_inv;
+
+    int n_blocks = dim / 32;
+    int blocks_per_warp = (n_blocks + 7) / 8;
+
+    for (int bi = 0; bi < blocks_per_warp; bi++) {
+        int blk_idx = warp_id * blocks_per_warp + bi;
+        if (blk_idx >= n_blocks) break;
+
+        int elem_idx = blk_idx * 32 + lane;
+        float xv = __half2float(x[elem_idx]);
+        float val = xv * rms_inv * weight[elem_idx];
+
+        if (y_fp16) y_fp16[elem_idx] = __float2half(val);
+
+        float amax = fabsf(val);
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+
+        float d = amax / 127.0f;
+        float id = d > 0.0f ? 1.0f / d : 0.0f;
+        int8_t q = (int8_t)roundf(val * id);
+
+        float sum = (float)q;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+
+        y_q8[blk_idx].qs[lane] = q;
+        if (lane == 0)
+            y_q8[blk_idx].ds = __halves2half2(__float2half(d), __float2half(sum));
+    }
+}
+
+void gwen_rmsnorm_quantize_q8_1_batch2(
+        const half* x_a, const half* x_b,
+        const float* weight,
+        void* y_q8_a, void* y_q8_b,
+        half* y_fp16_a, half* y_fp16_b,
+        int dim, float eps, cudaStream_t stream) {
+    kernel_rmsnorm_quantize_q8_1_batch2<<<2, 256, 0, stream>>>(
+        x_a, x_b, weight,
+        static_cast<block_q8_1*>(y_q8_a), static_cast<block_q8_1*>(y_q8_b),
+        y_fp16_a, y_fp16_b, dim, eps);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
 void gwen_rmsnorm(const half* x, const half* weight, half* y,
                   int dim, float eps, cudaStream_t stream) {
     kernel_rmsnorm<<<1, 32, 0, stream>>>(x, weight, y, dim, eps);

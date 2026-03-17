@@ -173,6 +173,112 @@ void gwen_swiglu_quantize_q8_1(const half* gate, const half* up, void* y_q8, int
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 
+// Batch2: process two independent SwiGLU+Q8_1 in a single launch
+// blockIdx.y selects token A (0) or B (1)
+__global__ void __launch_bounds__(256)
+kernel_swiglu_quantize_q8_1_batch2(
+        const half* __restrict__ gate_a, const half* __restrict__ gate_b,
+        const half* __restrict__ up_a, const half* __restrict__ up_b,
+        block_q8_1* __restrict__ y_q8_a, block_q8_1* __restrict__ y_q8_b,
+        int n_blocks) {
+    const half* gate = (blockIdx.y == 0) ? gate_a : gate_b;
+    const half* up = (blockIdx.y == 0) ? up_a : up_b;
+    block_q8_1* y_q8 = (blockIdx.y == 0) ? y_q8_a : y_q8_b;
+
+    int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (warp_global >= n_blocks) return;
+
+    int base = warp_global * 32 + lane;
+
+    float g = __half2float(gate[base]);
+    float u = __half2float(up[base]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    float val = g * sig * u;
+
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int8_t q = (int8_t)roundf(val * id);
+
+    float sum = (float)q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+
+    y_q8[warp_global].qs[lane] = q;
+    if (lane == 0)
+        y_q8[warp_global].ds = __halves2half2(__float2half(d), __float2half(sum));
+}
+
+void gwen_swiglu_quantize_q8_1_batch2(
+        const half* gate_a, const half* gate_b,
+        const half* up_a, const half* up_b,
+        void* y_q8_a, void* y_q8_b,
+        int n, cudaStream_t stream) {
+    int n_blocks = n / 32;
+    int grid_x = (n_blocks + 7) / 8;
+    dim3 grid(grid_x, 2);
+    kernel_swiglu_quantize_q8_1_batch2<<<grid, 256, 0, stream>>>(
+        gate_a, gate_b, up_a, up_b,
+        static_cast<block_q8_1*>(y_q8_a), static_cast<block_q8_1*>(y_q8_b),
+        n_blocks);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+// Batch2: quantize two independent FP16 vectors to Q8_1 in a single launch
+__global__ void __launch_bounds__(256)
+kernel_quantize_q8_1_batch2(
+        const half* __restrict__ x_a, const half* __restrict__ x_b,
+        block_q8_1* __restrict__ y_a, block_q8_1* __restrict__ y_b,
+        int n_blocks) {
+    const half* x = (blockIdx.y == 0) ? x_a : x_b;
+    block_q8_1* y = (blockIdx.y == 0) ? y_a : y_b;
+
+    int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (warp_global >= n_blocks) return;
+
+    int base = warp_global * 32 + lane;
+    float val = __half2float(x[base]);
+
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int8_t q = (int8_t)roundf(val * id);
+
+    float sum = (float)q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+
+    y[warp_global].qs[lane] = q;
+    if (lane == 0)
+        y[warp_global].ds = __halves2half2(__float2half(d), __float2half(sum));
+}
+
+void gwen_quantize_q8_1_batch2(
+        const half* x_a, const half* x_b,
+        void* y_q8_a, void* y_q8_b,
+        int n, cudaStream_t stream) {
+    int n_blocks = n / 32;
+    int grid_x = (n_blocks + 7) / 8;
+    dim3 grid(grid_x, 2);
+    kernel_quantize_q8_1_batch2<<<grid, 256, 0, stream>>>(
+        x_a, x_b,
+        static_cast<block_q8_1*>(y_q8_a), static_cast<block_q8_1*>(y_q8_b),
+        n_blocks);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
 void gwen_sigmoid(const half* x, half* y, int n, cudaStream_t stream) {
     int blocks = (n + 255) / 256;
     kernel_sigmoid<<<blocks, 256, 0, stream>>>(x, y, n);

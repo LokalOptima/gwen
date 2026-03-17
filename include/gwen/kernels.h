@@ -111,6 +111,12 @@ void gwen_rmsnorm_f32w(const half* x, const float* weight, half* y,
 void gwen_rmsnorm_quantize_q8_1(const half* x, const float* weight, void* y_q8, half* y_fp16,
                                   int dim, float eps, cudaStream_t stream = 0);
 
+// Batch2: fused RMSNorm + Q8_1 for two independent vectors in one launch
+void gwen_rmsnorm_quantize_q8_1_batch2(
+        const half* x_a, const half* x_b, const float* weight,
+        void* y_q8_a, void* y_q8_b, half* y_fp16_a, half* y_fp16_b,
+        int dim, float eps, cudaStream_t stream = 0);
+
 // Batched RMSNorm: normalize n_vecs vectors of length dim
 // x: [n_vecs, dim], y: [n_vecs, dim], weight: [dim] (shared across vectors)
 void gwen_rmsnorm_batched_f32w(const half* x, const float* weight, half* y,
@@ -131,6 +137,19 @@ void gwen_swiglu(const half* gate, const half* up, half* y, int n, cudaStream_t 
 
 // Fused SwiGLU + Q8_1 quantize: computes SwiGLU and writes Q8_1 directly (skips FP16 intermediate)
 void gwen_swiglu_quantize_q8_1(const half* gate, const half* up, void* y_q8, int n, cudaStream_t stream = 0);
+
+// Batch2: fused SwiGLU + Q8_1 for two independent inputs in one launch
+void gwen_swiglu_quantize_q8_1_batch2(
+        const half* gate_a, const half* gate_b,
+        const half* up_a, const half* up_b,
+        void* y_q8_a, void* y_q8_b,
+        int n, cudaStream_t stream = 0);
+
+// Batch2: Q8_1 quantize two independent FP16 vectors in one launch
+void gwen_quantize_q8_1_batch2(
+        const half* x_a, const half* x_b,
+        void* y_q8_a, void* y_q8_b,
+        int n, cudaStream_t stream = 0);
 
 // Sigmoid: y = 1 / (1 + exp(-x))
 void gwen_sigmoid(const half* x, half* y, int n, cudaStream_t stream = 0);

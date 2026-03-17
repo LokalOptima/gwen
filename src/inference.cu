@@ -245,6 +245,82 @@ kernel_gated_rmsnorm_quantize_q8_1(
         y_q8[out_blk].ds = __halves2half2(__float2half(d), __float2half(sum));
 }
 
+// Batch2: process two independent gated RMSNorm + Q8_1 in one launch
+// blockIdx.x = head index, blockIdx.y = token (0=A, 1=B)
+__global__ void __launch_bounds__(128)
+kernel_gated_rmsnorm_quantize_q8_1_batch2(
+    const half* __restrict__ x_a, const half* __restrict__ x_b,
+    const float* __restrict__ weight,
+    const half* __restrict__ gate_a, const half* __restrict__ gate_b,
+    block_q8_1* __restrict__ y_q8_a, block_q8_1* __restrict__ y_q8_b,
+    int n_heads, int dim_per_head, float eps)
+{
+    const half* x = (blockIdx.y == 0) ? x_a : x_b;
+    const half* gate = (blockIdx.y == 0) ? gate_a : gate_b;
+    block_q8_1* y_q8 = (blockIdx.y == 0) ? y_q8_a : y_q8_b;
+
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int offset_base = head * dim_per_head;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim_per_head; i += 128) {
+        float val = __half2float(x[offset_base + i]);
+        sum_sq += val * val;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+
+    __shared__ float warp_sums[4];
+    if (lane == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+        s_rms_inv = rsqrtf(total / dim_per_head + eps);
+    }
+    __syncthreads();
+    float rms_inv = s_rms_inv;
+
+    int blocks_per_head = dim_per_head / 32;
+    int blk_idx = warp_id;
+    if (blk_idx >= blocks_per_head) return;
+
+    int elem_idx = offset_base + blk_idx * 32 + lane;
+    int local_idx = blk_idx * 32 + lane;
+
+    float x_val = __half2float(x[elem_idx]) * rms_inv;
+    float w = weight[local_idx];
+    float g = __half2float(gate[elem_idx]);
+    float silu_g = g / (1.0f + expf(-g));
+    float val = x_val * w * silu_g;
+
+    float amax = fabsf(val);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int8_t q = (int8_t)roundf(val * id);
+
+    float sum = (float)q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+
+    int out_blk = head * blocks_per_head + blk_idx;
+    y_q8[out_blk].qs[lane] = q;
+    if (lane == 0)
+        y_q8[out_blk].ds = __halves2half2(__float2half(d), __float2half(sum));
+}
+
 // ============================================================
 // Gate/Beta computation for DeltaNet
 // ============================================================
@@ -2341,11 +2417,12 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             int dn_idx = dn_state_idx++;
             auto& state = deltanet_states[dn_idx];
 
-            // --- RMSNorm + Q8_1 quantize for both tokens ---
-            gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-            gwen_rmsnorm_quantize_q8_1(b2_buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              b2_x_q8_a, b2_x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm + Q8_1 quantize for both tokens ---
+            gwen_rmsnorm_quantize_q8_1_batch2(
+                              buf_a, b2_buf_a,
+                              static_cast<const float*>(w.attn_norm.device_data),
+                              x_q8_a, b2_x_q8_a, x_norm, b2_x_norm,
+                              cfg.n_embed, cfg.rms_norm_eps, s);
 
             // --- Batch2 GEMV: QKV and gate projections (read weights once) ---
             gwen_gemv_dp4a_batch2(w.attn_qkv.device_data, x_q8_a, b2_x_q8_a,
@@ -2416,26 +2493,28 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 state.S, qb, kb, vb, d_alpha, d_beta,
                 b2_attn_out, nullptr, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
 
-            // --- Gated RMSNorm + Q8_1 for both tokens ---
-            kernel_gated_rmsnorm_quantize_q8_1<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                attn_out, static_cast<const float*>(w.ssm_norm.device_data),
-                gate_z, static_cast<block_q8_1*>(x_q8_b),
-                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
-            kernel_gated_rmsnorm_quantize_q8_1<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                b2_attn_out, static_cast<const float*>(w.ssm_norm.device_data),
-                b2_gate_z, static_cast<block_q8_1*>(b2_x_q8_b),
-                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
+            // --- Batch2 Gated RMSNorm + Q8_1 for both tokens ---
+            {
+                dim3 grid(cfg.ssm_n_heads, 2);
+                kernel_gated_rmsnorm_quantize_q8_1_batch2<<<grid, 128, 0, s>>>(
+                    attn_out, b2_attn_out,
+                    static_cast<const float*>(w.ssm_norm.device_data),
+                    gate_z, b2_gate_z,
+                    static_cast<block_q8_1*>(x_q8_b), static_cast<block_q8_1*>(b2_x_q8_b),
+                    cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
+            }
 
             // --- Batch2 GEMV: ssm_out with residual ---
             gwen_gemv_dp4a_residual_batch2(w.ssm_out.device_data, x_q8_b, b2_x_q8_b,
                       buf_b, b2_buf_b, buf_a, b2_buf_a,
                       w.ssm_out.shape[1], w.ssm_out.shape[0], w.ssm_out.type, s);
 
-            // --- RMSNorm + Q8_1 for both tokens (FFN input) ---
-            gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
-            gwen_rmsnorm_quantize_q8_1(b2_buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              b2_x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm + Q8_1 for both tokens (FFN input) ---
+            gwen_rmsnorm_quantize_q8_1_batch2(
+                              buf_b, b2_buf_b,
+                              static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_q8_a, b2_x_q8_a, nullptr, nullptr,
+                              cfg.n_embed, cfg.rms_norm_eps, s);
 
             // --- Batch2 GEMV: FFN gate and up ---
             gwen_gemv_dp4a_batch2(w.ffn_gate.device_data, x_q8_a, b2_x_q8_a,
@@ -2445,9 +2524,10 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                       ffn_up, b2_ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
 
-            // --- SwiGLU + Q8_1 for both tokens ---
-            gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
-            gwen_swiglu_quantize_q8_1(b2_ffn_gate, b2_ffn_up, b2_x_q8_b, cfg.n_ff, s);
+            // --- Batch2 SwiGLU + Q8_1 for both tokens ---
+            gwen_swiglu_quantize_q8_1_batch2(ffn_gate, b2_ffn_gate,
+                      ffn_up, b2_ffn_up,
+                      x_q8_b, b2_x_q8_b, cfg.n_ff, s);
 
             // --- Batch2 GEMV: FFN down with residual ---
             gwen_gemv_dp4a_residual_batch2(w.ffn_down.device_data, x_q8_b, b2_x_q8_b,
@@ -2458,11 +2538,12 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            // --- RMSNorm + Q8_1 for both tokens ---
-            gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
-            gwen_rmsnorm_quantize_q8_1(b2_buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              b2_x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm + Q8_1 for both tokens ---
+            gwen_rmsnorm_quantize_q8_1_batch2(
+                              buf_a, b2_buf_a,
+                              static_cast<const float*>(w.attn_norm.device_data),
+                              x_q8_a, b2_x_q8_a, nullptr, nullptr,
+                              cfg.n_embed, cfg.rms_norm_eps, s);
 
             // --- Batch2 GEMV: Q, K, V projections ---
             gwen_gemv_dp4a_batch2(w.attn_q.device_data, x_q8_a, b2_x_q8_a,
@@ -2537,18 +2618,19 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 gwen_sigmoid_mul(b2_attn_out, b2_gated_out, b2_gated_out, attn_dim, s);
             }
 
-            // --- Quantize gated outputs + batch2 output proj with residual ---
-            gwen_quantize_q8_1(gated_out, x_q8_b, cfg.n_head * cfg.head_dim, s);
-            gwen_quantize_q8_1(b2_gated_out, b2_x_q8_b, cfg.n_head * cfg.head_dim, s);
+            // --- Batch2 quantize gated outputs + batch2 output proj with residual ---
+            gwen_quantize_q8_1_batch2(gated_out, b2_gated_out,
+                      x_q8_b, b2_x_q8_b, cfg.n_head * cfg.head_dim, s);
             gwen_gemv_dp4a_residual_batch2(w.attn_output.device_data, x_q8_b, b2_x_q8_b,
                       buf_b, b2_buf_b, buf_a, b2_buf_a,
                       w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type, s);
 
-            // --- RMSNorm + Q8_1 for FFN ---
-            gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
-            gwen_rmsnorm_quantize_q8_1(b2_buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              b2_x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm + Q8_1 for FFN ---
+            gwen_rmsnorm_quantize_q8_1_batch2(
+                              buf_b, b2_buf_b,
+                              static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_q8_a, b2_x_q8_a, nullptr, nullptr,
+                              cfg.n_embed, cfg.rms_norm_eps, s);
 
             // --- Batch2 GEMV: FFN ---
             gwen_gemv_dp4a_batch2(w.ffn_gate.device_data, x_q8_a, b2_x_q8_a,
@@ -2557,8 +2639,9 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             gwen_gemv_dp4a_batch2(w.ffn_up.device_data, x_q8_a, b2_x_q8_a,
                       ffn_up, b2_ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
-            gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
-            gwen_swiglu_quantize_q8_1(b2_ffn_gate, b2_ffn_up, b2_x_q8_b, cfg.n_ff, s);
+            gwen_swiglu_quantize_q8_1_batch2(ffn_gate, b2_ffn_gate,
+                      ffn_up, b2_ffn_up,
+                      x_q8_b, b2_x_q8_b, cfg.n_ff, s);
             gwen_gemv_dp4a_residual_batch2(w.ffn_down.device_data, x_q8_b, b2_x_q8_b,
                       buf_a, b2_buf_a, buf_b, b2_buf_b,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
