@@ -90,7 +90,7 @@ void Model::load_mtp(const std::string& mtp_path) {
     uint32_t version, n_tensors;
     f.read(reinterpret_cast<char*>(&version), 4);
     f.read(reinterpret_cast<char*>(&n_tensors), 4);
-    GWEN_CHECK(version == 1, "Unsupported MTP file version");
+    GWEN_CHECK(version >= 1 && version <= 3, "Unsupported MTP file version (expected 1-3)");
 
     printf("Loading MTP weights: %u tensors from %s\n", n_tensors, mtp_path.c_str());
 
@@ -166,6 +166,14 @@ void Model::load_mtp(const std::string& mtp_path) {
             mtp.layer.ffn_down = w;
         } else if (name == "mtp.norm.weight") {
             mtp.output_norm = w;
+        } else if (name == "mtp.lm_head.weight") {
+            // Reduced lm_head from fine-tuning — wire into reduced_lm_head
+            reduced_lm_head.weights = w;
+            reduced_lm_head.type = w.type;
+            // For FP16: row_bytes = n_embed * 2
+            if (w.type == GGMLType::F16) {
+                reduced_lm_head.row_bytes = config.n_embed * 2;
+            }
         } else {
             printf("  Warning: unknown MTP tensor: %s\n", name.c_str());
         }
@@ -184,6 +192,21 @@ void Model::load_mtp(const std::string& mtp_path) {
 
     has_mtp = true;
     printf("MTP weights loaded: %.1f MB total\n", total_bytes / 1024.0 / 1024.0);
+
+    // v3 footer: restricted vocab mapping [K, restricted_ids[K]]
+    if (version >= 3 && f.peek() != EOF) {
+        uint32_t K;
+        f.read(reinterpret_cast<char*>(&K), 4);
+        if (K > 0) {
+            reduced_lm_head.token_ids.resize(K);
+            f.read(reinterpret_cast<char*>(reduced_lm_head.token_ids.data()), K * sizeof(int32_t));
+            reduced_lm_head.K = K;
+            // lm_head weights are in MTP tensors (mtp.lm_head.weight), FP16
+            // The reduced_lm_head.weights will be set during upload from the MTP lm_head tensor
+            has_reduced_lm_head = true;
+            printf("GWMT v3: restricted vocab K=%u embedded in MTP file\n", K);
+        }
+    }
 }
 
 // ============================================================

@@ -159,6 +159,10 @@ struct InferenceState {
     // output_host: [B * L * n_embed] FP16 hidden states (host)
     void extract_hidden_batch(Model& model, const int32_t* all_tokens, int B, int L, void* output_host);
 
+    // Dev server: restricted embed for teacher logit computation
+    half* restricted_embed_fp16 = nullptr;  // [K, n_embed] FP16 on GPU (persistent)
+    int restricted_vocab_K = 0;             // number of restricted vocab entries
+
     // Compute main model predictions from hidden states on GPU (after extract_hidden_batch).
     // Applies output_norm + lm_head (embed_tokens GEMV) + argmax per token.
     // hidden_gpu: [N, n_embed] FP16 on GPU (e.g., pf_a after batch extraction)

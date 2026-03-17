@@ -57,6 +57,18 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/src/server.cpp)
         ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib)
 endif()
 
+# --- Dev Server executable (MTP v3 training) ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/dev_server.cpp)
+    find_package(CUDAToolkit REQUIRED)
+    find_package(Threads REQUIRED)
+    add_executable(gwen_dev_server src/dev_server.cpp
+        ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib/httplib.cpp)
+    target_link_libraries(gwen_dev_server gwen_core CUDA::cudart Threads::Threads)
+    target_include_directories(gwen_dev_server PRIVATE
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/vendor/cpp-httplib)
+endif()
+
 # --- Micro-benchmark ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/bench/micro_bench.cu)
     add_executable(micro_bench bench/micro_bench.cu)

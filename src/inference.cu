@@ -2658,6 +2658,63 @@ int InferenceState::forward(Model& model, int token_id) {
 // ============================================================
 // Prefill — process all prompt tokens, using GEMM for projections
 // ============================================================
+// Row dequantization: extract K rows from Q6K table → FP16
+// ============================================================
+// Same dequant math as kernel_embed_lookup_batch_q6k, but uses a row_ids
+// indirection array instead of sequential token IDs.
+// Grid: (1, K), Block: 256 — one block per row.
+
+__global__ void __launch_bounds__(256)
+kernel_dequant_rows_q6k(const void* __restrict__ table,
+                         const int* __restrict__ row_ids,
+                         half* __restrict__ dst,
+                         int dim, int K) {
+    int row_idx = blockIdx.y;
+    if (row_idx >= K) return;
+
+    int token_id = row_ids[row_idx];
+    int blocks_per_row = dim / 256;
+    int tid = threadIdx.x;
+
+    for (int blk_local = 0; blk_local < blocks_per_row; blk_local++) {
+        int blk_idx = token_id * blocks_per_row + blk_local;
+        const uint8_t* base = static_cast<const uint8_t*>(table) + (size_t)blk_idx * 210;
+
+        const uint8_t* ql = base;
+        const uint8_t* qh = base + 128;
+        const int8_t* scales = reinterpret_cast<const int8_t*>(base + 192);
+        half d_half;
+        memcpy(&d_half, base + 208, sizeof(half));
+        float d = __half2float(d_half);
+
+        int half_idx = tid / 128;
+        int j = tid % 128;
+        int quarter = j / 32;
+        int pos = j % 32;
+
+        int ql_byte = half_idx * 64 + (quarter & 1) * 32 + pos;
+        int ql_nibble = (quarter >= 2) ? (ql[ql_byte] >> 4) : (ql[ql_byte] & 0xF);
+
+        int qh_byte = half_idx * 32 + pos;
+        int qh_shift = quarter * 2;
+        int qh_bits = (qh[qh_byte] >> qh_shift) & 0x3;
+
+        int q_val = ql_nibble | (qh_bits << 4);
+        int scale_idx = half_idx * 8 + quarter * 2 + pos / 16;
+        int8_t scale = scales[scale_idx];
+        float result = d * scale * (q_val - 32);
+        dst[(size_t)row_idx * dim + blk_local * 256 + tid] = __float2half(result);
+    }
+}
+
+void gwen_dequant_rows_q6k(const void* table, const int* row_ids, half* dst,
+                            int K, int dim, cudaStream_t stream) {
+    dim3 grid(1, K);
+    kernel_dequant_rows_q6k<<<grid, 256, 0, stream>>>(table, row_ids, dst, dim, K);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+// ============================================================
 // Strategy: batch GEMMs for linear projections, sequential for state-dependent ops.
 // Layout: prefill_x[t, dim] = hidden state of token t
 

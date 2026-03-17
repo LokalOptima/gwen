@@ -223,4 +223,27 @@ void gwen_gemm_f32out(const void* W_quant, GGMLType type,
                        int out_features, int in_features, int seq_len,
                        cudaStream_t stream = 0);
 
+// ============================================================
+// Row dequantization (selective rows from quantized matrix)
+// ============================================================
+
+// Dequantize K specific rows from a Q6_K embedding table to FP16.
+// table: quantized embedding [n_vocab, dim] in Q6_K format
+// row_ids: [K] int32 token IDs (device pointer) specifying which rows to extract
+// dst: [K, dim] FP16 output (device pointer, contiguous)
+// K: number of rows to dequantize
+// dim: embedding dimension (must be multiple of 256)
+void gwen_dequant_rows_q6k(const void* table, const int* row_ids, half* dst,
+                            int K, int dim, cudaStream_t stream = 0);
+
+// ============================================================
+// FP16 GEMM (no dequant — weights already in FP16)
+// ============================================================
+
+// y[seq_len, out] = x[seq_len, in] * W^T[in, out]
+// W_fp16: [out_features, in_features] FP16 (already dequantized)
+void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
+                     int out_features, int in_features, int seq_len,
+                     cudaStream_t stream = 0);
+
 } // namespace gwen

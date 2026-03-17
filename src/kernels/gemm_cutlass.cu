@@ -105,4 +105,28 @@ void gwen_gemm_f32out(const void* W_quant, GGMLType type,
     GWEN_CHECK(status == cutlass::Status::kSuccess, "CUTLASS GEMM F32 output failed");
 }
 
+// FP16 weight GEMM: same as gwen_gemm but weights are already FP16 (no dequant).
+// Used for restricted_embed and fine-tuned lm_head where weights are stored as FP16.
+// Reuses the same CutlassGemm type — just skips the dequant step.
+void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
+                     int out_features, int in_features, int seq_len,
+                     cudaStream_t stream) {
+    int M = out_features;
+    int N = seq_len;
+    int K = in_features;
+
+    CutlassGemm gemm_op;
+    CutlassGemm::Arguments args(
+        {M, N, K},
+        {reinterpret_cast<const cutlass::half_t*>(W_fp16), K},  // A: [M, K] RowMajor
+        {reinterpret_cast<const cutlass::half_t*>(x), K},       // B: [K, N] ColumnMajor
+        {reinterpret_cast<cutlass::half_t*>(y), M},             // C: [M, N] ColumnMajor
+        {reinterpret_cast<cutlass::half_t*>(y), M},             // D: [M, N] ColumnMajor
+        {1.0f, 0.0f}
+    );
+
+    cutlass::Status status = gemm_op(args, nullptr, stream);
+    GWEN_CHECK(status == cutlass::Status::kSuccess, "CUTLASS GEMM FP16 failed");
+}
+
 } // namespace gwen
