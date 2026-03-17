@@ -500,13 +500,18 @@ kernel_deltanet_fused(
     __shared__ float warp_buf[4];
     __shared__ float s_q_inv, s_k_inv, s_decay, s_beta;
 
-    // ---- Load S from global → shared memory ----
+    // ---- Async load S from global → shared (overlapped with Phase 1-2) ----
     float* S_head = S + head * dk * dk;
+    // cp.async copies 4 bytes per thread, directly global→shared, non-blocking
+    #pragma unroll 4
     for (int i = 0; i < 128 * 128; i += 128) {
-        sh_S[i + tid] = S_head[i + tid];
+        uint32_t smem_addr_val = __cvta_generic_to_shared(&sh_S[i + tid]);
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                     :: "r"(smem_addr_val), "l"(&S_head[i + tid]));
     }
+    asm volatile("cp.async.commit_group;\n");
 
-    // ---- Phase 1: L2-normalize Q and K ----
+    // ---- Phase 1: L2-normalize Q and K (overlapped with S load) ----
     float q_val = __half2float(q[tid]);
     float k_val = __half2float(k[tid]);
 
@@ -539,7 +544,7 @@ kernel_deltanet_fused(
     sh_q[tid] = q_val * s_q_inv;
     sh_k[tid] = k_val * s_k_inv;
 
-    // ---- Phase 2: Compute gate and beta ----
+    // ---- Phase 2: Compute gate and beta (still overlapped with S load) ----
     const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
     const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
     int blocks_per_head = n_embed / 32;
@@ -573,6 +578,9 @@ kernel_deltanet_fused(
         s_decay = expf(ssm_a[head] * sp);
         s_beta = 1.0f / (1.0f + expf(-total_beta));
     }
+
+    // ---- Wait for async S load to complete before Phase 3 ----
+    asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
 
     // ---- Phase 3: S update in shared memory (~4 cycle access vs ~200 from L2) ----
