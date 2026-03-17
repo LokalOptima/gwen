@@ -2123,8 +2123,9 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     x_q8_a = a(q8_blocks * 36);  // 36 bytes per block_q8_1
     x_q8_b = a(q8_blocks * 36);
 
-    // Pre-allocated argmax result and graph-compatible device scalars
-    d_argmax_token = static_cast<int*>(a(sizeof(int)));
+    // Pre-allocated argmax results: d_argmax_token[0] = token A, d_argmax_token[1] = token B
+    // Adjacent allocation so forward_2tok can read both in one 8-byte D2H memcpy
+    d_argmax_token = static_cast<int*>(a(2 * sizeof(int)));
     argmax_partial_max = static_cast<float*>(a(ARGMAX_BLOCKS * sizeof(float)));
     argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
     // d_token_id layout: [tok_a, pos_a, tok_b, pos_b] — 4 ints for batch2 support
@@ -2404,7 +2405,8 @@ void InferenceState::allocate_batch2(const ModelConfig& cfg, CudaAllocator& allo
     b2_x_q8_a = a(q8_blocks * 36);
     b2_x_q8_b = a(q8_blocks * 36);
 
-    b2_d_argmax = static_cast<int*>(a(sizeof(int)));
+    // b2_d_argmax is adjacent to d_argmax_token (allocated as 2 ints in allocate())
+    b2_d_argmax = d_argmax_token + 1;
     b2_argmax_partial_max = static_cast<float*>(a(ARGMAX_BLOCKS * sizeof(float)));
     b2_argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
 
@@ -2991,9 +2993,9 @@ std::pair<int,int> InferenceState::forward_2tok(Model& model, int token_id_a, in
     GWEN_CHECK_CUDA(cudaGraphLaunch(graph_2tok_exec, compute_stream));
     GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 
+    // d_argmax_token[0] = pred_a, d_argmax_token[1] = pred_b (adjacent in device memory)
     int results[2];
-    GWEN_CHECK_CUDA(cudaMemcpy(&results[0], d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
-    GWEN_CHECK_CUDA(cudaMemcpy(&results[1], b2_d_argmax, sizeof(int), cudaMemcpyDeviceToHost));
+    GWEN_CHECK_CUDA(cudaMemcpy(results, d_argmax_token, 2 * sizeof(int), cudaMemcpyDeviceToHost));
 
     pos += 2;
     return {results[0], results[1]};
