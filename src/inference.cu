@@ -322,7 +322,154 @@ kernel_gated_rmsnorm_quantize_q8_1_batch2(
 }
 
 // ============================================================
-// Gate/Beta computation for DeltaNet
+// Fused DeltaNet state update: L2-norm(Q,K) + gate/beta + S update
+// ============================================================
+// Replaces 4 separate kernels (2× l2_normalize, compute_gate_beta, deltanet_decode)
+// with a single launch: 16 blocks × 128 threads (one block per head).
+//
+// Phase 1: L2-normalize Q and K (128 threads, 1 element each for dk=128)
+// Phase 2: Compute gate and beta (128 threads over 1024 x_norm elements)
+// Phase 3: DeltaNet S matrix update + output (128 threads, 1 column each)
+__global__ void __launch_bounds__(128)
+kernel_deltanet_fused(
+    float* __restrict__ S,              // [n_heads, dk, dk] recurrent state
+    half* __restrict__ q_in,            // [n_heads * dk] Q from conv1d (modified in-place)
+    half* __restrict__ k_in,            // [n_heads * dk] K from conv1d (modified in-place)
+    const half* __restrict__ v_in,      // [n_heads * dk] V from conv1d
+    const half* __restrict__ x_norm,    // [n_embed] pre-attention norm (for gate/beta)
+    const void* __restrict__ alpha_w,   // Q8_0 [n_heads * n_embed/32 blocks]
+    const void* __restrict__ beta_w,    // Q8_0 [n_heads * n_embed/32 blocks]
+    const float* __restrict__ ssm_a,    // [n_heads]
+    const float* __restrict__ dt_bias,  // [n_heads]
+    half* __restrict__ output,          // [n_heads * dk]
+    float q_scale,                      // 1/sqrt(dk) for Q normalization
+    int n_heads, int dk, int n_embed)
+{
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int tid = threadIdx.x;  // 0..127
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+
+    half* q = q_in + head * dk;
+    half* k = k_in + head * dk;
+
+    // ---- Phase 1: L2-normalize Q and K ----
+    float q_val = __half2float(q[tid]);
+    float k_val = __half2float(k[tid]);
+
+    // Q: sum-of-squares reduction (128 threads → 4 warps)
+    float q_sq = q_val * q_val;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, o);
+
+    __shared__ float warp_buf[4];
+    if (lane == 0) warp_buf[warp_id] = q_sq;
+    __syncthreads();
+
+    __shared__ float s_q_inv, s_k_inv;
+    if (tid == 0) {
+        float total = warp_buf[0] + warp_buf[1] + warp_buf[2] + warp_buf[3];
+        s_q_inv = rsqrtf(fmaxf(total, 1e-12f)) * q_scale;
+    }
+    __syncthreads();
+
+    // K: sum-of-squares reduction
+    float k_sq = k_val * k_val;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, o);
+
+    if (lane == 0) warp_buf[warp_id] = k_sq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = warp_buf[0] + warp_buf[1] + warp_buf[2] + warp_buf[3];
+        s_k_inv = rsqrtf(fmaxf(total, 1e-12f));
+    }
+    __syncthreads();
+
+    // Normalize and store to shared memory for Phase 3
+    __shared__ float sh_q[128], sh_k[128];
+    sh_q[tid] = q_val * s_q_inv;
+    sh_k[tid] = k_val * s_k_inv;
+
+    // ---- Phase 2: Compute gate and beta ----
+    // Dot product x_norm[1024] with Q8_0 alpha/beta weights
+    // 128 threads each handle 8 elements (1024/128)
+    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
+    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
+    int blocks_per_head = n_embed / 32;
+
+    float alpha_acc = 0.0f;
+    float beta_acc = 0.0f;
+    for (int i = tid; i < n_embed; i += 128) {
+        int blk = i / 32;
+        int elem = i % 32;
+        int blk_idx = head * blocks_per_head + blk;
+        float ad = __half2float(alpha_blocks[blk_idx].d);
+        float bd = __half2float(beta_blocks[blk_idx].d);
+        float x_val = __half2float(x_norm[i]);
+        alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
+        beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+    }
+
+    // 128-thread reduction
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        alpha_acc += __shfl_xor_sync(0xFFFFFFFF, alpha_acc, o);
+        beta_acc += __shfl_xor_sync(0xFFFFFFFF, beta_acc, o);
+    }
+
+    __shared__ float sh_alpha[4], sh_beta[4];
+    if (lane == 0) {
+        sh_alpha[warp_id] = alpha_acc;
+        sh_beta[warp_id] = beta_acc;
+    }
+    __syncthreads();
+
+    __shared__ float s_decay, s_beta;
+    if (tid == 0) {
+        float total_alpha = sh_alpha[0] + sh_alpha[1] + sh_alpha[2] + sh_alpha[3];
+        float total_beta = sh_beta[0] + sh_beta[1] + sh_beta[2] + sh_beta[3];
+
+        float alpha_biased = total_alpha + dt_bias[head];
+        float sp = (alpha_biased > 20.0f) ? alpha_biased : logf(1.0f + expf(alpha_biased));
+        s_decay = expf(ssm_a[head] * sp);
+        s_beta = 1.0f / (1.0f + expf(-total_beta));
+    }
+    __syncthreads();
+
+    // ---- Phase 3: DeltaNet S update ----
+    float decay = s_decay;
+    float b = s_beta;
+    float* S_head = S + head * dk * dk;
+
+    // Pass 1: Decay S and compute sk[j] = sum_i (decay * S[i][j]) * k[i]
+    float sk_j = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; i++) {
+        float val = S_head[i * 128 + tid] * decay;
+        S_head[i * 128 + tid] = val;
+        sk_j += val * sh_k[i];
+    }
+
+    // Pass 2: Update S and compute o[j] = sum_i S_updated[i][j] * q[i]
+    float d_j = (__half2float(v_in[head * dk + tid]) - sk_j) * b;
+    float o_j = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; i++) {
+        float updated = S_head[i * 128 + tid] + sh_k[i] * d_j;
+        S_head[i * 128 + tid] = updated;
+        o_j += updated * sh_q[i];
+    }
+
+    output[head * dk + tid] = __float2half(o_j);
+}
+
+// ============================================================
+// Gate/Beta computation for DeltaNet (standalone, for prefill path)
 // ============================================================
 // gate_i = ssm_a_i * softplus(alpha_proj_i + dt_bias_i)
 //   where alpha_proj_i = dot(ssm_alpha_weight[i, :], x)
@@ -2252,20 +2399,14 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             half* k = qkv + cfg.ssm_inner_size;
             half* v = qkv + 2 * cfg.ssm_inner_size;
 
-            gwen_l2_normalize(q, q, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
-            gwen_l2_normalize(k, k, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
-
-            kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
-                x_norm,
+            // Fused: L2-norm(Q,K) + gate/beta + S update
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                state.S, q, k, v, x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
-                d_alpha, d_beta,
-                cfg.n_embed, cfg.ssm_n_heads);
-
-            kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                state.S, q, k, v, d_alpha, d_beta,
-                attn_out, nullptr, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+                attn_out, q_scale,
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
 
             // Fused gated RMSNorm + Q8_1 quantize
             kernel_gated_rmsnorm_quantize_q8_1<<<cfg.ssm_n_heads, 128, 0, s>>>(
@@ -2442,18 +2583,15 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 qkv_dim, cfg.ssm_conv_kernel);
 
             half *qa = qkv, *ka = qkv + cfg.ssm_inner_size, *va = qkv + 2 * cfg.ssm_inner_size;
-            gwen_l2_normalize(qa, qa, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
-            gwen_l2_normalize(ka, ka, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
 
-            kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
-                x_norm, w.ssm_alpha.device_data, w.ssm_beta.device_data,
+            // --- Fused: L2-norm(Q,K) + gate/beta + S update for token A ---
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                state.S, qa, ka, va, x_norm,
+                w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
-                d_alpha, d_beta, cfg.n_embed, cfg.ssm_n_heads);
-
-            kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                state.S, qa, ka, va, d_alpha, d_beta,
-                attn_out, nullptr, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+                attn_out, q_scale,
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
 
             // --- Save S snapshot after token A, before token B ---
             // 1 MB D2D per layer (baked into CUDA graph, ~1 μs each)
@@ -2480,18 +2618,15 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 qkv_dim, cfg.ssm_conv_kernel);
 
             half *qb = b2_qkv, *kb = b2_qkv + cfg.ssm_inner_size, *vb = b2_qkv + 2 * cfg.ssm_inner_size;
-            gwen_l2_normalize(qb, qb, cfg.ssm_n_heads, cfg.ssm_state_size, q_scale, s);
-            gwen_l2_normalize(kb, kb, cfg.ssm_n_heads, cfg.ssm_state_size, 1.0f, s);
 
-            kernel_compute_gate_beta<<<cfg.ssm_n_heads, 32, 0, s>>>(
-                b2_x_norm, w.ssm_alpha.device_data, w.ssm_beta.device_data,
+            // --- Fused: L2-norm(Q,K) + gate/beta + S update for token B ---
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 0, s>>>(
+                state.S, qb, kb, vb, b2_x_norm,
+                w.ssm_alpha.device_data, w.ssm_beta.device_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
-                d_alpha, d_beta, cfg.n_embed, cfg.ssm_n_heads);
-
-            kernel_deltanet_decode<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                state.S, qb, kb, vb, d_alpha, d_beta,
-                b2_attn_out, nullptr, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+                b2_attn_out, q_scale,
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
 
             // --- Batch2 Gated RMSNorm + Q8_1 for both tokens ---
             {
