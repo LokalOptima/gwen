@@ -481,11 +481,11 @@ def train(args: argparse.Namespace) -> None:
     embed_weight = load_embeddings(Path(args.model_dir), device)
 
     # GWEN server
+    use_idk = args.idk
     host, port = args.server_url.replace("http://", "").split(":")
-    gwen = GwenClient(host, int(port))
+    gwen = GwenClient(host, int(port), use_shm=use_idk)
 
     # MTP head
-    use_idk = args.idk
     log("Initializing MTP head..." + (" (IDK mode)" if use_idk else ""))
     if args.from_pretrained:
         mtp = MTPHead.from_pretrained(args.model_dir, vocab_size=args.top_k, device=device,
@@ -832,7 +832,7 @@ def train(args: argparse.Namespace) -> None:
 
         pbar = tqdm(
             total=train_tokens_per_epoch / 1e6, desc=f"[{stage_label}] Epoch {epoch+1}/{total_epochs}",
-            unit="MTok", bar_format="{l_bar}{bar}| {n:.1f}/{total:.0f} MTok [{elapsed}<{remaining}, {postfix}]",
+            unit="MTok", bar_format="{l_bar}{bar}| {n:.1f}/{total:.0f} MTok [{elapsed}<{remaining} {postfix}]",
             file=sys.stderr, dynamic_ncols=True,
         )
         batch_iter = iter(train_dl)
@@ -1231,8 +1231,8 @@ def main():
                     help="Dev server URL (gwen_dev_server with --restricted-vocab)")
     p.add_argument("--out-dir", type=Path, default=Path("train/runs/mtp_v3"))
     p.add_argument("--top-k", type=int, default=4096, help="Restricted vocab size")
-    p.add_argument("--epochs", type=int, default=3,
-                    help="Stage 2 epochs (full fine-tune)")
+    p.add_argument("--epochs", type=int, default=1,
+                    help="Training epochs (1 pass over ~500M tokens is sufficient)")
     p.add_argument("--stage1-steps", type=int, default=1000,
                     help="Stage 1 steps (lm_head warmup only, 0 to skip)")
     p.add_argument("--stage1-lr", type=float, default=1e-3,

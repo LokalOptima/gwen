@@ -22,6 +22,10 @@
 #include <getopt.h>
 #include <chrono>
 #include <fstream>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace gwen;
 
@@ -184,6 +188,18 @@ int main(int argc, char** argv) {
     printf("Total GPU memory: %.1f MB\n\n",
            allocator.total_allocated() / 1024.0 / 1024.0);
 
+    // --- Shared memory for zero-copy responses ---
+    // max payload: hidden[N*1024*2] + logits[N*K*2] + p_idk[N*4]
+    size_t shm_size = (size_t)max_total_tokens * (n_embed * 2 + K * 2 + 4);
+    const char* shm_name = "/gwen_batch";
+    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+    if (shm_fd < 0) { perror("shm_open"); return 1; }
+    if (ftruncate(shm_fd, shm_size) < 0) { perror("ftruncate"); return 1; }
+    char* shm_ptr = (char*)mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) { perror("mmap"); return 1; }
+    printf("Shared memory: %s (%.1f MB)\n", shm_name, (double)shm_size / 1024 / 1024);
+
     std::mutex gpu_mtx;
     long request_count = 0;
 
@@ -249,23 +265,37 @@ int main(int argc, char** argv) {
         const int32_t* all_tokens = (const int32_t*)(req.body.data() + 8);
 
         bool want_p_idk = (req.get_param_value("p_idk") == "1");
+        bool skip_logits = (req.get_param_value("no_logits") == "1");
+        bool use_shm = (req.get_param_value("shm") == "1");
 
-        // Prepare output buffer: header + hidden + logits [+ p_idk]
+        // Prepare output sizes
         size_t hidden_bytes = (size_t)N * n_embed * sizeof(uint16_t);
-        size_t logits_bytes = (size_t)N * K * sizeof(uint16_t);
+        size_t logits_bytes = skip_logits ? 0 : (size_t)N * K * sizeof(uint16_t);
         size_t pidk_bytes = want_p_idk ? (size_t)N * sizeof(float) : 0;
+        size_t payload_bytes = hidden_bytes + logits_bytes + pidk_bytes;
         size_t header_bytes = 12;
-        std::string body(header_bytes + hidden_bytes + logits_bytes + pidk_bytes, '\0');
 
-        uint32_t header[3] = {B, L, (uint32_t)K};
-        memcpy(&body[0], header, 12);
+        // shm=1: bulk data goes to shared memory, HTTP only carries the header
+        // Otherwise: everything in the HTTP body as before
+        char* out_buf;
+        std::string http_body;
+        if (use_shm) {
+            http_body.resize(header_bytes);
+            out_buf = shm_ptr;
+        } else {
+            http_body.resize(header_bytes + payload_bytes);
+            out_buf = &http_body[header_bytes];
+        }
+
+        uint32_t header[3] = {B, L, skip_logits ? 0u : (uint32_t)K};
+        memcpy(&http_body[0], header, header_bytes);
 
         std::lock_guard<std::mutex> lock(gpu_mtx);
         auto t_start = std::chrono::high_resolution_clock::now();
 
         // 1. Extract hidden states: tokens → all layers → prefill_x (GPU)
-        //    Copies hidden to host (body[12..]) and leaves data on GPU.
-        state.extract_hidden_batch(*model, all_tokens, B, L, &body[header_bytes]);
+        //    Copies hidden to host and leaves data on GPU.
+        state.extract_hidden_batch(*model, all_tokens, B, L, out_buf);
 
         // 2. Compute teacher logits from hidden states on GPU (prefill_x).
         //    Inline RMSNorm + GEMM to avoid double-copy of hidden states.
@@ -282,10 +312,12 @@ int main(int argc, char** argv) {
             gwen_gemm_fp16(state.restricted_embed_fp16, state.prefill_norm,
                            d_logits_buf, K, n_embed, N, s);
 
-            // Copy logits to host
-            GWEN_CHECK_CUDA(cudaMemcpy(&body[header_bytes + hidden_bytes],
-                                        d_logits_buf, logits_bytes,
-                                        cudaMemcpyDeviceToHost));
+            // Copy logits to host (skip if no_logits=1)
+            if (!skip_logits) {
+                GWEN_CHECK_CUDA(cudaMemcpy(out_buf + hidden_bytes,
+                                            d_logits_buf, logits_bytes,
+                                            cudaMemcpyDeviceToHost));
+            }
 
             // Compute p_idk if requested
             if (want_p_idk) {
@@ -305,7 +337,7 @@ int main(int argc, char** argv) {
                                             &d_p_idk[ci], chunk, K, s);
                 }
                 // Copy p_idk to host
-                GWEN_CHECK_CUDA(cudaMemcpy(&body[header_bytes + hidden_bytes + logits_bytes],
+                GWEN_CHECK_CUDA(cudaMemcpy(out_buf + hidden_bytes + logits_bytes,
                                             d_p_idk, pidk_bytes,
                                             cudaMemcpyDeviceToHost));
             }
@@ -323,7 +355,7 @@ int main(int argc, char** argv) {
         res.set_header("X-Batch", std::to_string(B));
         res.set_header("X-SeqLen", std::to_string(L));
         res.set_header("X-Time-Ms", std::to_string((int)ms));
-        res.set_content(body, "application/octet-stream");
+        res.set_content(http_body, "application/octet-stream");
     });
 
     printf("GWEN dev server starting on %s:%d\n", host.c_str(), port);
