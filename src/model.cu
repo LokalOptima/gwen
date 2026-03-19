@@ -90,7 +90,7 @@ void Model::load_mtp(const std::string& mtp_path) {
     uint32_t version, n_tensors;
     f.read(reinterpret_cast<char*>(&version), 4);
     f.read(reinterpret_cast<char*>(&n_tensors), 4);
-    GWEN_CHECK(version >= 1 && version <= 3, "Unsupported MTP file version (expected 1-3)");
+    GWEN_CHECK(version >= 1 && version <= 4, "Unsupported MTP file version (expected 1-4)");
 
     printf("Loading MTP weights: %u tensors from %s\n", n_tensors, mtp_path.c_str());
 
@@ -193,7 +193,7 @@ void Model::load_mtp(const std::string& mtp_path) {
     has_mtp = true;
     printf("MTP weights loaded: %.1f MB total\n", total_bytes / 1024.0 / 1024.0);
 
-    // v3 footer: restricted vocab mapping [K, restricted_ids[K]]
+    // v3+ footer: restricted vocab mapping [K, restricted_ids[K]]
     if (version >= 3 && f.peek() != EOF) {
         uint32_t K;
         f.read(reinterpret_cast<char*>(&K), 4);
@@ -204,7 +204,17 @@ void Model::load_mtp(const std::string& mtp_path) {
             // lm_head weights are in MTP tensors (mtp.lm_head.weight), FP16
             // The reduced_lm_head.weights will be set during upload from the MTP lm_head tensor
             has_reduced_lm_head = true;
-            printf("GWMT v3: restricted vocab K=%u embedded in MTP file\n", K);
+            printf("GWMT v%u: restricted vocab K=%u embedded in MTP file\n", version, K);
+        }
+
+        // v4 footer: has_idk flag
+        if (version >= 4 && f.peek() != EOF) {
+            uint8_t idk_flag;
+            f.read(reinterpret_cast<char*>(&idk_flag), 1);
+            reduced_lm_head.has_idk = (idk_flag != 0);
+            if (reduced_lm_head.has_idk) {
+                printf("GWMT v4: IDK token enabled (index %u maps to -1)\n", K);
+            }
         }
     }
 }

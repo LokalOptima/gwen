@@ -80,6 +80,7 @@ struct ReducedLMHead {
     int row_bytes = 0;                  // bytes per quantized row
     GGMLType type = GGMLType::Q6_K;     // quantization type
     std::vector<uint8_t> host_buffer;   // host-side storage for weight data
+    bool has_idk = false;               // v4: IDK token at index K (maps to -1)
 };
 
 // Complete model

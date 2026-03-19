@@ -280,5 +280,17 @@ void gwen_logsumexp_rows(const half* x, float* log_Z,
 void gwen_p_idk_from_logits(const half* restricted_logits, const float* log_Z,
                               float* p_idk, int n_rows, int K, cudaStream_t stream = 0);
 
+// ============================================================
+// Top-k selection (for sparse distillation)
+// ============================================================
+
+// Select top-k values and indices from each row.
+// logits: [n_rows, K] FP16 input
+// topk_indices: [n_rows, k] uint16 output (column indices)
+// topk_values: [n_rows, k] FP16 output (corresponding values)
+// Uses bitonic sort in shared memory (K * 4 bytes shared mem).
+void gwen_topk(const half* logits, uint16_t* topk_indices, half* topk_values,
+               int n_rows, int K, int k, cudaStream_t stream = 0);
+
 
 } // namespace gwen

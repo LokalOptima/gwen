@@ -2276,6 +2276,33 @@ __global__ void kernel_remap_token(const int* __restrict__ token_map,
     *argmax_result = token_map[*argmax_result];
 }
 
+// Remap with IDK: indices >= K or < 0 map to -1 (IDK = skip speculation)
+__global__ void kernel_remap_token_idk(const int* __restrict__ token_map,
+                                       int* __restrict__ argmax_result,
+                                       int K) {
+    int idx = *argmax_result;
+    *argmax_result = (idx < 0 || idx >= K) ? -1 : token_map[idx];
+}
+
+// Confidence gate: if softmax probability of argmax token < threshold, set to -1 (skip)
+__global__ void kernel_confidence_gate(const float* __restrict__ logits,
+                                       int* __restrict__ argmax_result,
+                                       int N, float threshold) {
+    int idx = *argmax_result;
+    if (idx < 0) return;  // already gated
+
+    float max_val = logits[idx];
+    float sum_exp = 0.0f;
+    for (int i = 0; i < N; i++) {
+        sum_exp += expf(logits[i] - max_val);
+    }
+    float prob = 1.0f / sum_exp;
+
+    if (prob < threshold) {
+        *argmax_result = -1;
+    }
+}
+
 // ============================================================
 // KV cache store kernel (reads pos from device memory for graph capture)
 // ============================================================
@@ -4733,27 +4760,36 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
                       x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
 
     if (model.has_reduced_lm_head) {
-        // Reduced LM head: only score top-K tokens (massive bandwidth reduction)
+        // Reduced LM head: only score top-K (or K+1 with IDK) tokens
         const auto& rl = model.reduced_lm_head;
         int K = rl.K;
+        int lm_rows = rl.has_idk ? K + 1 : K;
         if (rl.type == GGMLType::F16) {
             // FP16 reduced lm_head: use RMSNorm output directly (not Q8_1)
             half* norm_out = x_norm;
             gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(mtp_w.output_norm.device_data),
                               norm_out, cfg.n_embed, cfg.rms_norm_eps, s);
             gwen_gemv_fp16(static_cast<const half*>(rl.weights.device_data),
-                           norm_out, logits_h, K, cfg.n_embed, s);
+                           norm_out, logits_h, lm_rows, cfg.n_embed, s);
         } else {
             gwen_gemv_dp4a(rl.weights.device_data, x_q8_a, logits_h,
-                      K, cfg.n_embed, rl.type, s);
+                      lm_rows, cfg.n_embed, rl.type, s);
         }
 
-        int logit_blocks = (K + 255) / 256;
-        kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, K);
-        kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, K);
+        int logit_blocks = (lm_rows + 255) / 256;
+        kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, lm_rows);
+        kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, lm_rows);
         kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
-        // Remap index (0..K-1) → real token ID
-        kernel_remap_token<<<1, 1, 0, s>>>(rl.d_token_ids, d_argmax_token);
+        // Confidence gate: skip speculation if max softmax prob < threshold
+        if (mtp_confidence_threshold > 0.0f) {
+            kernel_confidence_gate<<<1, 1, 0, s>>>(logits_f, d_argmax_token, lm_rows, mtp_confidence_threshold);
+        }
+        // Remap index → real token ID (IDK: index < 0 or >= K maps to -1)
+        if (rl.has_idk || mtp_confidence_threshold > 0.0f) {
+            kernel_remap_token_idk<<<1, 1, 0, s>>>(rl.d_token_ids, d_argmax_token, K);
+        } else {
+            kernel_remap_token<<<1, 1, 0, s>>>(rl.d_token_ids, d_argmax_token);
+        }
     } else {
         // Full LM head: score all vocab tokens
         gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
@@ -4840,7 +4876,18 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
 
     if (!batch2_allocated) {
         // === FALLBACK: CPU-driven speculative decode (no batch2 buffers) ===
+        int idk_count = 0;
         while ((int)output_tokens.size() < n_predict) {
+            if (draft == -1) {
+                // IDK: skip speculation, fall back to regular forward
+                int next = forward(model, output_tokens.back());
+                output_tokens.push_back(next);
+                idk_count++;
+                if (next == (int)model.config.eos_token_id) break;
+                if ((int)output_tokens.size() >= n_predict) break;
+                draft = forward_mtp(model, next);
+                continue;
+            }
             int last_token = output_tokens.back();
             int pred = forward(model, last_token);
             if (pred == draft) {
@@ -4856,6 +4903,9 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
             if (bonus == (int)model.config.eos_token_id) break;
             draft = forward_mtp(model, bonus);
         }
+        if (idk_count > 0) {
+            printf("MTP IDK: %d tokens skipped speculation\n", idk_count);
+        }
         if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
         return output_tokens;
     }
@@ -4864,8 +4914,18 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
     // CPU dispatches two CUDA graphs per cycle (forward_2tok + MTP) with one int comparison
     // between them. CPU overhead is ~30 μs per 1.6 ms cycle (~2% of wall time).
     {
-        int accepted = 0, rejected = 0;
+        int accepted = 0, rejected = 0, idk_count = 0;
         while ((int)output_tokens.size() < n_predict) {
+            if (draft == -1) {
+                // IDK: skip forward_2tok, fall back to regular forward
+                int next = forward(model, output_tokens.back());
+                output_tokens.push_back(next);
+                idk_count++;
+                if (next == (int)model.config.eos_token_id) break;
+                if ((int)output_tokens.size() >= n_predict) break;
+                draft = forward_mtp(model, next);
+                continue;
+            }
             int last_token = output_tokens.back();
             auto [pred_a, pred_b] = forward_2tok(model, last_token, draft);
             if (pred_a == draft) {
@@ -4891,8 +4951,11 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
         }
         if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
         int total = accepted + rejected;
-        printf("MTP stats: %d accepted, %d rejected (%.1f%% acceptance rate), %d cycles\n",
-               accepted, rejected, total > 0 ? 100.0 * accepted / total : 0.0, total);
+        printf("MTP stats: %d accepted, %d rejected, %d IDK (%.1f%% acceptance rate, %.1f%% IDK), %d cycles\n",
+               accepted, rejected, idk_count,
+               total > 0 ? 100.0 * accepted / total : 0.0,
+               (total + idk_count) > 0 ? 100.0 * idk_count / (total + idk_count) : 0.0,
+               total + idk_count);
         return output_tokens;
     }
 }

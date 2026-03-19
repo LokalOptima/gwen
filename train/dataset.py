@@ -134,6 +134,7 @@ class TokenSequenceDataset(Dataset):
             "token_ids": token_ids,
             "targets": targets,
             "length": length,
+            "idx": idx,
         }
 
 
@@ -155,7 +156,8 @@ def mtp_collate(batch: list[dict]) -> dict:
         tgt_len = len(item["targets"])
         targets[i, :tgt_len] = item["targets"]
 
-    return {"token_ids": token_ids, "targets": targets}
+    indices = [item["idx"] for item in batch]
+    return {"token_ids": token_ids, "targets": targets, "indices": indices}
 
 
 class TokenBatchSampler(Sampler):

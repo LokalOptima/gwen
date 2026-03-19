@@ -6,7 +6,6 @@ Extracted from train_mtp.py for reuse across pipeline scripts.
 
 import http.client
 import json
-import mmap
 import struct
 import sys
 
@@ -21,23 +20,11 @@ def log(msg: str) -> None:
 class GwenClient:
     """Client for GWEN inference server's batch hidden state extraction."""
 
-    def __init__(self, host: str, port: int, use_shm: bool = False):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
         self.conn = http.client.HTTPConnection(host, port, timeout=300)
         self._check_health()
-        self.shm_buf = None
-        if use_shm:
-            self._open_shm()
-
-    def _open_shm(self):
-        """Map the server's shared memory region for zero-copy reads."""
-        import os
-        fd = os.open("/dev/shm/gwen_batch", os.O_RDONLY)
-        size = os.fstat(fd).st_size
-        self.shm_buf = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
-        os.close(fd)
-        log(f"  Shared memory: /dev/shm/gwen_batch ({size / 1024 / 1024:.0f} MB)")
 
     def _check_health(self):
         try:
@@ -109,50 +96,49 @@ class GwenClient:
                                dtype=np.float16).reshape(B2, L2, K).copy()
         return torch.from_numpy(hidden), torch.from_numpy(logits)
 
-    def batch_logits_with_p_idk(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Extract hidden states, teacher logits, AND p_idk from dev_server.
+    def batch_sparse_logits(self, token_ids: torch.Tensor, k: int = 64
+                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract hidden states + sparse top-k teacher logits + log_Z.
 
-        Uses shared memory when available (use_shm=True), falling back to HTTP.
-        Returns: (hidden [B, L, 1024] F16, logits [B, L, K] F16, p_idk [B, L] F32)
+        Calls /batch_logits?sparse={k}.
+        Returns: (hidden [B, L, 1024] F16,
+                  topk_indices [B, L, k] int32,
+                  topk_values [B, L, k] F16,
+                  log_Z [B, L] F32)
         """
         token_np = token_ids.cpu().numpy().astype(np.int32)
         B, L = token_np.shape
         body = struct.pack('<II', B, L) + token_np.tobytes()
+        data = self._post(f"/batch_logits?sparse={k}", body)
+        B2, L2, sparse_k = struct.unpack('<III', data[:12])
+        assert sparse_k == k, f"Expected sparse_k={k}, got {sparse_k}"
+        N = B2 * L2
 
-        if self.shm_buf is not None:
-            # shm path: HTTP carries only the 12-byte header, bulk data in shared memory
-            data = self._post("/batch_logits?p_idk=1&shm=1", body)
-            B2, L2, K = struct.unpack('<III', data[:12])
-            N = B2 * L2
-            off = 0
-            hidden_bytes = N * 1024 * 2
-            hidden = np.frombuffer(self.shm_buf, dtype=np.float16, count=N * 1024, offset=off).reshape(B2, L2, 1024).copy()
-            off += hidden_bytes
-            logits_bytes = N * K * 2
-            logits = np.frombuffer(self.shm_buf, dtype=np.float16, count=N * K, offset=off).reshape(B2, L2, K).copy()
-            off += logits_bytes
-            p_idk = np.frombuffer(self.shm_buf, dtype=np.float32, count=N, offset=off).reshape(B2, L2).copy()
-        else:
-            # HTTP path: everything in the response body
-            data = self._post("/batch_logits?p_idk=1", body)
-            B2, L2, K = struct.unpack('<III', data[:12])
-            N = B2 * L2
-            off = 12
-            hidden_bytes = N * 1024 * 2
-            hidden = np.frombuffer(data[off:off + hidden_bytes], dtype=np.float16).reshape(B2, L2, 1024).copy()
-            off += hidden_bytes
-            logits_bytes = N * K * 2
-            logits = np.frombuffer(data[off:off + logits_bytes], dtype=np.float16).reshape(B2, L2, K).copy()
-            off += logits_bytes
-            pidk_bytes = N * 4
-            p_idk = np.frombuffer(data[off:off + pidk_bytes], dtype=np.float32).reshape(B2, L2).copy()
+        off = 12
+        hidden_bytes = N * 1024 * 2
+        hidden = np.frombuffer(data[off:off + hidden_bytes], dtype=np.float16).reshape(B2, L2, 1024).copy()
+        off += hidden_bytes
 
-        return torch.from_numpy(hidden), torch.from_numpy(logits), torch.from_numpy(p_idk)
+        idx_bytes = N * k * 2  # uint16
+        indices = np.frombuffer(data[off:off + idx_bytes], dtype=np.uint16).reshape(B2, L2, k).copy()
+        off += idx_bytes
+
+        val_bytes = N * k * 2  # fp16
+        values = np.frombuffer(data[off:off + val_bytes], dtype=np.float16).reshape(B2, L2, k).copy()
+        off += val_bytes
+
+        logz_bytes = N * 4  # f32
+        log_z = np.frombuffer(data[off:off + logz_bytes], dtype=np.float32).reshape(B2, L2).copy()
+
+        return (torch.from_numpy(hidden),
+                torch.from_numpy(indices.astype(np.int32)),
+                torch.from_numpy(values),
+                torch.from_numpy(log_z))
 
     def batch_hidden_with_p_idk(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Extract hidden states + p_idk only (no logits transfer).
 
-        Calls /batch_logits?p_idk=1&no_logits=1. ~4x smaller response than batch_logits_with_p_idk.
+        Calls /batch_logits?p_idk=1&no_logits=1. ~4x smaller response than batch_logits.
         Returns: (hidden [B, L, 1024] F16, p_idk [B, L] F32)
         """
         token_np = token_ids.cpu().numpy().astype(np.int32)

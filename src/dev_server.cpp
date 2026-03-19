@@ -22,10 +22,7 @@
 #include <getopt.h>
 #include <chrono>
 #include <fstream>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <algorithm>
 
 using namespace gwen;
 
@@ -185,20 +182,17 @@ int main(int argc, char** argv) {
            pidk_chunk, (double)pidk_chunk * n_vocab * 2 / 1024 / 1024,
            (double)max_total_tokens * 4 / 1024);
 
+    // --- Allocate sparse top-k buffers ---
+    int max_sparse_k = 128;  // max supported sparse k
+    uint16_t* d_topk_indices = static_cast<uint16_t*>(
+        allocator.alloc((size_t)max_total_tokens * max_sparse_k * sizeof(uint16_t)));
+    half* d_topk_values = static_cast<half*>(
+        allocator.alloc((size_t)max_total_tokens * max_sparse_k * sizeof(half)));
+    printf("Sparse top-k buffers: max_k=%d (%.1f MB each)\n",
+           max_sparse_k, (double)max_total_tokens * max_sparse_k * 2 / 1024 / 1024);
+
     printf("Total GPU memory: %.1f MB\n\n",
            allocator.total_allocated() / 1024.0 / 1024.0);
-
-    // --- Shared memory for zero-copy responses ---
-    // max payload: hidden[N*1024*2] + logits[N*K*2] + p_idk[N*4]
-    size_t shm_size = (size_t)max_total_tokens * (n_embed * 2 + K * 2 + 4);
-    const char* shm_name = "/gwen_batch";
-    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
-    if (shm_fd < 0) { perror("shm_open"); return 1; }
-    if (ftruncate(shm_fd, shm_size) < 0) { perror("ftruncate"); return 1; }
-    char* shm_ptr = (char*)mmap(nullptr, shm_size, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED, shm_fd, 0);
-    if (shm_ptr == MAP_FAILED) { perror("mmap"); return 1; }
-    printf("Shared memory: %s (%.1f MB)\n", shm_name, (double)shm_size / 1024 / 1024);
 
     std::mutex gpu_mtx;
     long request_count = 0;
@@ -266,28 +260,34 @@ int main(int argc, char** argv) {
 
         bool want_p_idk = (req.get_param_value("p_idk") == "1");
         bool skip_logits = (req.get_param_value("no_logits") == "1");
-        bool use_shm = (req.get_param_value("shm") == "1");
+
+        // Sparse top-k mode: ?sparse=64
+        int sparse_k = 0;
+        auto sv = req.get_param_value("sparse");
+        if (!sv.empty()) sparse_k = std::min(std::max(atoi(sv.c_str()), 0), K);
 
         // Prepare output sizes
         size_t hidden_bytes = (size_t)N * n_embed * sizeof(uint16_t);
-        size_t logits_bytes = skip_logits ? 0 : (size_t)N * K * sizeof(uint16_t);
-        size_t pidk_bytes = want_p_idk ? (size_t)N * sizeof(float) : 0;
-        size_t payload_bytes = hidden_bytes + logits_bytes + pidk_bytes;
         size_t header_bytes = 12;
+        size_t payload_bytes;
 
-        // shm=1: bulk data goes to shared memory, HTTP only carries the header
-        // Otherwise: everything in the HTTP body as before
-        char* out_buf;
-        std::string http_body;
-        if (use_shm) {
-            http_body.resize(header_bytes);
-            out_buf = shm_ptr;
+        if (sparse_k > 0) {
+            // Sparse: hidden + topk_indices(uint16) + topk_values(fp16) + log_Z(f32)
+            payload_bytes = hidden_bytes
+                          + (size_t)N * sparse_k * sizeof(uint16_t)   // indices
+                          + (size_t)N * sparse_k * sizeof(uint16_t)   // values (fp16)
+                          + (size_t)N * sizeof(float);                // log_Z
         } else {
-            http_body.resize(header_bytes + payload_bytes);
-            out_buf = &http_body[header_bytes];
+            size_t logits_bytes = skip_logits ? 0 : (size_t)N * K * sizeof(uint16_t);
+            size_t pidk_bytes = want_p_idk ? (size_t)N * sizeof(float) : 0;
+            payload_bytes = hidden_bytes + logits_bytes + pidk_bytes;
         }
 
-        uint32_t header[3] = {B, L, skip_logits ? 0u : (uint32_t)K};
+        std::string http_body;
+        http_body.resize(header_bytes + payload_bytes);
+        char* out_buf = &http_body[header_bytes];
+
+        uint32_t header[3] = {B, L, sparse_k > 0 ? (uint32_t)sparse_k : (skip_logits ? 0u : (uint32_t)K)};
         memcpy(&http_body[0], header, header_bytes);
 
         std::lock_guard<std::mutex> lock(gpu_mtx);
@@ -312,34 +312,64 @@ int main(int argc, char** argv) {
             gwen_gemm_fp16(state.restricted_embed_fp16, state.prefill_norm,
                            d_logits_buf, K, n_embed, N, s);
 
-            // Copy logits to host (skip if no_logits=1)
-            if (!skip_logits) {
-                GWEN_CHECK_CUDA(cudaMemcpy(out_buf + hidden_bytes,
-                                            d_logits_buf, logits_bytes,
-                                            cudaMemcpyDeviceToHost));
-            }
-
-            // Compute p_idk if requested
-            if (want_p_idk) {
-                // Chunked 248K GEMM + logsumexp + p_idk
+            if (sparse_k > 0) {
+                // Sparse path: chunked 248K GEMM + logsumexp for log_Z, then top-k on restricted logits
                 for (int ci = 0; ci < N; ci += pidk_chunk) {
                     int chunk = std::min(pidk_chunk, N - ci);
-                    // Full vocab logits: prefill_norm[ci..] × full_embed^T → [chunk, 248K]
                     gwen_gemm_fp16(d_full_embed_fp16,
                                    &state.prefill_norm[ci * n_embed],
                                    d_full_logits_chunk,
                                    n_vocab, n_embed, chunk, s);
-                    // logsumexp over 248K → log_Z[chunk]
                     gwen_logsumexp_rows(d_full_logits_chunk, &d_log_Z[ci],
                                          chunk, n_vocab, s);
-                    // p_idk from restricted logits (already in d_logits_buf) + log_Z
-                    gwen_p_idk_from_logits(&d_logits_buf[(size_t)ci * K], &d_log_Z[ci],
-                                            &d_p_idk[ci], chunk, K, s);
                 }
-                // Copy p_idk to host
-                GWEN_CHECK_CUDA(cudaMemcpy(out_buf + hidden_bytes + logits_bytes,
-                                            d_p_idk, pidk_bytes,
+
+                // Top-k on restricted logits
+                gwen_topk(d_logits_buf, d_topk_indices, d_topk_values,
+                          N, K, sparse_k, s);
+
+                // D2H: topk_indices + topk_values + log_Z
+                size_t off = hidden_bytes;
+                size_t idx_bytes = (size_t)N * sparse_k * sizeof(uint16_t);
+                size_t val_bytes = (size_t)N * sparse_k * sizeof(half);
+                size_t logz_bytes = (size_t)N * sizeof(float);
+                GWEN_CHECK_CUDA(cudaMemcpy(out_buf + off, d_topk_indices, idx_bytes,
                                             cudaMemcpyDeviceToHost));
+                off += idx_bytes;
+                GWEN_CHECK_CUDA(cudaMemcpy(out_buf + off, d_topk_values, val_bytes,
+                                            cudaMemcpyDeviceToHost));
+                off += val_bytes;
+                GWEN_CHECK_CUDA(cudaMemcpy(out_buf + off, d_log_Z, logz_bytes,
+                                            cudaMemcpyDeviceToHost));
+            } else {
+                // Original dense path
+                // Copy logits to host (skip if no_logits=1)
+                if (!skip_logits) {
+                    size_t logits_bytes = (size_t)N * K * sizeof(uint16_t);
+                    GWEN_CHECK_CUDA(cudaMemcpy(out_buf + hidden_bytes,
+                                                d_logits_buf, logits_bytes,
+                                                cudaMemcpyDeviceToHost));
+                }
+
+                // Compute p_idk if requested
+                if (want_p_idk) {
+                    size_t logits_bytes = skip_logits ? 0 : (size_t)N * K * sizeof(uint16_t);
+                    size_t pidk_bytes = (size_t)N * sizeof(float);
+                    for (int ci = 0; ci < N; ci += pidk_chunk) {
+                        int chunk = std::min(pidk_chunk, N - ci);
+                        gwen_gemm_fp16(d_full_embed_fp16,
+                                       &state.prefill_norm[ci * n_embed],
+                                       d_full_logits_chunk,
+                                       n_vocab, n_embed, chunk, s);
+                        gwen_logsumexp_rows(d_full_logits_chunk, &d_log_Z[ci],
+                                             chunk, n_vocab, s);
+                        gwen_p_idk_from_logits(&d_logits_buf[(size_t)ci * K], &d_log_Z[ci],
+                                                &d_p_idk[ci], chunk, K, s);
+                    }
+                    GWEN_CHECK_CUDA(cudaMemcpy(out_buf + hidden_bytes + logits_bytes,
+                                                d_p_idk, pidk_bytes,
+                                                cudaMemcpyDeviceToHost));
+                }
             }
         }
 
@@ -347,8 +377,9 @@ int main(int argc, char** argv) {
         double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         request_count++;
 
+        const char* mode_str = sparse_k > 0 ? "+sparse" : (want_p_idk ? "+p_idk" : "");
         printf("[%ld] batch_logits%s: %u×%u=%d tok, K=%d → %.1f ms (%.0f tok/s)\n",
-               request_count, want_p_idk ? "+p_idk" : "",
+               request_count, mode_str,
                B, L, N, K, ms, (double)N / (ms / 1000.0));
         fflush(stdout);
 

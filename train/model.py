@@ -179,10 +179,12 @@ class MTPHead(nn.Module):
         num_kv_heads: int = 2,
         head_dim: int = 256,
         eps: float = 1e-6,
+        idk: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
+        self.idk = idk
 
         # Input norms
         self.pre_fc_norm_embedding = RMSNorm(hidden_size, eps=eps)
@@ -201,7 +203,8 @@ class MTPHead(nn.Module):
 
         # Output
         self.norm = RMSNorm(hidden_size, eps=eps)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        lm_head_size = vocab_size + 1 if idk else vocab_size
+        self.lm_head = nn.Linear(hidden_size, lm_head_size, bias=False)
 
     def forward(
         self,
@@ -250,17 +253,21 @@ class MTPHead(nn.Module):
         vocab_size: int,
         device: str = "cpu",
         vocab_ids: list[int] | None = None,
+        idk: bool = False,
     ) -> "MTPHead":
         """Load pre-trained MTP weights from Qwen3.5-0.8B safetensors.
 
         If vocab_ids is provided (list of full-vocab token IDs for the restricted
         vocab), initializes lm_head from the corresponding rows of the pre-trained
         lm_head. Otherwise lm_head is randomly initialized.
+
+        If idk=True, lm_head has K+1 outputs. First K rows initialized from
+        embed_tokens (when vocab_ids given), row K initialized to zeros.
         """
         from safetensors import safe_open
 
         model_dir = Path(model_dir)
-        model = cls(vocab_size=vocab_size)
+        model = cls(vocab_size=vocab_size, idk=idk)
 
         # Find safetensors files
         index_path = model_dir / "model.safetensors.index.json"
@@ -341,9 +348,17 @@ class MTPHead(nn.Module):
             if full_lm_head is not None:
                 import numpy as np
                 ids = np.array(vocab_ids, dtype=np.int64)
-                state_dict["lm_head.weight"] = full_lm_head[ids]  # [K, 1024]
-                loaded += 1
-                print(f"Loaded {loaded}/16 pre-trained MTP tensors (lm_head from embed_tokens top-{vocab_size} slice)")
+                restricted_rows = full_lm_head[ids]  # [K, 1024]
+                if idk:
+                    # K+1 output: first K rows from embed_tokens, row K = zeros
+                    idk_row = torch.zeros(1, restricted_rows.shape[1], dtype=restricted_rows.dtype)
+                    state_dict["lm_head.weight"] = torch.cat([restricted_rows, idk_row], dim=0)
+                    loaded += 1
+                    print(f"Loaded {loaded}/16 pre-trained MTP tensors (lm_head from embed_tokens top-{vocab_size} + IDK row)")
+                else:
+                    state_dict["lm_head.weight"] = restricted_rows  # [K, 1024]
+                    loaded += 1
+                    print(f"Loaded {loaded}/16 pre-trained MTP tensors (lm_head from embed_tokens top-{vocab_size} slice)")
             else:
                 print(f"Loaded {loaded}/15 pre-trained MTP tensors (lm_head: embed_tokens not found, random init)")
         else:

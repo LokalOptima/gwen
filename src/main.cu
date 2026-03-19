@@ -19,6 +19,7 @@ static void print_usage(const char* prog) {
     printf("  --prompt TEXT         Prompt text\n");
     printf("  --n-predict N        Number of tokens to generate (default: 50)\n");
     printf("  --greedy             Use greedy decoding\n");
+    printf("  --mtp-threshold F    Confidence threshold for MTP (skip if softmax prob < F)\n");
     printf("  --benchmark          Output benchmark timing as JSON\n");
     printf("  --output-logits      Output raw logits\n");
     printf("  --teacher-tokens T   Comma-separated reference token IDs for teacher-forced comparison\n");
@@ -37,6 +38,7 @@ int main(int argc, char** argv) {
     std::string teacher_tokens_str;
     std::string batch_extract_file;
     int n_predict = 50;
+    float mtp_threshold = 0.0f;
     bool greedy = true;  // default greedy for now
     bool benchmark = false;
     bool output_logits = false;
@@ -48,6 +50,7 @@ int main(int argc, char** argv) {
         {"model",        required_argument, nullptr, 'm'},
         {"mtp",          required_argument, nullptr, 'M'},
         {"mtp-lm-head",  required_argument, nullptr, 'L'},
+        {"mtp-threshold",required_argument, nullptr, 'T'},
         {"prompt",       required_argument, nullptr, 'p'},
         {"n-predict",    required_argument, nullptr, 'n'},
         {"greedy",       no_argument,       nullptr, 'g'},
@@ -63,11 +66,12 @@ int main(int argc, char** argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:L:p:n:t:B:S:Cgblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:L:T:p:n:t:B:S:Cgblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
             case 'L': mtp_lm_head_path = optarg; break;
+            case 'T': mtp_threshold = atof(optarg); break;
             case 'p': prompt = optarg; break;
             case 'n': n_predict = atoi(optarg); break;
             case 't': teacher_tokens_str = optarg; break;
@@ -338,6 +342,7 @@ int main(int argc, char** argv) {
     if (model->has_mtp) {
         state.allocate_mtp(model->config, allocator, 4096);
         state.allocate_batch2(model->config, allocator);
+        state.mtp_confidence_threshold = mtp_threshold;
     }
     printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 

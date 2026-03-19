@@ -236,6 +236,7 @@ struct InferenceState {
                               const std::vector<int>& teacher_tokens = {});
 
     // Generate tokens with MTP speculative decoding
+    float mtp_confidence_threshold = 0.0f;  // softmax prob below this → skip speculation
     std::vector<int> generate_speculative(Model& model, const std::vector<int>& prompt_tokens,
                                            int n_predict);
 };
