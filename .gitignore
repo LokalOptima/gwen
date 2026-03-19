@@ -13,3 +13,16 @@ profiles/
 archive.zip
 train/runs/
 scratch/
+.claude/
+data/embed_tokens_q6k.npy
+
+# Compiled test binaries
+tests/compare_logits_v2
+tests/dump_llama_cpu
+tests/dump_llama_tensors
+tests/f32_forward
+tests/llama_dump_layers
+tests/llama_dump_logits
+tests/llama_generate
+tests/llama_golden
+tests/llama_logits
