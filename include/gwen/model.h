@@ -10,12 +10,14 @@ namespace gwen {
 struct WeightRef {
     const void* host_data = nullptr;  // mmap'd pointer (stays valid as long as GGUFFile lives)
     void* device_data = nullptr;      // GPU pointer (after upload)
+    void* device_data_mma = nullptr;  // GPU pointer to mma-reshuffled layout (Q4_K/Q5_K/Q6_K only)
     GGMLType type = GGMLType::F32;
     size_t n_elements = 0;
     size_t size_bytes = 0;
     std::vector<uint64_t> shape;
 
     bool on_device() const { return device_data != nullptr; }
+    bool has_mma_data() const { return device_data_mma != nullptr; }
 };
 
 // DeltaNet layer weights (18 of 24 layers)

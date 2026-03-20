@@ -85,6 +85,41 @@ void gwen_gemv_dp4a_residual_batch2(const void* W,
                                      GGMLType type, cudaStream_t stream = 0);
 
 // ============================================================
+// Async dp4a GEMV (streaming loads + L2 eviction hints)
+// ============================================================
+
+// dp4a GEMV with streaming loads and L2 eviction hints for weights
+void gwen_gemv_dp4a_async(const void* W, const void* x_q8, half* y,
+                           int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
+
+// dp4a async GEMV with fused residual add
+void gwen_gemv_dp4a_async_residual(const void* W, const void* x_q8, half* y, const half* residual,
+                                    int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
+
+// ============================================================
+// Tensor core mma.sync GEMV (Marlin-style, FP16 input)
+// ============================================================
+// Uses mma.sync.m16n8k16 with just-in-time Q4_K/Q5_K/Q6_K→FP16 dequant.
+// Takes FP16 activation input directly (no Q8_1 quantization needed).
+// 64 output rows per block (4 warps × 16 rows via mma M=16).
+
+// y = W * x, where x is FP16 and W is quantized
+void gwen_gemv_mma(const void* W, const half* x, half* y,
+                    int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
+
+// y = W * x + residual (fused residual add)
+void gwen_gemv_mma_residual(const void* W, const half* x, half* y, const half* residual,
+                              int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
+
+// Reshuffled Q4_K mma.sync GEMV — coalesced loads from pre-arranged layout
+// W_mma: pointer to reshuffled weight data (from reshuffle_q4k_for_mma)
+void gwen_gemv_mma_reshuffled(const void* W_mma, const half* x, half* y,
+                               int out_features, int in_features, cudaStream_t stream = 0);
+
+void gwen_gemv_mma_reshuffled_residual(const void* W_mma, const half* x, half* y, const half* residual,
+                                        int out_features, int in_features, cudaStream_t stream = 0);
+
+// ============================================================
 // FP16 GEMV (for MTP weights stored as FP16)
 // ============================================================
 

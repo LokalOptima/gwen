@@ -1,4 +1,5 @@
 #include "gwen/model.h"
+#include "gwen/ggml_quants.h"
 #include <fstream>
 
 namespace gwen {
@@ -276,6 +277,176 @@ static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
     }
 }
 
+// ============================================================
+// Q4_K weight reshuffling for Marlin-style mma.sync GEMV
+// ============================================================
+//
+// Marlin formulation: C[M,N] = A[M,K] * B[K,N]
+//   A = activation (M=batch), B = weights (K×N), C = output
+//
+// Reshuffled layout: organized by column tiles of N_TILE=128 output features.
+// For each column-tile × Q4_K-block (256 K-elements):
+//
+// Nibbles: 16 K-chunks × 256 threads × 4 bytes = 16384 bytes
+//   Thread tid loads 4 bytes at offset tid*4 per chunk.
+//   Byte packing (for thread tid in warp w, lane t):
+//     byte[0]: nib_k0 | (nib_k8 << 4)  for column group 0
+//     byte[1]: nib_k1 | (nib_k9 << 4)  for column group 0
+//     byte[2]: nib_k0 | (nib_k8 << 4)  for column group 1
+//     byte[3]: nib_k1 | (nib_k9 << 4)  for column group 1
+//   where k0=(t%4)*2, k1=k0+1, k8=k0+8, k9=k1+8
+//   column group 0 = warp_col + t/4, column group 1 = warp_col + 8 + t/4
+//
+// Scales:  8 sub-blocks × 128 FP16 values = 2048 bytes (combined d*sc)
+// Offsets: 8 sub-blocks × 128 FP16 values = 2048 bytes (combined dmin*mn)
+//
+// Total: 16384 + 2048 + 2048 = 20480 bytes per column-tile per Q4_K block
+
+static constexpr int N_TILE_RESHUFFLE = 64;
+static constexpr int MARLIN_THREADS_R = 128;
+static constexpr int MARLIN_NIB  = 8192;   // 16 chunks × 128 threads × 4 bytes
+static constexpr int MARLIN_SC   = 1024;   // 8 sub-blocks × 64 × sizeof(half)
+static constexpr int MARLIN_OFF  = 1024;
+static constexpr int MARLIN_TILE = MARLIN_NIB + MARLIN_SC + MARLIN_OFF;  // 10240
+
+// Extract 6-bit packed Q4_K scale/min values into separate 8-bit arrays
+static void unpack_q4k_scales(const uint8_t scales_packed[12], uint8_t sc[8], uint8_t mn[8]) {
+    for (int sb = 0; sb < 4; sb++) {
+        sc[sb] = scales_packed[sb] & 0x3F;
+        mn[sb] = scales_packed[sb + 4] & 0x3F;
+    }
+    for (int sb = 4; sb < 8; sb++) {
+        sc[sb] = (scales_packed[sb + 4] & 0xF) | ((scales_packed[sb - 4] >> 6) << 4);
+        mn[sb] = (scales_packed[sb + 4] >> 4) | ((scales_packed[sb] >> 6) << 4);
+    }
+}
+
+static uint8_t q4k_get_nibble(const uint8_t qs[128], int abs_elem) {
+    int qs_byte = (abs_elem / 64) * 32 + (abs_elem % 32);
+    bool is_high = (abs_elem % 64) >= 32;
+    return is_high ? (qs[qs_byte] >> 4) : (qs[qs_byte] & 0xF);
+}
+
+static std::vector<uint8_t> reshuffle_q4k_for_mma(const void* host_data,
+                                                     int out_features, int in_features) {
+    const auto* blocks = static_cast<const block_q4_k*>(host_data);
+    int blocks_per_row = in_features / 256;
+    int n_col_tiles = (out_features + N_TILE_RESHUFFLE - 1) / N_TILE_RESHUFFLE;
+
+    size_t total_bytes = (size_t)n_col_tiles * blocks_per_row * MARLIN_TILE;
+    std::vector<uint8_t> reshuffled(total_bytes, 0);
+
+    for (int ct = 0; ct < n_col_tiles; ct++) {
+        for (int blk = 0; blk < blocks_per_row; blk++) {
+            uint8_t* tile = reshuffled.data() + (size_t)(ct * blocks_per_row + blk) * MARLIN_TILE;
+            uint8_t* nib_base = tile;
+            half* sc_base = reinterpret_cast<half*>(tile + MARLIN_NIB);
+            half* off_base = reinterpret_cast<half*>(tile + MARLIN_NIB + MARLIN_SC);
+
+            // Pre-compute combined scales/offsets for each column × sub-block
+            for (int col_local = 0; col_local < N_TILE_RESHUFFLE; col_local++) {
+                int col_global = ct * N_TILE_RESHUFFLE + col_local;
+                if (col_global >= out_features) continue;
+
+                const block_q4_k& src = blocks[col_global * blocks_per_row + blk];
+                uint8_t sc[8], mn[8];
+                unpack_q4k_scales(src.scales, sc, mn);
+                float d = __half2float(src.d);
+                float dmin = __half2float(src.dmin);
+
+                for (int sb = 0; sb < 8; sb++) {
+                    sc_base[sb * N_TILE_RESHUFFLE + col_local] = __float2half(d * sc[sb]);
+                    off_base[sb * N_TILE_RESHUFFLE + col_local] = __float2half(dmin * mn[sb]);
+                }
+            }
+
+            // Pack nibbles for each K-chunk
+            for (int chunk = 0; chunk < 16; chunk++) {
+                int sb = chunk / 2;
+                int half_sb = chunk % 2;
+
+                // For each thread tid (0..255)
+                for (int tid = 0; tid < MARLIN_THREADS_R; tid++) {
+                    int w = tid / 32;   // warp id
+                    int t = tid % 32;   // lane
+
+                    int b_k_base = (t % 4) * 2;
+                    int b_n_in_group = t / 4;
+
+                    int col_g0 = w * 16 + b_n_in_group;
+                    int col_g1 = w * 16 + 8 + b_n_in_group;
+                    int col_g0_global = ct * N_TILE_RESHUFFLE + col_g0;
+                    int col_g1_global = ct * N_TILE_RESHUFFLE + col_g1;
+
+                    int k0 = b_k_base;
+                    int k1 = b_k_base + 1;
+                    int k8 = b_k_base + 8;
+                    int k9 = b_k_base + 9;
+
+                    // Absolute K-element indices within the Q4_K block
+                    int abs_k0 = sb * 32 + half_sb * 16 + k0;
+                    int abs_k1 = sb * 32 + half_sb * 16 + k1;
+                    int abs_k8 = sb * 32 + half_sb * 16 + k8;
+                    int abs_k9 = sb * 32 + half_sb * 16 + k9;
+
+                    // Pack nibbles for dequant_u4:
+                    // dequant_u4 expects: bits[3:0]=nib_a, [7:4]=nib_c, [19:16]=nib_b, [23:20]=nib_d
+                    // Produces: out0 = {nib_a, nib_b}, out1 = {nib_c, nib_d}
+                    // We want: b_frag[0] = {B[k0,col], B[k1,col]}, b_frag[1] = {B[k8,col], B[k9,col]}
+                    // So: out0 = {B[k0,col], B[k1,col]} → nib_a=B[k0], nib_b=B[k1]
+                    //     out1 = {B[k8,col], B[k9,col]} → nib_c=B[k8], nib_d=B[k9]
+                    // Pack: nib_k0 | (nib_k8 << 4) | (nib_k1 << 16) | (nib_k9 << 20)
+                    // As bytes: byte[0] = nib_k0|(nib_k8<<4), byte[1] = 0,
+                    //           byte[2] = nib_k1|(nib_k9<<4), byte[3] = 0
+                    // But we want 4 bytes for 2 groups. Repack:
+                    //   For group 0: 2 bytes packing 4 nibbles
+                    //   For group 1: 2 bytes packing 4 nibbles
+                    // Store as: byte[0..1] = group 0, byte[2..3] = group 1
+                    // byte[0] = nib_k0 | (nib_k8 << 4)
+                    // byte[1] = nib_k1 | (nib_k9 << 4)
+                    // byte[2] = nib_k0' | (nib_k8' << 4)  (group 1)
+                    // byte[3] = nib_k1' | (nib_k9' << 4)
+
+                    uint8_t* dst = nib_base + chunk * (MARLIN_THREADS_R * 4) + tid * 4;
+
+                    auto get_nib = [&](int col_global, int abs_k) -> uint8_t {
+                        if (col_global >= out_features) return 0;
+                        const block_q4_k& src = blocks[col_global * blocks_per_row + blk];
+                        return q4k_get_nibble(src.qs, abs_k);
+                    };
+
+                    // Byte packing for uint32 load → dequant_u4:
+                    // uint32 = byte[0] | (byte[1]<<8) | (byte[2]<<16) | (byte[3]<<24)
+                    // dequant_u4 reads: bits[3:0]=nib_a, [7:4]=nib_c, [19:16]=nib_b, [23:20]=nib_d
+                    // → out0={nib_a, nib_b}, out1={nib_c, nib_d}
+                    // For group 0: want out0={B[k0,col], B[k1,col]}, out1={B[k8,col], B[k9,col]}
+                    //   byte[0] = B[k0]|(B[k8]<<4),  byte[2] = B[k1]|(B[k9]<<4)
+                    // For group 1: want same pattern
+                    //   byte[1] = B[k0']|(B[k8']<<4), byte[3] = B[k1']|(B[k9']<<4)
+                    dst[0] = get_nib(col_g0_global, abs_k0) | (get_nib(col_g0_global, abs_k8) << 4);
+                    dst[1] = get_nib(col_g1_global, abs_k0) | (get_nib(col_g1_global, abs_k8) << 4);
+                    dst[2] = get_nib(col_g0_global, abs_k1) | (get_nib(col_g0_global, abs_k9) << 4);
+                    dst[3] = get_nib(col_g1_global, abs_k1) | (get_nib(col_g1_global, abs_k9) << 4);
+                }
+            }
+        }
+    }
+
+    return reshuffled;
+}
+
+// Reshuffle and upload mma-format weight data for a Q4_K weight tensor
+static void upload_weight_mma_q4k(CudaAllocator& alloc, WeightRef& w) {
+    if (!w.host_data || w.size_bytes == 0 || w.type != GGMLType::Q4_K) return;
+    if (w.shape.size() < 2) return;
+
+    int in_features = (int)w.shape[0];
+    int out_features = (int)w.shape[1];
+
+    auto reshuffled = reshuffle_q4k_for_mma(w.host_data, out_features, in_features);
+    w.device_data_mma = alloc.upload(reshuffled.data(), reshuffled.size());
+}
+
 void Model::upload_weights(CudaAllocator& allocator) {
     upload_weight(allocator, token_embd);
     upload_weight(allocator, output_norm);
@@ -312,6 +483,41 @@ void Model::upload_weights(CudaAllocator& allocator) {
             upload_weight(allocator, w.ffn_down);
         }
     }
+
+    // Reshuffle Q4_K weights for mma.sync GEMV
+    printf("Reshuffling Q4_K weights for mma.sync...\n");
+    size_t mma_bytes = 0;
+    for (auto& layer : layers) {
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            upload_weight_mma_q4k(allocator, w.attn_q);
+            upload_weight_mma_q4k(allocator, w.attn_k);
+            upload_weight_mma_q4k(allocator, w.attn_output);
+            upload_weight_mma_q4k(allocator, w.ffn_gate);
+            upload_weight_mma_q4k(allocator, w.ffn_up);
+            upload_weight_mma_q4k(allocator, w.ffn_down);
+        } else {
+            auto& w = layer.deltanet;
+            upload_weight_mma_q4k(allocator, w.attn_gate);
+            upload_weight_mma_q4k(allocator, w.ffn_gate);
+            upload_weight_mma_q4k(allocator, w.ffn_up);
+        }
+    }
+    // Count mma reshuffled bytes
+    for (auto& layer : layers) {
+        auto count_mma = [&](WeightRef& w) { if (w.device_data_mma) mma_bytes += w.size_bytes; };
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            count_mma(w.attn_q); count_mma(w.attn_k); count_mma(w.attn_output);
+            count_mma(w.ffn_gate); count_mma(w.ffn_up); count_mma(w.ffn_down);
+        } else {
+            auto& w = layer.deltanet;
+            count_mma(w.attn_gate); count_mma(w.ffn_gate); count_mma(w.ffn_up);
+        }
+    }
+    if (mma_bytes > 0)
+        printf("MMA reshuffled: %zu Q4_K tensors, original %.1f MB\n",
+               mma_bytes > 0 ? 1UL : 0UL, mma_bytes / 1024.0 / 1024.0);
 
     // Upload reduced LM head if loaded
     if (has_reduced_lm_head) {

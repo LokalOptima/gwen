@@ -96,6 +96,30 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_dp4a.cu)
     target_link_libraries(test_dp4a gwen_core)
 endif()
 
+# --- GEMV variant test ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/scripts/marlin/test_gemv_variants.cu)
+    add_executable(test_gemv_variants scratch/test_gemv_variants.cu)
+    target_link_libraries(test_gemv_variants gwen_core)
+endif()
+
+# --- Pipeline benchmark ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/scripts/marlin/bench_pipeline.cu)
+    add_executable(bench_pipeline scratch/bench_pipeline.cu)
+    target_link_libraries(bench_pipeline gwen_core)
+endif()
+
+# --- Marlin correctness test ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/scripts/marlin/test_marlin_correctness.cu)
+    add_executable(test_marlin_correctness scratch/test_marlin_correctness.cu)
+    target_link_libraries(test_marlin_correctness gwen_core)
+endif()
+
+# --- GEMV variant benchmark ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/scripts/marlin/bench_gemv_variants.cu)
+    add_executable(bench_gemv_variants scratch/bench_gemv_variants.cu)
+    target_link_libraries(bench_gemv_variants gwen_core)
+endif()
+
 # --- Profiler ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/bench/profile_forward.cu)
     add_executable(profile_forward bench/profile_forward.cu)
