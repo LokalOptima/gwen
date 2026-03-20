@@ -16,7 +16,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --model PATH         Path to GGUF model file (required)\n");
     fprintf(stderr, "  --mtp PATH           Path to MTP weights file (enables speculative decoding)\n");
     fprintf(stderr, "  --mtp-lm-head PATH   Path to reduced LM head for faster MTP (GWRL format)\n");
-    fprintf(stderr, "  --prompt TEXT         Prompt text\n");
+    fprintf(stderr, "  --template STR/FILE  Template (file or string); {input} replaced with input text\n");
     fprintf(stderr, "  --max-predict N        Number of tokens to generate (default: 50)\n");
     fprintf(stderr, "  --greedy             Use greedy decoding\n");
     fprintf(stderr, "  --mtp-threshold F    Confidence threshold for MTP (skip if softmax prob < F)\n");
@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     std::string model_path;
     std::string mtp_path;
     std::string mtp_lm_head_path;
-    std::string prompt;
+    std::string tmpl_path;
     std::string teacher_tokens_str;
     std::string batch_extract_file;
     int n_predict = 50;
@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
         {"mtp",          required_argument, nullptr, 'M'},
         {"mtp-lm-head",  required_argument, nullptr, 'L'},
         {"mtp-threshold",required_argument, nullptr, 'T'},
-        {"prompt",       required_argument, nullptr, 'p'},
+        {"template",     required_argument, nullptr, 'p'},
         {"max-predict",    required_argument, nullptr, 'n'},
         {"greedy",       no_argument,       nullptr, 'g'},
         {"benchmark",    no_argument,       nullptr, 'b'},
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
             case 'M': mtp_path = optarg; break;
             case 'L': mtp_lm_head_path = optarg; break;
             case 'T': mtp_threshold = atof(optarg); break;
-            case 'p': prompt = optarg; break;
+            case 'p': tmpl_path = optarg; break;
             case 'n': n_predict = atoi(optarg); break;
             case 't': teacher_tokens_str = optarg; break;
             case 'g': greedy = true; break;
@@ -325,29 +325,35 @@ int main(int argc, char** argv) {
     }
 
     // ========== Normal generation mode ==========
-    if (prompt.empty()) {
-        fprintf(stderr, "\nNo prompt specified. Use --prompt to generate text.\n");
+    if (input_text.empty()) {
+        fprintf(stderr, "\nNo input text. Pass text as positional argument.\n");
         return 0;
     }
 
-    // If prompt is a file path, read its contents
-    {
-        std::ifstream pf(prompt);
-        if (pf.is_open()) {
-            std::string contents((std::istreambuf_iterator<char>(pf)),
-                                  std::istreambuf_iterator<char>());
-            prompt = std::move(contents);
-        }
-    }
-
-    // Substitute {input} in prompt, or append input text
-    if (!input_text.empty()) {
-        auto pos = prompt.find("{input}");
-        if (pos != std::string::npos) {
-            prompt.replace(pos, 7, input_text);
+    // Build prompt:
+    //   no template   → input text as-is
+    //   template w/o {input} → template + input text
+    //   template w/ {input}  → {input} replaced with input text
+    std::string prompt;
+    if (!tmpl_path.empty()) {
+        // Try as file first, fall back to literal string
+        std::string tmpl;
+        std::ifstream tf(tmpl_path);
+        if (tf.is_open()) {
+            tmpl = std::string((std::istreambuf_iterator<char>(tf)),
+                                std::istreambuf_iterator<char>());
         } else {
-            prompt += input_text;
+            tmpl = tmpl_path;
         }
+        auto pos = tmpl.find("{input}");
+        if (pos != std::string::npos) {
+            tmpl.replace(pos, 7, input_text);
+        } else {
+            tmpl += input_text;
+        }
+        prompt = tmpl;
+    } else {
+        prompt = input_text;
     }
 
     // Tokenize prompt

@@ -43,19 +43,19 @@ weights: $(MODEL) $(MTP) $(MTP_HEAD)
 
 # ── Run ──────────────────────────────────────────────────────────────
 run: $(BUILD_DIR)/gwen $(MODEL)
-	$(BUILD_DIR)/gwen --model $(MODEL) --prompt "$(PROMPT)" --max-predict $(N) --greedy
+	$(BUILD_DIR)/gwen --model $(MODEL) "$(PROMPT)" --max-predict $(N) --greedy
 
 run-mtp: $(BUILD_DIR)/gwen $(MODEL) $(MTP) $(MTP_HEAD)
 	$(BUILD_DIR)/gwen --model $(MODEL) --mtp $(MTP) --mtp-lm-head $(MTP_HEAD) \
-		--prompt "$(PROMPT)" --max-predict $(N)
+		"$(PROMPT)" --max-predict $(N)
 
 # ── Benchmark ────────────────────────────────────────────────────────
 bench: $(BUILD_DIR)/gwen $(MODEL)
-	$(BUILD_DIR)/gwen --model $(MODEL) --prompt "$(PROMPT)" --max-predict $(N) --greedy --benchmark
+	$(BUILD_DIR)/gwen --model $(MODEL) "$(PROMPT)" --max-predict $(N) --greedy --benchmark
 
 bench-mtp: $(BUILD_DIR)/gwen $(MODEL) $(MTP) $(MTP_HEAD)
 	$(BUILD_DIR)/gwen --model $(MODEL) --mtp $(MTP) --mtp-lm-head $(MTP_HEAD) \
-		--prompt "$(PROMPT)" --max-predict $(N) --benchmark
+		"$(PROMPT)" --max-predict $(N) --benchmark
 
 # ── Utility ──────────────────────────────────────────────────────────
 info: $(BUILD_DIR)/gwen $(MODEL)
