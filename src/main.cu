@@ -11,23 +11,23 @@
 using namespace gwen;
 
 static void print_usage(const char* prog) {
-    printf("Usage: %s [options]\n", prog);
-    printf("Options:\n");
-    printf("  --model PATH         Path to GGUF model file (required)\n");
-    printf("  --mtp PATH           Path to MTP weights file (enables speculative decoding)\n");
-    printf("  --mtp-lm-head PATH   Path to reduced LM head for faster MTP (GWRL format)\n");
-    printf("  --prompt TEXT         Prompt text\n");
-    printf("  --n-predict N        Number of tokens to generate (default: 50)\n");
-    printf("  --greedy             Use greedy decoding\n");
-    printf("  --mtp-threshold F    Confidence threshold for MTP (skip if softmax prob < F)\n");
-    printf("  --benchmark          Output benchmark timing as JSON\n");
-    printf("  --output-logits      Output raw logits\n");
-    printf("  --teacher-tokens T   Comma-separated reference token IDs for teacher-forced comparison\n");
-    printf("  --batch-extract FILE Batch GEMM extract mode: read prompts from FILE (one per line)\n");
-    printf("  --seq-len N          Sequence length for batch-extract (pad/truncate, default: 512)\n");
-    printf("  --compare-extract    Compare extract_hidden (F32 GEMV) vs extract_hidden_batch (B=1 GEMM)\n");
-    printf("  --info               Print model info and exit\n");
-    printf("  --help               Show this help\n");
+    fprintf(stderr, "Usage: %s [options]\n", prog);
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  --model PATH         Path to GGUF model file (required)\n");
+    fprintf(stderr, "  --mtp PATH           Path to MTP weights file (enables speculative decoding)\n");
+    fprintf(stderr, "  --mtp-lm-head PATH   Path to reduced LM head for faster MTP (GWRL format)\n");
+    fprintf(stderr, "  --prompt TEXT         Prompt text\n");
+    fprintf(stderr, "  --max-predict N        Number of tokens to generate (default: 50)\n");
+    fprintf(stderr, "  --greedy             Use greedy decoding\n");
+    fprintf(stderr, "  --mtp-threshold F    Confidence threshold for MTP (skip if softmax prob < F)\n");
+    fprintf(stderr, "  --benchmark          Output benchmark timing as JSON\n");
+    fprintf(stderr, "  --output-logits      Output raw logits\n");
+    fprintf(stderr, "  --teacher-tokens T   Comma-separated reference token IDs for teacher-forced comparison\n");
+    fprintf(stderr, "  --batch-extract FILE Batch GEMM extract mode: read prompts from FILE (one per line)\n");
+    fprintf(stderr, "  --seq-len N          Sequence length for batch-extract (pad/truncate, default: 512)\n");
+    fprintf(stderr, "  --compare-extract    Compare extract_hidden (F32 GEMV) vs extract_hidden_batch (B=1 GEMM)\n");
+    fprintf(stderr, "  --info               Print model info and exit\n");
+    fprintf(stderr, "  --help               Show this help\n");
 }
 
 int main(int argc, char** argv) {
@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
         {"mtp-lm-head",  required_argument, nullptr, 'L'},
         {"mtp-threshold",required_argument, nullptr, 'T'},
         {"prompt",       required_argument, nullptr, 'p'},
-        {"n-predict",    required_argument, nullptr, 'n'},
+        {"max-predict",    required_argument, nullptr, 'n'},
         {"greedy",       no_argument,       nullptr, 'g'},
         {"benchmark",    no_argument,       nullptr, 'b'},
         {"output-logits",no_argument,       nullptr, 'l'},
@@ -103,13 +103,13 @@ int main(int argc, char** argv) {
 
     // Load model
     auto t0 = std::chrono::high_resolution_clock::now();
-    printf("Loading model: %s\n", model_path.c_str());
+    fprintf(stderr, "Loading model: %s\n", model_path.c_str());
 
     auto model = Model::load(model_path);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     double load_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    printf("GGUF parsed in %.1f ms\n", load_ms);
+    fprintf(stderr, "GGUF parsed in %.1f ms\n", load_ms);
 
     // Load MTP weights if provided
     if (!mtp_path.empty()) {
@@ -128,12 +128,12 @@ int main(int argc, char** argv) {
     }
 
     // Build tokenizer
-    printf("\nBuilding tokenizer...\n");
+    fprintf(stderr, "\nBuilding tokenizer...\n");
     auto tokenizer = Tokenizer::from_gguf(*model->gguf);
-    printf("Vocab size: %d\n", tokenizer->vocab_size());
+    fprintf(stderr, "Vocab size: %d\n", tokenizer->vocab_size());
 
     // Upload weights to GPU
-    printf("\nUploading weights to GPU...\n");
+    fprintf(stderr, "\nUploading weights to GPU...\n");
     auto t2 = std::chrono::high_resolution_clock::now();
 
     CudaAllocator allocator;
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
 
     auto t3 = std::chrono::high_resolution_clock::now();
     double upload_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    printf("Weights uploaded in %.1f ms (%.1f MB, %zu allocations)\n",
+    fprintf(stderr, "Weights uploaded in %.1f ms (%.1f MB, %zu allocations)\n",
            upload_ms,
            allocator.total_allocated() / 1024.0 / 1024.0,
            allocator.n_allocations());
@@ -158,14 +158,14 @@ int main(int argc, char** argv) {
         int L = seq_len;
         int n_embed = model->config.n_embed;
 
-        printf("\n=== Compare Extract: F32 GEMV (extract_hidden) vs FP16 GEMM (extract_hidden_batch, B=1) ===\n");
-        printf("Seq length: %d, n_embed: %d\n\n", L, n_embed);
+        fprintf(stderr, "\n=== Compare Extract: F32 GEMV (extract_hidden) vs FP16 GEMM (extract_hidden_batch, B=1) ===\n");
+        fprintf(stderr, "Seq length: %d, n_embed: %d\n\n", L, n_embed);
 
         // Allocate with F32 path enabled + batch buffers
         InferenceState state;
         state.allocate(model->config, allocator);
         state.allocate_batch_prefill(model->config, allocator, L, 1, /*f32_path=*/true);
-        printf("Total GPU memory: %.1f MB\n\n", allocator.total_allocated() / 1024.0 / 1024.0);
+        fprintf(stderr, "Total GPU memory: %.1f MB\n\n", allocator.total_allocated() / 1024.0 / 1024.0);
 
         int all_pass = 1;
         for (int p = 0; p < n_prompts; p++) {
@@ -177,7 +177,7 @@ int main(int argc, char** argv) {
             for (int j = 0; j < copy_len; j++) tok_padded[j] = tokens[j];
             int actual_len = copy_len;
 
-            printf("[%d] \"%s\" (%d tokens, padded to %d)\n", p, test_prompts[p], (int)tokens.size(), L);
+            fprintf(stderr, "[%d] \"%s\" (%d tokens, padded to %d)\n", p, test_prompts[p], (int)tokens.size(), L);
 
             // Run F32 GEMV path (extract_hidden)
             std::vector<uint16_t> gemv_out((size_t)L * n_embed);
@@ -215,33 +215,33 @@ int main(int argc, char** argv) {
                 if (pos_max_abs > max_abs) max_abs = pos_max_abs;
 
                 if (t < 5 || t == actual_len - 1) {
-                    printf("  pos[%3d]: cos=%.6f  max_abs=%.6f\n", t, cos_sim, pos_max_abs);
+                    fprintf(stderr, "  pos[%3d]: cos=%.6f  max_abs=%.6f\n", t, cos_sim, pos_max_abs);
                 } else if (t == 5) {
-                    printf("  ...\n");
+                    fprintf(stderr, "  ...\n");
                 }
 
                 if (cos_sim < 0.9999f) {
-                    printf("  WARN: low cosine at pos %d: %.6f\n", t, cos_sim);
+                    fprintf(stderr, "  WARN: low cosine at pos %d: %.6f\n", t, cos_sim);
                     all_pass = 0;
                 }
             }
             size_t total_elems = (size_t)actual_len * n_embed;
             float mean_abs = (float)(sum_abs / total_elems);
-            printf("  Summary: bit_mismatches=%d/%zu  max_abs=%.6f  mean_abs=%.6f\n",
+            fprintf(stderr, "  Summary: bit_mismatches=%d/%zu  max_abs=%.6f  mean_abs=%.6f\n",
                    bit_mismatches, total_elems, max_abs, mean_abs);
 
             // F32 vs FP16 paths: max_abs up to ~0.01 is expected (FP16 precision)
             // Cosine < 0.9999 would indicate actual corruption
             if (max_abs > 0.05f) {
-                printf("  FAIL: max_abs > 0.05 (likely corruption)\n");
+                fprintf(stderr, "  FAIL: max_abs > 0.05 (likely corruption)\n");
                 all_pass = 0;
             } else {
-                printf("  PASS\n");
+                fprintf(stderr, "  PASS\n");
             }
-            printf("\n");
+            fprintf(stderr, "\n");
         }
 
-        printf("=== %s ===\n", all_pass ? "ALL PASSED" : "SOME FAILED");
+        fprintf(stderr, "=== %s ===\n", all_pass ? "ALL PASSED" : "SOME FAILED");
         return all_pass ? 0 : 1;
     }
 
@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
 
         int B = (int)prompts.size();
         int L = seq_len;
-        printf("\nBatch extract mode: B=%d, L=%d (from %s)\n", B, L, batch_extract_file.c_str());
+        fprintf(stderr, "\nBatch extract mode: B=%d, L=%d (from %s)\n", B, L, batch_extract_file.c_str());
 
         // Tokenize each prompt, pad/truncate to L
         std::vector<int32_t> all_tokens(B * L, 0);
@@ -275,7 +275,7 @@ int main(int argc, char** argv) {
             for (int j = 0; j < copy_len; j++) {
                 all_tokens[b * L + j] = tokens[j];
             }
-            printf("  [%d] %zu tok%s — %.40s%s\n", b, tokens.size(),
+            fprintf(stderr, "  [%d] %zu tok%s — %.40s%s\n", b, tokens.size(),
                    (int)tokens.size() > L ? " (truncated)" :
                    (int)tokens.size() < L ? " (padded)" : "",
                    prompts[b].c_str(),
@@ -283,18 +283,18 @@ int main(int argc, char** argv) {
         }
 
         // Allocate batch state
-        printf("\nAllocating batch state...\n");
+        fprintf(stderr, "\nAllocating batch state...\n");
         InferenceState state;
         state.allocate(model->config, allocator);
         state.allocate_batch_prefill(model->config, allocator, B * L, B);
-        printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
+        fprintf(stderr, "Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 
         // Output buffer
         int n_embed = model->config.n_embed;
         std::vector<uint16_t> output((size_t)B * L * n_embed);
 
         // Run extraction
-        printf("\nRunning batch extraction...\n");
+        fprintf(stderr, "\nRunning batch extraction...\n");
         auto t4 = std::chrono::high_resolution_clock::now();
 
         state.extract_hidden_batch(*model, all_tokens.data(), B, L, output.data());
@@ -305,12 +305,12 @@ int main(int argc, char** argv) {
         int total_tokens = B * L;
         double tok_per_s = total_tokens / (ms / 1000.0);
 
-        printf("\n--- Batch Extract Timing ---\n");
-        printf("Batch size: %d\n", B);
-        printf("Seq length: %d\n", L);
-        printf("Total tokens: %d\n", total_tokens);
-        printf("Time: %.1f ms\n", ms);
-        printf("Throughput: %.0f tok/s\n", tok_per_s);
+        fprintf(stderr, "\n--- Batch Extract Timing ---\n");
+        fprintf(stderr, "Batch size: %d\n", B);
+        fprintf(stderr, "Seq length: %d\n", L);
+        fprintf(stderr, "Total tokens: %d\n", total_tokens);
+        fprintf(stderr, "Time: %.1f ms\n", ms);
+        fprintf(stderr, "Throughput: %.0f tok/s\n", tok_per_s);
 
         if (benchmark) {
             fprintf(stderr,
@@ -326,7 +326,7 @@ int main(int argc, char** argv) {
 
     // ========== Normal generation mode ==========
     if (prompt.empty()) {
-        printf("\nNo prompt specified. Use --prompt to generate text.\n");
+        fprintf(stderr, "\nNo prompt specified. Use --prompt to generate text.\n");
         return 0;
     }
 
@@ -352,15 +352,15 @@ int main(int argc, char** argv) {
 
     // Tokenize prompt
     auto prompt_tokens = tokenizer->encode(prompt);
-    printf("\nPrompt: %s\n", prompt.c_str());
-    printf("Prompt tokens (%zu): ", prompt_tokens.size());
+    fprintf(stderr, "\nPrompt: %s\n", prompt.c_str());
+    fprintf(stderr, "Prompt tokens (%zu): ", prompt_tokens.size());
     for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-        printf("%d ", prompt_tokens[i]);
+        fprintf(stderr, "%d ", prompt_tokens[i]);
     }
-    printf("\n");
+    fprintf(stderr, "\n");
 
     // Allocate inference state
-    printf("\nAllocating inference state...\n");
+    fprintf(stderr, "\nAllocating inference state...\n");
     InferenceState state;
     state.allocate(model->config, allocator);
     state.allocate_prefill(model->config, allocator, 4096);
@@ -369,7 +369,7 @@ int main(int argc, char** argv) {
         state.allocate_batch2(model->config, allocator);
         state.mtp_confidence_threshold = mtp_threshold;
     }
-    printf("Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
+    fprintf(stderr, "Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 
     // Parse teacher tokens if provided
     std::vector<int> teacher_tokens;
@@ -379,11 +379,11 @@ int main(int argc, char** argv) {
         while (std::getline(iss, tok, ',')) {
             if (!tok.empty()) teacher_tokens.push_back(std::stoi(tok));
         }
-        printf("\nTeacher-forcing with %zu reference tokens\n", teacher_tokens.size());
+        fprintf(stderr, "\nTeacher-forcing with %zu reference tokens\n", teacher_tokens.size());
     }
 
     // Generate
-    printf("\nGenerating %d tokens (greedy=%s)...\n", n_predict, greedy ? "true" : "false");
+    fprintf(stderr, "\nGenerating %d tokens (greedy=%s)...\n", n_predict, greedy ? "true" : "false");
     auto t4 = std::chrono::high_resolution_clock::now();
 
     std::vector<int> output_tokens;
@@ -398,17 +398,17 @@ int main(int argc, char** argv) {
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t5 = std::chrono::high_resolution_clock::now();
 
-    // Decode and print output
+    // Decode and print output — this is the only stdout output
     std::string output_text = tokenizer->decode(output_tokens);
-    printf("\n%s%s\n", prompt.c_str(), output_text.c_str());
+    printf("%s%s\n", prompt.c_str(), output_text.c_str());
 
     // Print token IDs for debugging
-    printf("\nGenerated token IDs: ");
-    for (int id : output_tokens) printf("%d ", id);
-    printf("\n");
-    printf("Decoded per-token: ");
-    for (int id : output_tokens) printf("[%s]", tokenizer->decode(id).c_str());
-    printf("\n");
+    fprintf(stderr, "\nGenerated token IDs: ");
+    for (int id : output_tokens) fprintf(stderr, "%d ", id);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Decoded per-token: ");
+    for (int id : output_tokens) fprintf(stderr, "[%s]", tokenizer->decode(id).c_str());
+    fprintf(stderr, "\n");
 
     // Timing stats
     double gen_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
@@ -416,11 +416,11 @@ int main(int argc, char** argv) {
     int n_gen = (int)output_tokens.size();
     double tok_per_s = n_gen / (gen_ms / 1000.0);
 
-    printf("\n--- Timing ---\n");
-    printf("Prompt tokens: %d\n", n_prompt);
-    printf("Generated tokens: %d\n", n_gen);
-    printf("Total time: %.1f ms\n", gen_ms);
-    printf("Tokens/sec: %.1f\n", tok_per_s);
+    fprintf(stderr, "\n--- Timing ---\n");
+    fprintf(stderr, "Prompt tokens: %d\n", n_prompt);
+    fprintf(stderr, "Generated tokens: %d\n", n_gen);
+    fprintf(stderr, "Total time: %.1f ms\n", gen_ms);
+    fprintf(stderr, "Tokens/sec: %.1f\n", tok_per_s);
 
     if (benchmark) {
         // JSON output for benchmark scripts

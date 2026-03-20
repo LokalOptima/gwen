@@ -92,7 +92,7 @@ void Model::load_mtp(const std::string& mtp_path) {
     f.read(reinterpret_cast<char*>(&n_tensors), 4);
     GWEN_CHECK(version >= 1 && version <= 4, "Unsupported MTP file version (expected 1-4)");
 
-    printf("Loading MTP weights: %u tensors from %s\n", n_tensors, mtp_path.c_str());
+    fprintf(stderr, "Loading MTP weights: %u tensors from %s\n", n_tensors, mtp_path.c_str());
 
     // Read tensors
     mtp_host_buffers.resize(n_tensors);
@@ -175,23 +175,23 @@ void Model::load_mtp(const std::string& mtp_path) {
                 reduced_lm_head.row_bytes = config.n_embed * 2;
             }
         } else {
-            printf("  Warning: unknown MTP tensor: %s\n", name.c_str());
+            fprintf(stderr, "  Warning: unknown MTP tensor: %s\n", name.c_str());
         }
 
-        printf("  %-50s [", name.c_str());
+        fprintf(stderr, "  %-50s [", name.c_str());
         for (uint32_t d = 0; d < ndims; d++) {
-            if (d > 0) printf(", ");
-            printf("%lu", shape[d]);
+            if (d > 0) fprintf(stderr, ", ");
+            fprintf(stderr, "%lu", shape[d]);
         }
         const char* dtype_str = "???";
         if (dtype == 0) dtype_str = "F32";
         else if (dtype == 1) dtype_str = "F16";
         else if (dtype == 8) dtype_str = "Q8_0";
-        printf("] %s  %.1f KB\n", dtype_str, data_size / 1024.0f);
+        fprintf(stderr, "] %s  %.1f KB\n", dtype_str, data_size / 1024.0f);
     }
 
     has_mtp = true;
-    printf("MTP weights loaded: %.1f MB total\n", total_bytes / 1024.0 / 1024.0);
+    fprintf(stderr, "MTP weights loaded: %.1f MB total\n", total_bytes / 1024.0 / 1024.0);
 
     // v3+ footer: restricted vocab mapping [K, restricted_ids[K]]
     if (version >= 3 && f.peek() != EOF) {
@@ -204,7 +204,7 @@ void Model::load_mtp(const std::string& mtp_path) {
             // lm_head weights are in MTP tensors (mtp.lm_head.weight), FP16
             // The reduced_lm_head.weights will be set during upload from the MTP lm_head tensor
             has_reduced_lm_head = true;
-            printf("GWMT v%u: restricted vocab K=%u embedded in MTP file\n", version, K);
+            fprintf(stderr, "GWMT v%u: restricted vocab K=%u embedded in MTP file\n", version, K);
         }
 
         // v4 footer: has_idk flag
@@ -213,7 +213,7 @@ void Model::load_mtp(const std::string& mtp_path) {
             f.read(reinterpret_cast<char*>(&idk_flag), 1);
             reduced_lm_head.has_idk = (idk_flag != 0);
             if (reduced_lm_head.has_idk) {
-                printf("GWMT v4: IDK token enabled (index %u maps to -1)\n", K);
+                fprintf(stderr, "GWMT v4: IDK token enabled (index %u maps to -1)\n", K);
             }
         }
     }
@@ -241,7 +241,7 @@ void Model::load_reduced_lm_head(const std::string& path) {
     f.read(reinterpret_cast<char*>(&ggml_type), 4);
     f.read(reinterpret_cast<char*>(&row_bytes), 4);
 
-    printf("Loading reduced LM head: %u tokens, %u embed, type=%u, %u bytes/row\n",
+    fprintf(stderr, "Loading reduced LM head: %u tokens, %u embed, type=%u, %u bytes/row\n",
            K, n_embed, ggml_type, row_bytes);
 
     // Read token ID mapping
@@ -264,7 +264,7 @@ void Model::load_reduced_lm_head(const std::string& path) {
     reduced_lm_head.type = static_cast<GGMLType>(ggml_type);
 
     has_reduced_lm_head = true;
-    printf("Reduced LM head loaded: %u tokens, %.1f MB (%.1fx reduction)\n",
+    fprintf(stderr, "Reduced LM head loaded: %u tokens, %.1f MB (%.1fx reduction)\n",
            K, weight_bytes / 1024.0 / 1024.0,
            (float)config.n_vocab / K);
 }
@@ -320,7 +320,7 @@ void Model::upload_weights(CudaAllocator& allocator) {
         size_t ids_bytes = reduced_lm_head.K * sizeof(int32_t);
         reduced_lm_head.d_token_ids = static_cast<int*>(allocator.upload(
             reduced_lm_head.token_ids.data(), ids_bytes));
-        printf("Reduced LM head uploaded: %.1f MB weights + %.1f KB token map\n",
+        fprintf(stderr, "Reduced LM head uploaded: %.1f MB weights + %.1f KB token map\n",
                reduced_lm_head.weights.size_bytes / 1024.0 / 1024.0,
                ids_bytes / 1024.0);
     }
@@ -346,33 +346,33 @@ void Model::upload_weights(CudaAllocator& allocator) {
 }
 
 void Model::print_info() const {
-    printf("=== GWEN Model Info ===\n");
-    printf("Model: %s\n", gguf->path().c_str());
-    printf("Layers: %u (%u DeltaNet + %u FullAttn)\n",
+    fprintf(stderr, "=== GWEN Model Info ===\n");
+    fprintf(stderr, "Model: %s\n", gguf->path().c_str());
+    fprintf(stderr, "Layers: %u (%u DeltaNet + %u FullAttn)\n",
            config.n_layers,
            config.n_layers - config.n_layers / config.full_attn_interval,
            config.n_layers / config.full_attn_interval);
-    printf("Embed dim: %u\n", config.n_embed);
-    printf("FFN dim: %u\n", config.n_ff);
-    printf("Vocab: %u\n", config.n_vocab);
-    printf("Full Attn: %u heads (%u KV), head_dim=%u\n",
+    fprintf(stderr, "Embed dim: %u\n", config.n_embed);
+    fprintf(stderr, "FFN dim: %u\n", config.n_ff);
+    fprintf(stderr, "Vocab: %u\n", config.n_vocab);
+    fprintf(stderr, "Full Attn: %u heads (%u KV), head_dim=%u\n",
            config.n_head, config.n_head_kv, config.head_dim);
-    printf("DeltaNet: %u heads, state=%ux%u, inner=%u\n",
+    fprintf(stderr, "DeltaNet: %u heads, state=%ux%u, inner=%u\n",
            config.ssm_n_heads, config.ssm_state_size, config.ssm_state_size,
            config.ssm_inner_size);
-    printf("RoPE: theta=%.0f, dim=%u, sections=[%d,%d,%d,%d]\n",
+    fprintf(stderr, "RoPE: theta=%.0f, dim=%u, sections=[%d,%d,%d,%d]\n",
            config.rope_theta, config.rope_dim,
            config.rope_sections[0], config.rope_sections[1],
            config.rope_sections[2], config.rope_sections[3]);
-    printf("Context length: %u\n", config.context_length);
-    printf("RMSNorm eps: %e\n", config.rms_norm_eps);
+    fprintf(stderr, "Context length: %u\n", config.context_length);
+    fprintf(stderr, "RMSNorm eps: %e\n", config.rms_norm_eps);
 
     // Print layer pattern
-    printf("\nLayer pattern: ");
+    fprintf(stderr, "\nLayer pattern: ");
     for (uint32_t i = 0; i < config.n_layers; i++) {
-        printf("%c", config.is_full_attention_layer(i) ? 'A' : 'D');
+        fprintf(stderr, "%c", config.is_full_attention_layer(i) ? 'A' : 'D');
     }
-    printf("\n");
+    fprintf(stderr, "\n");
 
     // Weight summary
     size_t total_bytes = token_embd.size_bytes + output_norm.size_bytes;
@@ -397,8 +397,8 @@ void Model::print_info() const {
                           w.ffn_down.size_bytes;
         }
     }
-    printf("Total weight size: %.1f MB\n", total_bytes / 1024.0 / 1024.0);
-    printf("Tensors: %zu\n", gguf->n_tensors());
+    fprintf(stderr, "Total weight size: %.1f MB\n", total_bytes / 1024.0 / 1024.0);
+    fprintf(stderr, "Tensors: %zu\n", gguf->n_tensors());
 }
 
 } // namespace gwen

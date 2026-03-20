@@ -2581,11 +2581,11 @@ void InferenceState::allocate_batch_prefill(const ModelConfig& cfg, CudaAllocato
         + h_total                                                     // h_states
         + max_total_tokens * cfg.ssm_inner_size * sizeof(half);       // v_new
 
-    printf("Batch prefill: max_seqs=%d, max_tokens=%d\n", max_seqs, max_total_tokens);
-    printf("  DeltaNet S states: %.1f MB (%d seqs × %d layers × %.0f KB/layer)\n",
+    fprintf(stderr, "Batch prefill: max_seqs=%d, max_tokens=%d\n", max_seqs, max_total_tokens);
+    fprintf(stderr, "  DeltaNet S states: %.1f MB (%d seqs × %d layers × %.0f KB/layer)\n",
            S_total / 1024.0 / 1024.0, max_seqs, n_batch_dn_layers, S_per_layer / 1024.0);
-    printf("  Conv states: %.1f MB\n", conv_total / 1024.0 / 1024.0);
-    printf("  Chunkwise buffers: %.1f MB (NT_max=%d)\n", chunk_total / 1024.0 / 1024.0, chunk_NT_max);
+    fprintf(stderr, "  Conv states: %.1f MB\n", conv_total / 1024.0 / 1024.0);
+    fprintf(stderr, "  Chunkwise buffers: %.1f MB (NT_max=%d)\n", chunk_total / 1024.0 / 1024.0, chunk_NT_max);
 }
 
 // ============================================================
@@ -2646,10 +2646,10 @@ void InferenceState::allocate_mtp(const ModelConfig& cfg, CudaAllocator& alloc, 
                                     n_dn_layers * sizeof(float*), cudaMemcpyHostToDevice));
 
         size_t replay_total = n_dn_layers * S_bytes_per_layer + conv_replay_bytes;
-        printf("MTP state allocated (KV cache: %.1f MB, replay buffers: %.1f KB)\n",
+        fprintf(stderr, "MTP state allocated (KV cache: %.1f MB, replay buffers: %.1f KB)\n",
                2 * kv_bytes / 1024.0 / 1024.0, replay_total / 1024.0);
     } else {
-        printf("MTP state allocated (KV cache: %.1f MB, no DeltaNet layers)\n",
+        fprintf(stderr, "MTP state allocated (KV cache: %.1f MB, no DeltaNet layers)\n",
                2 * kv_bytes / 1024.0 / 1024.0);
     }
 }
@@ -2694,7 +2694,7 @@ void InferenceState::allocate_batch2(const ModelConfig& cfg, CudaAllocator& allo
     b2_argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
 
     batch2_allocated = true;
-    printf("Batch-2 verify buffers allocated\n");
+    fprintf(stderr, "Batch-2 verify buffers allocated\n");
 }
 
 // ============================================================
@@ -3249,7 +3249,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
 std::pair<int,int> InferenceState::forward_2tok(Model& model, int token_id_a, int token_id_b) {
     // Pack: [tok_a, pos_a, tok_b, pos_b] — 4 ints, one memcpy
     int params[4] = {token_id_a, pos, token_id_b, pos + 1};
-    GWEN_CHECK_CUDA(cudaMemcpy(d_token_id, params, 4 * sizeof(int), cudaMemcpyHostToDevice));
+    GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_id, params, 4 * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
     if (!graph_2tok_captured) {
         cudaGraph_t graph;
@@ -3279,7 +3279,7 @@ std::pair<int,int> InferenceState::forward_2tok(Model& model, int token_id_a, in
 int InferenceState::forward(Model& model, int token_id) {
     // Write token_id and pos to device memory in one copy (adjacent layout)
     int params[2] = {token_id, pos};
-    GWEN_CHECK_CUDA(cudaMemcpy(d_token_id, params, 2 * sizeof(int), cudaMemcpyHostToDevice));
+    GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_id, params, 2 * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
     if (!graph_captured) {
         // First call: capture the entire forward pass as a CUDA graph
@@ -3775,7 +3775,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
     // Upload token IDs to device (use pre-allocated buffer)
     int* d_token_ids = d_prefill_tokens;
-    GWEN_CHECK_CUDA(cudaMemcpy(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice));
+    GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
     // 1. Batch embedding lookup → F32 residual accumulator [N, 1024]
     {
@@ -4530,7 +4530,7 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t_prefill = std::chrono::high_resolution_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
-    printf("TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
+    fprintf(stderr, "TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
            prompt_tokens.size() / (ttft_ms / 1000.0));
 
     // Decode loop
@@ -4585,10 +4585,10 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
                 scored.push_back({host_logits[j], j});
             std::sort(scored.begin(), scored.end(),
                 [](auto& a, auto& b) { return a.first > b.first; });
-            printf("  [%d] token=%d logit=%.4f  top5:", i, next, scored[0].first);
+            fprintf(stderr, "  [%d] token=%d logit=%.4f  top5:", i, next, scored[0].first);
             for (int j = 0; j < 5; j++)
-                printf(" %d(%.2f)", scored[j].second, scored[j].first);
-            printf("\n");
+                fprintf(stderr, " %d(%.2f)", scored[j].second, scored[j].first);
+            fprintf(stderr, "\n");
         }
 
         if (logits_bin_fp) {
@@ -4804,7 +4804,7 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
 
 int InferenceState::forward_mtp(Model& model, int token_id) {
     int mtp_params[2] = {token_id, mtp_pos};
-    GWEN_CHECK_CUDA(cudaMemcpy(d_mtp_token, mtp_params, 2 * sizeof(int), cudaMemcpyHostToDevice));
+    GWEN_CHECK_CUDA(cudaMemcpyAsync(d_mtp_token, mtp_params, 2 * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
     if (!mtp_graph_captured) {
         cudaGraph_t graph;
@@ -4861,7 +4861,7 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t_prefill = std::chrono::high_resolution_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
-    printf("TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
+    fprintf(stderr, "TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
            prompt_tokens.size() / (ttft_ms / 1000.0));
 
     // First decode step: process the prefill prediction to set mtp_hidden
@@ -4904,7 +4904,7 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
             draft = forward_mtp(model, bonus);
         }
         if (idk_count > 0) {
-            printf("MTP IDK: %d tokens skipped speculation\n", idk_count);
+            fprintf(stderr, "MTP IDK: %d tokens skipped speculation\n", idk_count);
         }
         if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
         return output_tokens;
@@ -4951,7 +4951,7 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
         }
         if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
         int total = accepted + rejected;
-        printf("MTP stats: %d accepted, %d rejected, %d IDK (%.1f%% acceptance rate, %.1f%% IDK), %d cycles\n",
+        fprintf(stderr, "MTP stats: %d accepted, %d rejected, %d IDK (%.1f%% acceptance rate, %.1f%% IDK), %d cycles\n",
                accepted, rejected, idk_count,
                total > 0 ? 100.0 * accepted / total : 0.0,
                (total + idk_count) > 0 ? 100.0 * idk_count / (total + idk_count) : 0.0,
