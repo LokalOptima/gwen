@@ -71,16 +71,16 @@ static std::unordered_map<std::string, uint8_t> build_unicode_to_byte() {
     return map;
 }
 
-std::vector<int> Tokenizer::encode(const std::string& text) const {
-    // Step 1: Convert bytes to unicode characters (GPT-2 style)
+// BPE-encode a plain text segment (no special tokens)
+std::vector<int> Tokenizer::encode_bpe(const std::string& text) const {
+    if (text.empty()) return {};
+
     std::vector<std::string> tokens;
     for (uint8_t b : text) {
         tokens.push_back(byte_to_unicode(b));
     }
 
-    // Step 2: Apply BPE merges greedily
     while (tokens.size() > 1) {
-        // Find the highest-priority (lowest rank) merge that applies
         int best_rank = INT_MAX;
         int best_pos = -1;
 
@@ -93,21 +93,18 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
             }
         }
 
-        if (best_pos < 0) break;  // no more merges apply
+        if (best_pos < 0) break;
 
-        // Apply the merge
         tokens[best_pos] = tokens[best_pos] + tokens[best_pos + 1];
         tokens.erase(tokens.begin() + best_pos + 1);
     }
 
-    // Step 3: Look up token IDs
     std::vector<int> ids;
     for (const auto& t : tokens) {
         auto it = token_to_id_.find(t);
         if (it != token_to_id_.end()) {
             ids.push_back(it->second);
         } else {
-            // Fallback: encode as individual bytes (should rarely happen)
             for (uint8_t b : t) {
                 auto bit = token_to_id_.find(byte_to_unicode(b));
                 if (bit != token_to_id_.end()) {
@@ -116,6 +113,66 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
             }
         }
     }
+
+    return ids;
+}
+
+std::vector<int> Tokenizer::encode(const std::string& text) const {
+    enum { NORMAL, SAW_LT, IN_SPECIAL } state = NORMAL;
+
+    std::vector<int> ids;
+    std::string buf;
+    std::string special;
+
+    for (size_t i = 0; i < text.size(); i++) {
+        char c = text[i];
+        switch (state) {
+        case NORMAL:
+            if (c == '<') state = SAW_LT;
+            else buf += c;
+            break;
+
+        case SAW_LT:
+            if (c == '|') {
+                special = "<|";
+                state = IN_SPECIAL;
+            } else {
+                buf += '<';
+                buf += c;
+                state = NORMAL;
+            }
+            break;
+
+        case IN_SPECIAL:
+            special += c;
+            if (c == '|' && i + 1 < text.size() && text[i + 1] == '>') {
+                special += '>';
+                i++;
+                // Flush plain text, then emit special token
+                auto it = token_to_id_.find(special);
+                if (it == token_to_id_.end()) {
+                    fprintf(stderr, "tokenizer: unknown special token: %s\n", special.c_str());
+                    exit(1);
+                }
+                auto bpe = encode_bpe(buf);
+                ids.insert(ids.end(), bpe.begin(), bpe.end());
+                buf.clear();
+                ids.push_back(it->second);
+                special.clear();
+                state = NORMAL;
+            }
+            break;
+        }
+    }
+
+    if (state != NORMAL) {
+        fprintf(stderr, "tokenizer: unterminated special token: %s\n",
+                state == SAW_LT ? "<" : special.c_str());
+        exit(1);
+    }
+
+    auto bpe = encode_bpe(buf);
+    ids.insert(ids.end(), bpe.begin(), bpe.end());
 
     return ids;
 }

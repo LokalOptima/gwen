@@ -1,0 +1,31 @@
+Remove filler words (uh, um) and stuttered repetitions.
+Fix capitalization and punctuation.
+Do NOT change, replace, rephrase, or reorder any other words.
+Copy everything else exactly.
+
+IN: I I think we should uh probably go with the first option
+OUT: I think we should probably go with the first option.<|endoftext|>
+
+IN: it's uh it's basically um a wrapper around the the main API
+OUT: It's basically a wrapper around the main API.<|endoftext|>
+
+IN: the function takes a list of no sorry a dictionary of parameters
+OUT: The function takes a list of, no sorry, a dictionary of parameters.<|endoftext|>
+
+IN: He hoped there would be stew for dinner, turnips and carrots and bruised potatoes and fat mutton pieces to be ladled out in thick, peppered, flour fattened sauce,
+OUT: He hoped there would be stew for dinner, turnips and carrots and bruised potatoes and fat mutton pieces to be ladled out in thick, peppered, flour fattened sauce.<|endoftext|>
+
+IN: uh what
+OUT: What?<|endoftext|>
+
+IN: Please review the pull request before merging.
+OUT: Please review the pull request before merging.<|endoftext|>
+
+IN: Uh recently we started working to with ABB, one of the world's leading global technology companies.
+OUT: Recently, we started working to with ABB, one of the world's leading global technology companies.<|endoftext|>
+
+IN: um ok go ahead
+OUT: OK, go ahead.<|endoftext|>
+
+IN: {input}
+OUT:

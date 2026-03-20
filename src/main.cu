@@ -89,6 +89,12 @@ int main(int argc, char** argv) {
 
     (void)output_logits;
 
+    // Positional argument after flags = input text
+    std::string input_text;
+    if (optind < argc) {
+        input_text = argv[optind];
+    }
+
     if (model_path.empty()) {
         fprintf(stderr, "Error: --model is required\n");
         print_usage(argv[0]);
@@ -324,14 +330,33 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // If prompt is a file path, read its contents
+    {
+        std::ifstream pf(prompt);
+        if (pf.is_open()) {
+            std::string contents((std::istreambuf_iterator<char>(pf)),
+                                  std::istreambuf_iterator<char>());
+            prompt = std::move(contents);
+        }
+    }
+
+    // Substitute {input} in prompt, or append input text
+    if (!input_text.empty()) {
+        auto pos = prompt.find("{input}");
+        if (pos != std::string::npos) {
+            prompt.replace(pos, 7, input_text);
+        } else {
+            prompt += input_text;
+        }
+    }
+
     // Tokenize prompt
     auto prompt_tokens = tokenizer->encode(prompt);
     printf("\nPrompt: %s\n", prompt.c_str());
     printf("Prompt tokens (%zu): ", prompt_tokens.size());
-    for (int i = 0; i < (int)prompt_tokens.size() && i < 20; i++) {
+    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
         printf("%d ", prompt_tokens[i]);
     }
-    if (prompt_tokens.size() > 20) printf("...");
     printf("\n");
 
     // Allocate inference state

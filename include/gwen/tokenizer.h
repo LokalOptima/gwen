@@ -13,8 +13,11 @@ class Tokenizer {
 public:
     static std::unique_ptr<Tokenizer> from_gguf(const GGUFFile& gguf);
 
-    // Encode text to token IDs (basic BPE)
+    // Encode text to token IDs (handles <|special|> tokens, then BPE)
     std::vector<int> encode(const std::string& text) const;
+
+    // BPE-encode a plain text segment (no special tokens)
+    std::vector<int> encode_bpe(const std::string& text) const;
 
     // Decode token IDs to text
     std::string decode(const std::vector<int>& tokens) const;
