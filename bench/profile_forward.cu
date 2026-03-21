@@ -9,7 +9,7 @@
 using namespace gwen;
 
 int main(int argc, char** argv) {
-    const char* model_path = argc > 1 ? argv[1] : "Qwen3.5-0.8B-Q4_K_M.gguf";
+    const char* model_path = argc > 1 ? argv[1] : "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf";
     int n_warmup = 10;
     int n_measure = 50;
 

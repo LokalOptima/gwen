@@ -20,7 +20,7 @@ import numpy as np
 
 GOLDEN_DIR = Path("tests/golden")
 GWEN = "./build/gwen"
-MODEL = "Qwen3.5-0.8B-Q4_K_M.gguf"
+MODEL = "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
 
 PROMPTS = [
     "The quick brown fox",

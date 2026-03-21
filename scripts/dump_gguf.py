@@ -3,9 +3,9 @@
 Dump GGUF file metadata and tensor info for debugging.
 
 Usage:
-    uv run scripts/dump_gguf.py Qwen3.5-0.8B-Q4_K_M.gguf
-    uv run scripts/dump_gguf.py Qwen3.5-0.8B-Q4_K_M.gguf --tensors    # show all tensors
-    uv run scripts/dump_gguf.py Qwen3.5-0.8B-Q4_K_M.gguf --layer 3    # show specific layer
+    uv run scripts/dump_gguf.py Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf
+    uv run scripts/dump_gguf.py Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf --tensors    # show all tensors
+    uv run scripts/dump_gguf.py Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf --layer 3    # show specific layer
 """
 
 import argparse

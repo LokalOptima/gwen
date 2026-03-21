@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).parent.parent
-MODEL_PATH = PROJECT_ROOT / "Qwen3.5-0.8B-Q4_K_M.gguf"
+MODEL_PATH = PROJECT_ROOT / "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
 LLAMACPP_BIN = PROJECT_ROOT / "third_party" / "llama.cpp" / "build" / "bin"
 GWEN_BIN = PROJECT_ROOT / "build" / "gwen"
 RESULTS_DIR = PROJECT_ROOT / "bench" / "results"

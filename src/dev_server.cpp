@@ -4,7 +4,7 @@
 //   POST /batch_logits  — returns hidden states + teacher logits over restricted vocab
 //
 // Usage:
-//   build/gwen_dev_server --model Qwen3.5-0.8B-Q4_K_M.gguf \
+//   build/gwen_dev_server --model Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf \
 //       --restricted-vocab data/restricted_vocab_4096.bin --port 8090
 
 #include "httplib.h"

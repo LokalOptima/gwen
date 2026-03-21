@@ -2,7 +2,7 @@
 # GWEN vs llama.cpp — comprehensive benchmark
 # Usage: ./scripts/bench.sh [n_tokens]
 
-MODEL="Qwen3.5-0.8B-Q4_K_M.gguf"
+MODEL="Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
 GWEN="./build/gwen"
 LLAMA_SIMPLE="./third_party/llama.cpp/build/bin/llama-simple"
 LLAMA_GENERATE="./tests/llama_generate"
@@ -11,7 +11,7 @@ N=${1:-100}
 echo "╔══════════════════════════════════════════════════╗"
 echo "║     GWEN vs llama.cpp — Performance Report      ║"
 echo "╠══════════════════════════════════════════════════╣"
-echo "║ Model:  Qwen3.5-0.8B-Q4_K_M (Q4_K/Q5_K/Q6_K)  ║"
+echo "║ Model:  Qwen3.5-0.8B-Base-Q4_K_M-patched        ║"
 echo "║ GPU:    NVIDIA RTX 5070 Ti (SM_120, 16GB GDDR7) ║"
 echo "║ Decode: $N tokens, greedy                        ║"
 echo "╚══════════════════════════════════════════════════╝"

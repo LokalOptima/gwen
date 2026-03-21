@@ -3,8 +3,8 @@
 # Usage: ./scripts/bench_mtp.sh [n_tokens] [runs_per_prompt]
 set -euo pipefail
 
-MODEL="${HOME}/models/gguf/Qwen3.5-0.8B-Q4_K_M.gguf"
-MTP="train/runs/mtp_v3_k4096/mtp_finetuned.bin"
+MODEL="${HOME}/models/gguf/Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
+MTP="train/runs/mtp_v6_base_k4096/mtp_finetuned.bin"
 GWEN="./build/gwen"
 N=${1:-200}
 RUNS=${2:-3}
@@ -33,7 +33,7 @@ declare -a LABELS=(
 
 echo "================================================================"
 echo "  GWEN Speculative Decode Benchmark"
-echo "  Model: Qwen3.5-0.8B-Q4_K_M | MTP: K=4096 fine-tuned"
+echo "  Model: Qwen3.5-0.8B-Base-Q4_K_M-patched | MTP: K=4096 fine-tuned"
 echo "  n_predict=$N, runs=$RUNS per prompt"
 echo "================================================================"
 echo ""

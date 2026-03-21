@@ -20,9 +20,9 @@ Binary format (GWMT):
     Shape stored as original logical shape; data_size = ceil(n_elements/32) * 34
 
 Usage:
-    uv run --with safetensors --with numpy --with ml-dtypes scripts/extract_mtp_weights.py --model-dir ~/models/hf/Qwen3.5-0.8B
-    uv run --with safetensors --with numpy --with ml-dtypes scripts/extract_mtp_weights.py --model-dir ~/models/hf/Qwen3.5-0.8B --quantize q8_0
-    uv run --with safetensors --with numpy --with ml-dtypes scripts/extract_mtp_weights.py --model-dir ~/models/hf/Qwen3.5-0.8B --output ~/models/gguf/Qwen3.5-0.8B-mtp-q8.bin --quantize q8_0
+    uv run --with safetensors --with numpy --with ml-dtypes scripts/extract_mtp_weights.py --model-dir ~/models/hf/Qwen3.5-0.8B-Base
+    uv run --with safetensors --with numpy --with ml-dtypes scripts/extract_mtp_weights.py --model-dir ~/models/hf/Qwen3.5-0.8B-Base --quantize q8_0
+    uv run --with safetensors --with numpy --with ml-dtypes scripts/extract_mtp_weights.py --model-dir ~/models/hf/Qwen3.5-0.8B-Base --output ~/models/gguf/Qwen3.5-0.8B-Base-mtp-q8.bin --quantize q8_0
 """
 
 import argparse

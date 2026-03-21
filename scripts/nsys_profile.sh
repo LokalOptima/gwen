@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-MODEL="Qwen3.5-0.8B-Q4_K_M.gguf"
+MODEL="Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
 GWEN="./build/gwen"
 NAME="${1:-gwen_decode}"
 OUTDIR="profiles"

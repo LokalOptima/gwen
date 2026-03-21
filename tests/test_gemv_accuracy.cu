@@ -12,7 +12,7 @@ using namespace gwen;
 
 int main() {
     // Load model
-    auto model = Model::load("Qwen3.5-0.8B-Q4_K_M.gguf");
+    auto model = Model::load("Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf");
 
     CudaAllocator allocator;
     model->upload_weights(allocator);

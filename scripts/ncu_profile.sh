@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-MODEL="Qwen3.5-0.8B-Q4_K_M.gguf"
+MODEL="Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
 GWEN="./build/gwen"
 KERNEL_FILTER="${1:-}"
 NAME="${2:-gwen_kernels}"
