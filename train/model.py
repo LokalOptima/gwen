@@ -332,21 +332,26 @@ class MTPHead(nn.Module):
 
         # Initialize lm_head from pre-trained weights if vocab mapping provided.
         # Qwen3.5 ties lm_head = embed_tokens, and MTP shares it with the main model.
-        # So we load from embed_tokens and slice to the restricted vocab.
+        # Prefer Q6K-dequantized embeddings (matches CUDA runtime exactly).
         if vocab_ids is not None:
-            # Find embedding tensor
-            emb_keys = ["model.language_model.embed_tokens.weight", "model.embed_tokens.weight"]
+            import numpy as np
+            q6k_path = Path("data/embed_tokens_q6k.npy")
             full_lm_head = None
-            for st_path in paths:
-                with safe_open(str(st_path), framework="pt") as f:
-                    for ek in emb_keys:
-                        if ek in f.keys():
-                            full_lm_head = f.get_tensor(ek)
-                            break
-                if full_lm_head is not None:
-                    break
+            if q6k_path.exists():
+                print(f"Loading lm_head init from {q6k_path} (matches CUDA runtime)")
+                full_lm_head = torch.from_numpy(np.load(str(q6k_path))).to(dtype=torch.float16)
+            else:
+                # Fallback to safetensors
+                emb_keys = ["model.language_model.embed_tokens.weight", "model.embed_tokens.weight"]
+                for st_path in paths:
+                    with safe_open(str(st_path), framework="pt") as f:
+                        for ek in emb_keys:
+                            if ek in f.keys():
+                                full_lm_head = f.get_tensor(ek)
+                                break
+                    if full_lm_head is not None:
+                        break
             if full_lm_head is not None:
-                import numpy as np
                 ids = np.array(vocab_ids, dtype=np.int64)
                 restricted_rows = full_lm_head[ids]  # [K, 1024]
                 if idk:

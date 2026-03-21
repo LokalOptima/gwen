@@ -112,13 +112,19 @@ def load_embeddings(model_dir: Path, device: str) -> torch.Tensor:
 
 
 def _load_output_norm(model_dir: Path) -> torch.Tensor:
-    """Load the output RMSNorm weight (model.norm.weight) from safetensors.
+    """Load the output RMSNorm weight.
 
-    Qwen3.5 convention: stored as additive offset w, applied as x * (1 + w).
-    Our convention: x * weight, so we return (1 + w).
+    Prefers data/output_norm.npy (extracted from GGUF by 02_prepare_models.py,
+    already in multiplicative form). Falls back to safetensors with 1+w conversion.
     """
+    npy_path = Path("data/output_norm.npy")
+    if npy_path.exists():
+        log(f"Loading output norm from {npy_path} (matches CUDA runtime)")
+        return torch.from_numpy(np.load(str(npy_path))).float()
+
     from safetensors import safe_open
 
+    log(f"WARNING: {npy_path} not found, falling back to safetensors")
     model_dir = Path(model_dir)
     norm_keys = ["model.norm.weight", "model.language_model.norm.weight"]
 
@@ -140,7 +146,7 @@ def _load_output_norm(model_dir: Path) -> torch.Tensor:
                         w = f.get_tensor(nk)
                         return (w.float() + 1.0)
 
-    raise KeyError(f"Cannot find output norm weight in {model_dir}")
+    raise KeyError(f"Cannot find output norm weight in {model_dir} or {npy_path}")
 
 
 
@@ -256,6 +262,7 @@ def run_eval(
     output_norm_weight: torch.Tensor | None = None,
     output_norm_eps: float = 1e-6,
     sparse_k: int = 0,
+    idk_weight: float = 1.0,
 ) -> tuple[float, float, int, dict]:
     """Run validation with KL distillation loss.
 
@@ -724,12 +731,13 @@ def train(args: argparse.Namespace) -> None:
         restricted_embed=restricted_embed, output_norm_weight=output_norm_weight,
         output_norm_eps=output_norm_eps,
         sparse_k=sparse_k,
+        idk_weight=args.idk_weight,
     )
 
-    if (args.init_from and use_sparse) or args.resume:
-        # Skip initial eval: meaningless when IDK is zeros (init-from), or redundant (resume)
-        log("\nSkipping initial eval")
-    else:
+    # Initial eval — skip if lm_head is untrained (stage1), resuming, or warm-starting IDK
+    run_initial_eval = not (args.resume or stage1_steps > 0 or (args.init_from and use_sparse))
+
+    if run_initial_eval:
         log("\nRunning initial eval (baseline)...")
         val_loss, accept_rate, _, idk_m = run_eval(
             mtp, val_cache_files, val_dl if not val_cache_files else None,
@@ -745,12 +753,13 @@ def train(args: argparse.Namespace) -> None:
             log(f"  Baseline: val_loss={val_loss:.4f}, accept={accept_rate:.1%}")
             log_file.write(f"0,0.0000,0,,,{val_loss:.6f},{accept_rate:.4f},{args.lr:.6e}\n")
         log_file.flush()
-
-    if not ((args.init_from and use_sparse) or args.resume):
         if val_loss < best_val:
             best_val = val_loss
         if accept_rate > best_accept:
             best_accept = accept_rate
+    else:
+        reason = "stage 1 pending" if stage1_steps > 0 else "resuming" if args.resume else "warm-start"
+        log(f"\nSkipping initial eval ({reason})")
 
     # Early stopping
     patience_counter = 0
@@ -843,6 +852,7 @@ def train(args: argparse.Namespace) -> None:
         batch_iter = iter(train_dl)
 
         for batch in batch_iter:
+            eval_now = False
             token_ids = batch["token_ids"]
             B, L = token_ids.shape
             batch_tokens = B * L
@@ -943,6 +953,7 @@ def train(args: argparse.Namespace) -> None:
                 transition_to_stage2()
                 stage_label = f"S{current_stage}"
                 pbar.set_description(f"[{stage_label}] Epoch {epoch+1}/{total_epochs}")
+                eval_now = True
 
             # Progress bar: tokens + steps
             avg = epoch_loss / n_batches
@@ -992,7 +1003,8 @@ def train(args: argparse.Namespace) -> None:
                 }, out_dir / "latest.pt")
 
             # --- Periodic eval ---
-            if steps_since_eval >= args.eval_every:
+            eval_now = eval_now or steps_since_eval >= args.eval_every
+            if eval_now:
                 val_loss, accept_rate, _, idk_m = run_eval(
                     mtp, val_cache_files, val_dl if not val_cache_files else None,
                     gwen if not val_cache_files else None, **eval_kwargs,
@@ -1208,14 +1220,14 @@ def main():
     p = sub.add_parser("train", help="Train MTP head with KL distillation (v3)")
     p.add_argument("--data", type=Path, required=True, help="Tokenized data (uint32 binary)")
     p.add_argument("--counts", type=Path, default=Path("data/token_counts.bin"))
-    p.add_argument("--model-dir", type=Path, default=Path.home() / "models" / "hf" / "Qwen3.5-0.8B")
+    p.add_argument("--model-dir", type=Path, default=Path.home() / "models" / "hf" / "Qwen3.5-0.8B-Base")
     p.add_argument("--server-url", type=str, default="http://127.0.0.1:8090",
                     help="Dev server URL (gwen_dev_server with --restricted-vocab)")
-    p.add_argument("--out-dir", type=Path, default=Path("train/runs/mtp_v3"))
+    p.add_argument("--out-dir", type=Path, default=Path("train/runs/mtp_v6_base_k4096"))
     p.add_argument("--top-k", type=int, default=4096, help="Restricted vocab size")
     p.add_argument("--epochs", type=int, default=1,
                     help="Training epochs (1 pass over ~500M tokens is sufficient)")
-    p.add_argument("--stage1-steps", type=int, default=1000,
+    p.add_argument("--stage1-steps", type=int, default=0,
                     help="Stage 1 steps (lm_head warmup only, 0 to skip)")
     p.add_argument("--stage1-lr", type=float, default=1e-3,
                     help="Stage 1 learning rate (IBM Recurrent Drafter)")
