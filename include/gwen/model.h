@@ -68,6 +68,11 @@ struct MTPWeights {
     FullAttnLayerWeights layer;     // 1 full attention transformer layer
     WeightRef output_norm;          // [n_embed] F32 — final RMSNorm before lm_head
     // lm_head is shared with token_embd (no dedicated weights)
+
+    // OOV gate (v5/v7): binary classifier "is next token OOV?"
+    WeightRef oov_weight;           // [1, n_embed] FP16
+    float oov_bias = 0.0f;         // scalar bias
+    bool has_oov_head = false;
 };
 
 // Reduced LM head for fast MTP (GWRL format — vocabulary pruning)

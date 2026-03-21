@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import struct
 import sys
 import time
@@ -226,15 +227,15 @@ def sparse_distillation_loss(
     log_z = log_Z.reshape(-1).float()             # [N]
     n_tokens = student_flat.shape[0]
 
-    # Teacher distribution: top-k true probs, renormalized
+    # Teacher distribution: true probs from log_Z (no renormalization)
     teacher_topk_probs = (topk_val - log_z.unsqueeze(-1)).exp().clamp(min=1e-8)  # [N, k]
-    teacher_topk_probs = teacher_topk_probs / teacher_topk_probs.sum(-1, keepdim=True)  # renormalize
 
     # Student distribution: logsumexp + gather
     s_logZ = student_flat.float().logsumexp(dim=-1)                    # [N]
     s_topk_log = student_flat.float().gather(-1, topk_idx.long()) - s_logZ.unsqueeze(-1)  # [N, k]
 
-    # KL divergence over k categories: sum_i p_i * (log p_i - log q_i)
+    # Partial KL: only on top-k positions, weighted by true teacher probs
+    # Tail mass doesn't participate — no signal pushing student mass toward or away from tail
     kl_topk = teacher_topk_probs * (teacher_topk_probs.log() - s_topk_log)  # [N, k]
     loss = kl_topk.sum(-1).mean()
 
@@ -857,6 +858,25 @@ def train(args: argparse.Namespace) -> None:
     t_start = time.time()
     tokens_at_start = tokens_seen
 
+    # Graceful shutdown on Ctrl-C: save checkpoint before exiting
+    _interrupted = False
+
+    def _sigint_handler(sig, frame):
+        nonlocal _interrupted
+        if _interrupted:
+            log("\nForced exit (second Ctrl-C)")
+            sys.exit(1)
+        _interrupted = True
+        log("\nInterrupted — will save checkpoint after current batch")
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    # EMA for progress bar display
+    ema_alpha = 0.05
+    ema_oov_rate = None
+    ema_loss_token = None
+    ema_loss_oov = None
+
     best_cost = float("inf")
 
     def save_checkpoint(val_loss, accept_rate, epoch, outcome_metrics=None):
@@ -962,6 +982,8 @@ def train(args: argparse.Namespace) -> None:
             n_chunks = (B + max_chunk - 1) // max_chunk
             optimizer.zero_grad(set_to_none=True)
             batch_loss = 0.0
+            batch_loss_token = 0.0
+            batch_loss_oov = 0.0
             skip = False
             batch_oov_rate = 0.0
             batch_oov_total = 0
@@ -1002,6 +1024,9 @@ def train(args: argparse.Namespace) -> None:
 
                 scaler.scale(loss).backward()
                 batch_loss += loss.item()
+                if use_sparse:
+                    batch_loss_token += loss_token.item() / n_chunks
+                    batch_loss_oov += loss_oov.item() / n_chunks
 
                 # Track batch OOV gate rate
                 if use_sparse:
@@ -1028,6 +1053,30 @@ def train(args: argparse.Namespace) -> None:
             n_batches += 1
             global_step += 1
 
+            # Graceful shutdown
+            if _interrupted:
+                log(f"\nSaving checkpoint at step {global_step}...")
+                torch.save({
+                    "model": mtp.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "tokens_seen": tokens_seen,
+                    "val_loss": best_val,
+                    "accept_rate": best_accept,
+                    "vocab_k": args.top_k,
+                    "temperature": T,
+                    "stage": current_stage,
+                    "timestamp": time.time(),
+                    "has_oov_head": True,
+                    "sparse_k": sparse_k,
+                }, out_dir / "latest.pt")
+                log(f"Saved {out_dir / 'latest.pt'} (step={global_step}, tokens={tokens_seen/1e6:.0f}M)")
+                pbar.close()
+                log_file.close()
+                sys.exit(0)
+
             # Stage transition: step-based
             if current_stage == 1 and global_step >= stage1_steps:
                 transition_to_stage2()
@@ -1043,9 +1092,12 @@ def train(args: argparse.Namespace) -> None:
             pbar.update(batch_tokens / 1e6)
             if use_sparse:
                 oov_gate_rate = batch_oov_rate / max(batch_oov_total, 1)
+                ema_oov_rate = oov_gate_rate if ema_oov_rate is None else ema_alpha * oov_gate_rate + (1 - ema_alpha) * ema_oov_rate
+                ema_loss_token = batch_loss_token if ema_loss_token is None else ema_alpha * batch_loss_token + (1 - ema_alpha) * ema_loss_token
+                ema_loss_oov = batch_loss_oov if ema_loss_oov is None else ema_alpha * batch_loss_oov + (1 - ema_alpha) * ema_loss_oov
                 pbar.set_postfix_str(
-                    f"step {global_step}, loss={avg:.4f} lr={lr_val:.1e} "
-                    f"oov={oov_gate_rate:.1%} ({tok_per_sec/1e3:.1f}K tok/s)"
+                    f"step {global_step}, tok={ema_loss_token:.4f} oov={ema_loss_oov:.4f} "
+                    f"lr={lr_val:.1e} gate={ema_oov_rate:.1%} ({tok_per_sec/1e3:.1f}K tok/s)"
                 )
             else:
                 pbar.set_postfix_str(

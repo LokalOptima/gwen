@@ -69,6 +69,7 @@ struct InferenceState {
     void* x_q8_b = nullptr;        // Q8_1 of ffn_out/gated_out (max: n_ff/32 blocks)
 
     int* d_argmax_token = nullptr; // pre-allocated argmax result
+    float* d_oov_logit = nullptr;  // [1] OOV gate output (v7)
     float* argmax_partial_max = nullptr; // [256] scratch for multi-block argmax
     int* argmax_partial_idx = nullptr;   // [256] scratch for multi-block argmax
     int* d_pos = nullptr;          // device-side position (for CUDA graph)
