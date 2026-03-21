@@ -26,6 +26,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  --batch-extract FILE Batch GEMM extract mode: read prompts from FILE (one per line)\n");
     fprintf(stderr, "  --seq-len N          Sequence length for batch-extract (pad/truncate, default: 512)\n");
     fprintf(stderr, "  --compare-extract    Compare extract_hidden (F32 GEMV) vs extract_hidden_batch (B=1 GEMM)\n");
+    fprintf(stderr, "  --profile-cycles     Profile per-operation CUDA timing in speculative decode\n");
     fprintf(stderr, "  --info               Print model info and exit\n");
     fprintf(stderr, "  --help               Show this help\n");
 }
@@ -44,6 +45,7 @@ int main(int argc, char** argv) {
     bool output_logits = false;
     bool info_only = false;
     bool compare_extract = false;
+    bool profile_cycles = false;
     int seq_len = 512;
 
     static struct option long_options[] = {
@@ -60,13 +62,14 @@ int main(int argc, char** argv) {
         {"batch-extract",required_argument, nullptr, 'B'},
         {"seq-len",      required_argument, nullptr, 'S'},
         {"compare-extract", no_argument,    nullptr, 'C'},
+        {"profile-cycles", no_argument,    nullptr, 'P'},
         {"info",         no_argument,       nullptr, 'i'},
         {"help",         no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:L:T:p:n:t:B:S:Cgblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:L:T:p:n:t:B:S:CPgblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
@@ -81,6 +84,7 @@ int main(int argc, char** argv) {
             case 'B': batch_extract_file = optarg; break;
             case 'S': seq_len = atoi(optarg); break;
             case 'C': compare_extract = true; break;
+            case 'P': profile_cycles = true; break;
             case 'i': info_only = true; break;
             case 'h': print_usage(argv[0]); return 0;
             default:  print_usage(argv[0]); return 1;
@@ -374,6 +378,7 @@ int main(int argc, char** argv) {
         state.allocate_mtp(model->config, allocator, 4096);
         state.allocate_batch2(model->config, allocator);
         state.mtp_confidence_threshold = mtp_threshold;
+        state.profile_cycles = profile_cycles;
     }
     fprintf(stderr, "Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 

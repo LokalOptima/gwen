@@ -111,6 +111,9 @@ struct InferenceState {
     cudaGraphExec_t graph_2tok_exec = nullptr;
     bool graph_2tok_captured = false;
 
+    // Cycle profiling (--profile-cycles)
+    bool profile_cycles = false;
+
     // Allocate all buffers
     void allocate(const ModelConfig& cfg, CudaAllocator& alloc, int max_seq = 4096);
 

@@ -4914,39 +4914,91 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
     // CPU dispatches two CUDA graphs per cycle (forward_2tok + MTP) with one int comparison
     // between them. CPU overhead is ~30 μs per 1.6 ms cycle (~2% of wall time).
     {
+        // Cycle profiling: CUDA events for per-operation timing
+        cudaEvent_t ev_start = nullptr, ev_end = nullptr;
+        struct TimingStats {
+            double sum = 0, sum_sq = 0, min_val = 1e9, max_val = 0;
+            int count = 0;
+            void record(float ms) {
+                sum += ms; sum_sq += (double)ms * ms;
+                if (ms < min_val) min_val = ms;
+                if (ms > max_val) max_val = ms;
+                count++;
+            }
+            double avg() const { return count > 0 ? sum / count : 0; }
+            double stddev() const {
+                if (count < 2) return 0;
+                double mean = avg();
+                return sqrt(sum_sq / count - mean * mean);
+            }
+        };
+        TimingStats t_1tok, t_2tok, t_mtp, t_rollback;
+
+        if (profile_cycles) {
+            GWEN_CHECK_CUDA(cudaEventCreate(&ev_start));
+            GWEN_CHECK_CUDA(cudaEventCreate(&ev_end));
+        }
+
+        auto time_op_begin = [&]() {
+            if (profile_cycles) {
+                GWEN_CHECK_CUDA(cudaEventRecord(ev_start, compute_stream));
+            }
+        };
+        auto time_op_end = [&](TimingStats& stats) {
+            if (profile_cycles) {
+                GWEN_CHECK_CUDA(cudaEventRecord(ev_end, compute_stream));
+                GWEN_CHECK_CUDA(cudaEventSynchronize(ev_end));
+                float ms;
+                GWEN_CHECK_CUDA(cudaEventElapsedTime(&ms, ev_start, ev_end));
+                stats.record(ms);
+            }
+        };
+
         int accepted = 0, rejected = 0, idk_count = 0;
         while ((int)output_tokens.size() < n_predict) {
             if (draft == -1) {
                 // IDK: skip forward_2tok, fall back to regular forward
+                time_op_begin();
                 int next = forward(model, output_tokens.back());
+                time_op_end(t_1tok);
                 output_tokens.push_back(next);
                 idk_count++;
                 if (next == (int)model.config.eos_token_id) break;
                 if ((int)output_tokens.size() >= n_predict) break;
+                time_op_begin();
                 draft = forward_mtp(model, next);
+                time_op_end(t_mtp);
                 continue;
             }
             int last_token = output_tokens.back();
+            time_op_begin();
             auto [pred_a, pred_b] = forward_2tok(model, last_token, draft);
+            time_op_end(t_2tok);
             if (pred_a == draft) {
                 output_tokens.push_back(draft);
                 output_tokens.push_back(pred_b);
                 accepted++;
                 if (pred_b == (int)model.config.eos_token_id) break;
                 if ((int)output_tokens.size() >= n_predict) break;
+                time_op_begin();
                 draft = forward_mtp(model, pred_b);
+                time_op_end(t_mtp);
             } else {
                 rejected++;
+                time_op_begin();
                 undo_deltanet_token_b(compute_stream);
                 pos -= 1;
                 GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, mtp_hidden_b,
                     model.config.n_embed * sizeof(half),
                     cudaMemcpyDeviceToDevice, compute_stream));
                 GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+                time_op_end(t_rollback);
                 output_tokens.push_back(pred_a);
                 if (pred_a == (int)model.config.eos_token_id) break;
                 if ((int)output_tokens.size() >= n_predict) break;
+                time_op_begin();
                 draft = forward_mtp(model, pred_a);
+                time_op_end(t_mtp);
             }
         }
         if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
@@ -4956,8 +5008,28 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
                total > 0 ? 100.0 * accepted / total : 0.0,
                (total + idk_count) > 0 ? 100.0 * idk_count / (total + idk_count) : 0.0,
                total + idk_count);
+
+        if (profile_cycles) {
+            fprintf(stderr, "\n--- Cycle Timing (ms) ---\n");
+            fprintf(stderr, "%-14s  %6s  %6s  %6s  %6s  %5s\n", "Operation", "avg", "min", "max", "stddev", "count");
+            auto print_row = [](const char* name, const TimingStats& s) {
+                if (s.count > 0) {
+                    fprintf(stderr, "%-14s  %6.3f  %6.3f  %6.3f  %6.3f  %5d\n",
+                            name, s.avg(), s.min_val, s.max_val, s.stddev(), s.count);
+                }
+            };
+            print_row("forward_1tok", t_1tok);
+            print_row("forward_2tok", t_2tok);
+            print_row("forward_mtp", t_mtp);
+            print_row("rollback", t_rollback);
+            fprintf(stderr, "\n");
+            GWEN_CHECK_CUDA(cudaEventDestroy(ev_start));
+            GWEN_CHECK_CUDA(cudaEventDestroy(ev_end));
+        }
+
         return output_tokens;
     }
 }
+
 
 } // namespace gwen

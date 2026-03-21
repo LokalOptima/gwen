@@ -192,23 +192,23 @@ def sparse_distillation_loss(
     topk_values: torch.Tensor,
     log_Z: torch.Tensor,
     mask: torch.Tensor | None = None,
-    idk_weight: float = 1.0,
 ) -> torch.Tensor:
-    """65-category KL divergence for sparse distillation (v5).
+    """k-category KL divergence for sparse distillation (v7).
 
-    Teacher distribution has 65 categories: top-64 true probs + IDK bucket.
-    Student distribution: softmax(K+1 logits), gather top-64 + IDK neuron.
+    Teacher distribution: top-k true probs (renormalized to sum to 1).
+    Student distribution: softmax(K logits), gather top-k positions.
+
+    Only trains on non-OOV positions (mask applied by caller).
 
     Args:
-        student_logits: [*, K+1] raw logits (K restricted + IDK neuron)
+        student_logits: [*, K] raw logits (K restricted vocab)
         topk_indices: [*, k] int32, teacher's top-k indices into [0, K)
         topk_values: [*, k] fp16, teacher's top-k raw logits
         log_Z: [*] f32, teacher's full-vocab log-partition function
-        mask: optional [*] bool mask
-        idk_weight: weight on IDK KL term (< 1.0 to reduce over-abstention)
+        mask: optional [*] bool mask (True = include in loss)
 
     Returns:
-        Scalar loss (per-token averaged KL divergence over 65 categories)
+        Scalar loss (per-token averaged KL divergence over k categories)
     """
     if mask is not None:
         student_logits = student_logits[mask]
@@ -220,25 +220,23 @@ def sparse_distillation_loss(
 
     # Flatten to [N, ...]
     k = topk_indices.shape[-1]
-    student_flat = student_logits.reshape(-1, student_logits.shape[-1])  # [N, K+1]
+    student_flat = student_logits.reshape(-1, student_logits.shape[-1])  # [N, K]
     topk_idx = topk_indices.reshape(-1, k)       # [N, k]
     topk_val = topk_values.reshape(-1, k).float() # [N, k]
     log_z = log_Z.reshape(-1).float()             # [N]
     n_tokens = student_flat.shape[0]
 
-    # Teacher distribution (65 categories, T=1 true probabilities)
+    # Teacher distribution: top-k true probs, renormalized
     teacher_topk_probs = (topk_val - log_z.unsqueeze(-1)).exp().clamp(min=1e-8)  # [N, k]
-    teacher_idk = (1.0 - teacher_topk_probs.sum(-1)).clamp(min=1e-8)  # [N]
+    teacher_topk_probs = teacher_topk_probs / teacher_topk_probs.sum(-1, keepdim=True)  # renormalize
 
-    # Student distribution: logsumexp + gather (never materializes full softmax)
+    # Student distribution: logsumexp + gather
     s_logZ = student_flat.float().logsumexp(dim=-1)                    # [N]
     s_topk_log = student_flat.float().gather(-1, topk_idx.long()) - s_logZ.unsqueeze(-1)  # [N, k]
-    s_idk_log = student_flat[:, -1].float() - s_logZ                   # [N] — IDK neuron
 
-    # KL divergence over 65 categories: sum_i p_i * (log p_i - log q_i)
+    # KL divergence over k categories: sum_i p_i * (log p_i - log q_i)
     kl_topk = teacher_topk_probs * (teacher_topk_probs.log() - s_topk_log)  # [N, k]
-    kl_idk = teacher_idk * (teacher_idk.log() - s_idk_log)                  # [N]
-    loss = (kl_topk.sum(-1) + idk_weight * kl_idk).mean()
+    loss = kl_topk.sum(-1).mean()
 
     return loss
 
@@ -262,17 +260,18 @@ def run_eval(
     output_norm_weight: torch.Tensor | None = None,
     output_norm_eps: float = 1e-6,
     sparse_k: int = 0,
-    idk_weight: float = 1.0,
+    conf_threshold: float = 0.0,
+    cycle_times: dict | None = None,
 ) -> tuple[float, float, int, dict]:
-    """Run validation with KL distillation loss.
+    """Run validation with outcome matrix evaluation.
 
-    Val cache stores (token_ids, hidden_input, p_idk). Teacher logits are
-    recomputed on-the-fly: RMSNorm(hidden) @ restricted_embed.T.
+    Outcome matrix (4 outcomes):
+        - accepted: draft predicted, teacher agrees → 2 tokens per cycle
+        - rejected: draft predicted, teacher disagrees → 1 token (wasted verify)
+        - saved: draft skipped (OOV or low conf), teacher would reject → correct skip
+        - missed: draft skipped, teacher would accept → missed opportunity
 
-    For sparse mode: takes top-k of recomputed teacher logits, reconstructs
-    log_Z from restricted logsumexp + cached p_idk, then uses sparse loss.
-
-    Returns: (val_loss, accept_rate, n_tokens_evaluated, idk_metrics)
+    Returns: (val_loss, accept_rate, n_tokens_evaluated, outcome_metrics)
     """
     mtp.eval()
     total_loss = 0.0
@@ -280,10 +279,15 @@ def run_eval(
     total_tokens = 0
     n_batches = 0
 
-    # IDK metrics accumulators
-    total_idk_preds = 0
-    total_non_idk_accept = 0
-    total_non_idk_tokens = 0
+    # Outcome matrix accumulators
+    n_accepted = 0
+    n_rejected = 0
+    n_saved_oov = 0
+    n_missed_oov = 0
+    n_saved_conf = 0
+    n_missed_conf = 0
+    total_oov_labels = 0
+    total_oov_correct = 0
 
     use_sparse = sparse_k > 0
 
@@ -317,13 +321,17 @@ def run_eval(
                 if use_sparse and not has_p_idk:
                     raise RuntimeError(
                         "Sparse mode requires val cache with p_idk. "
-                        "Re-extract with: uv run scripts/02_extract_val_cache.py --p-idk ..."
+                        "Re-extract with: uv run scripts/03_extract_val_cache.py --p-idk ..."
                     )
                 vc_p_idk = vc.get("p_idk")
 
+                # OOV ground truth: target token IDs not in restricted vocab
+                target_tids = vtids[:, 2:vL].numpy()  # targets for positions 1..L-2
+                is_oov = torch.from_numpy(vocab.full_to_restricted[target_tids] == -1)
+
                 # Chunk to bound GPU memory
                 T_eval = max(ve.shape[1], 1)
-                eval_bytes_per_seq = T_eval * ((K + 1) * 6 + K * 2 + 1024 * 6 + sparse_k * 6 + 8)
+                eval_bytes_per_seq = T_eval * (K * 6 + K * 2 + 1024 * 6 + sparse_k * 6 + 8)
                 free_eval, _ = torch.cuda.mem_get_info()
                 avail_eval = free_eval - 200 * 1024 * 1024
                 chunk = max(1, min(vB, int(avail_eval / eval_bytes_per_seq)))
@@ -332,9 +340,10 @@ def run_eval(
                     ce = min(ci + chunk, vB)
                     vh_mtp_gpu = vh_mtp[ci:ce].to(device, dtype=torch.float16, non_blocking=True)
                     vh_teacher_gpu = vh_teacher[ci:ce].to(device, dtype=torch.float16, non_blocking=True)
+                    is_oov_chunk = is_oov[ci:ce].to(device)
 
                     with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                        vlogits = mtp(
+                        vlogits, voov_logit = mtp(
                             ve[ci:ce].to(device, non_blocking=True),
                             vh_mtp_gpu,
                         )
@@ -345,39 +354,59 @@ def run_eval(
                             # Reconstruct log_Z from restricted logits + p_idk
                             vp_idk = vc_p_idk[ci:ce].to(device, non_blocking=True)
                             restricted_log_Z = vteacher_logits.float().logsumexp(dim=-1)
-                            # Clamp p_idk < 1 to avoid log(0) when teacher is 100% OOV
                             v_log_Z = restricted_log_Z - torch.log1p(-vp_idk.clamp(max=1.0 - 1e-6))
 
-                            # Top-k of teacher logits
                             vtopk_val, vtopk_idx = torch.topk(
                                 vteacher_logits, k=sparse_k, dim=-1)
 
-                            vloss = sparse_distillation_loss(
+                            # Token loss only on non-OOV positions
+                            non_oov = ~is_oov_chunk
+                            vloss_token = sparse_distillation_loss(
                                 vlogits, vtopk_idx, vtopk_val, v_log_Z,
-                                idk_weight=idk_weight)
+                                mask=non_oov)
+
+                            # OOV loss
+                            vloss_oov = F.binary_cross_entropy_with_logits(
+                                voov_logit.float(), is_oov_chunk.float())
+
+                            vloss = vloss_token + vloss_oov
                         else:
                             vloss = distillation_loss(
                                 vlogits, vteacher_logits, T=temperature)
 
                     total_loss += vloss.item()
 
-                    if use_sparse:
-                        vpreds = vlogits.argmax(dim=-1)
-                        vteacher_argmax = vteacher_logits.argmax(dim=-1)
+                    # Outcome matrix computation
+                    vpreds = vlogits.argmax(dim=-1)
+                    vteacher_argmax = vteacher_logits.argmax(dim=-1)
+                    teacher_accepts = (vpreds == vteacher_argmax)  # would teacher accept draft?
 
-                        student_idk = (vpreds == K)
-                        total_idk_preds += student_idk.sum().item()
+                    # OOV gate decision: sigmoid(oov_logit) > 0.5
+                    oov_skip = (voov_logit > 0.0)  # logit > 0 ⟺ sigmoid > 0.5
 
-                        non_idk = ~student_idk
-                        total_non_idk_accept += (vpreds[non_idk] == vteacher_argmax[non_idk]).sum().item()
-                        total_non_idk_tokens += non_idk.sum().item()
-
-                        total_accept += (vpreds[non_idk] == vteacher_argmax[non_idk]).sum().item()
+                    # Confidence gate decision (only on positions where OOV gate passes)
+                    if conf_threshold > 0:
+                        token_probs = F.softmax(vlogits.float(), dim=-1)
+                        max_conf = token_probs.max(dim=-1).values
+                        conf_skip = (max_conf < conf_threshold) & ~oov_skip
                     else:
-                        vpreds = vlogits.argmax(dim=-1)
-                        vteacher_argmax = vteacher_logits.argmax(dim=-1)
-                        total_accept += (vpreds == vteacher_argmax).sum().item()
+                        conf_skip = torch.zeros_like(oov_skip)
 
+                    # Draft predicts = neither OOV nor confidence skipped
+                    draft_predicts = ~oov_skip & ~conf_skip
+
+                    n_accepted += (draft_predicts & teacher_accepts).sum().item()
+                    n_rejected += (draft_predicts & ~teacher_accepts).sum().item()
+                    n_saved_oov += (oov_skip & ~teacher_accepts).sum().item()
+                    n_missed_oov += (oov_skip & teacher_accepts).sum().item()
+                    n_saved_conf += (conf_skip & ~teacher_accepts).sum().item()
+                    n_missed_conf += (conf_skip & teacher_accepts).sum().item()
+
+                    # OOV classification accuracy
+                    total_oov_labels += is_oov_chunk.numel()
+                    total_oov_correct += ((voov_logit > 0.0) == is_oov_chunk).sum().item()
+
+                    total_accept += teacher_accepts.sum().item()
                     total_tokens += vpreds.numel()
                     n_batches += 1
 
@@ -390,7 +419,7 @@ def run_eval(
                 vh = vh_full[:, :vL-2]
                 vteacher = vteacher_full[:, 1:vL-1]
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                    vlogits = mtp(ve.to(device), vh.to(device, dtype=torch.float16))
+                    vlogits, _ = mtp(ve.to(device), vh.to(device, dtype=torch.float16))
                     vloss = distillation_loss(
                         vlogits,
                         vteacher.to(device, non_blocking=True),
@@ -408,18 +437,31 @@ def run_eval(
 
     torch.cuda.empty_cache()
 
-    if use_sparse:
-        p_idk_rate = total_idk_preds / max(total_tokens, 1)
-        p_accept = total_non_idk_accept / max(total_non_idk_tokens, 1)
-        ms_per_tok = (p_idk_rate * 1.68 +
-                      (1 - p_idk_rate) * (p_accept * 1.125 + (1 - p_accept) * 2.30))
-        idk_metrics = {
-            "idk_rate": p_idk_rate,
-            "accept_rate_non_idk": p_accept,
-            "accept_rate_overall": accept_rate,
-            "est_tok_per_sec": 1000.0 / ms_per_tok,
+    # Compute cost metric from outcome matrix + measured cycle times
+    if use_sparse and cycle_times:
+        t = cycle_times
+        total_ms = (n_accepted * (t["forward_2tok_ms"] + t["forward_mtp_ms"])
+                  + n_rejected * (t["forward_2tok_ms"] + t["rollback_ms"] + t["forward_mtp_ms"])
+                  + n_saved_oov * t["forward_1tok_ms"]
+                  + n_saved_conf * (t["forward_1tok_ms"] + t["forward_mtp_ms"])
+                  + n_missed_oov * t["forward_1tok_ms"]
+                  + n_missed_conf * (t["forward_1tok_ms"] + t["forward_mtp_ms"]))
+        total_toks = n_accepted * 2 + n_rejected + n_saved_oov + n_saved_conf + n_missed_oov + n_missed_conf
+        cost = total_ms / max(total_toks, 1)
+        oov_acc = total_oov_correct / max(total_oov_labels, 1)
+
+        outcome_metrics = {
+            "cost": cost,
+            "accepted": n_accepted,
+            "rejected": n_rejected,
+            "saved_oov": n_saved_oov,
+            "missed_oov": n_missed_oov,
+            "saved_conf": n_saved_conf,
+            "missed_conf": n_missed_conf,
+            "oov_accuracy": oov_acc,
+            "accept_rate": accept_rate,
         }
-        return val_loss, accept_rate, total_tokens, idk_metrics
+        return val_loss, accept_rate, total_tokens, outcome_metrics
 
     return val_loss, accept_rate, total_tokens, {}
 
@@ -486,41 +528,55 @@ def train(args: argparse.Namespace) -> None:
     # GWEN server
     use_sparse = args.sparse > 0
     sparse_k = args.sparse
-    idk_weight = args.idk_weight
+    conf_threshold = args.conf_threshold
     host, port = args.server_url.replace("http://", "").split(":")
     gwen = GwenClient(host, int(port))
+
+    # Load cycle times for cost metric
+    cycle_times_path = Path(args.cycle_times) if args.cycle_times else Path("bench/cycle_times.json")
+    if cycle_times_path.exists():
+        with open(cycle_times_path) as f:
+            cycle_times = json.load(f)
+        log(f"Cycle times loaded from {cycle_times_path}")
+    else:
+        cycle_times = None
+        log(f"WARNING: {cycle_times_path} not found, cost metric unavailable")
 
     # MTP head
     log("Initializing MTP head..." + (f" (sparse k={sparse_k})" if use_sparse else ""))
     if args.from_pretrained:
         mtp = MTPHead.from_pretrained(args.model_dir, vocab_size=args.top_k, device=device,
-                                       vocab_ids=vocab.top_k_ids.tolist(), idk=use_sparse)
+                                       vocab_ids=vocab.top_k_ids.tolist())
     else:
-        mtp = MTPHead(vocab_size=args.top_k, idk=use_sparse).to(device)
+        mtp = MTPHead(vocab_size=args.top_k).to(device)
         log("  Initialized from scratch (no pre-trained weights)")
 
-    # Warm-start from existing checkpoint (e.g. v3 → v5 sparse)
+    # Warm-start from existing checkpoint
     if args.init_from:
         init_ckpt = torch.load(str(args.init_from), map_location=device, weights_only=False)
         init_sd = init_ckpt["model"]
         current_sd = mtp.state_dict()
         loaded_keys = 0
+        drop_idk = args.drop_idk
         for key in init_sd:
             if key in current_sd:
                 if init_sd[key].shape == current_sd[key].shape:
                     current_sd[key] = init_sd[key]
                     loaded_keys += 1
-                elif key == "lm_head.weight" and use_sparse:
-                    # v3 [K, 1024] → v5 [K+1, 1024]: copy K rows, leave IDK row as zeros
-                    K_src = init_sd[key].shape[0]
-                    current_sd[key][:K_src] = init_sd[key]
+                elif key == "lm_head.weight" and drop_idk:
+                    # v6 [K+1, 1024] → v7 [K, 1024]: copy first K rows, drop IDK row
+                    K_dst = current_sd[key].shape[0]
+                    current_sd[key] = init_sd[key][:K_dst]
                     loaded_keys += 1
-                    log(f"  lm_head: copied {K_src} rows from init checkpoint, IDK row = zeros")
+                    log(f"  lm_head: copied {K_dst} rows from init checkpoint (dropped IDK row)")
                 else:
                     log(f"  Warning: shape mismatch for {key}: "
                         f"{init_sd[key].shape} vs {current_sd[key].shape}, skipping")
+            # Skip keys only in source (e.g. oov_head won't be in v6 checkpoint)
         mtp.load_state_dict(current_sd)
         log(f"  Warm-started from {args.init_from} ({loaded_keys}/{len(init_sd)} keys loaded)")
+        if drop_idk:
+            log(f"  --drop-idk: IDK row dropped from lm_head, oov_head initialized random")
 
     params = mtp.param_count()
     log(f"  MTP params: {params['total']:,} ({params['total'] * 4 / 1e6:.1f} MB FP32)")
@@ -544,17 +600,21 @@ def train(args: argparse.Namespace) -> None:
     output_norm_eps = 1e-6
 
     if use_sparse:
-        log(f"  Sparse mode: k={sparse_k}, T=1 (no temperature), IDK neuron at index K")
+        log(f"  Sparse mode: k={sparse_k}, T=1 (no temperature), OOV gate + confidence gate")
+        if conf_threshold > 0:
+            log(f"  Confidence threshold: {conf_threshold}")
 
-    # Build optimizer — stage 1 trains only lm_head
+    # Build optimizer — stage 1 trains only lm_head + oov_head
     def make_optimizer(stage: int) -> torch.optim.Optimizer:
         if stage == 1:
             lr = args.stage1_lr
-            params_to_train = list(mtp.lm_head.parameters())
-            # Freeze everything except lm_head
+            params_to_train = list(mtp.lm_head.parameters()) + list(mtp.oov_head.parameters())
+            # Freeze everything except lm_head + oov_head
             for p in mtp.parameters():
                 p.requires_grad = False
             for p in mtp.lm_head.parameters():
+                p.requires_grad = True
+            for p in mtp.oov_head.parameters():
                 p.requires_grad = True
         else:
             lr = args.lr
@@ -654,9 +714,10 @@ def train(args: argparse.Namespace) -> None:
             "params": params,
         },
         "training": {
-            "version": 5 if use_sparse else 3,
-            "loss": "sparse_distillation_65cat" if use_sparse else "kl_divergence",
+            "version": 7 if use_sparse else 3,
+            "loss": "sparse_kl_oov_bce" if use_sparse else "kl_divergence",
             "sparse_k": sparse_k,
+            "conf_threshold": conf_threshold,
             "temperature": T,
             "stage1_steps": stage1_steps,
             "stage1_lr": args.stage1_lr,
@@ -707,7 +768,7 @@ def train(args: argparse.Namespace) -> None:
     if not log_exists:
         header = "step,epoch,tokens_seen,batch_loss,avg_loss,val_loss,accept_rate,lr"
         if use_sparse:
-            header += ",idk_rate,accept_rate_non_idk"
+            header += ",cost,oov_acc,accepted,rejected,saved,missed"
         log_file.write(header + "\n")
         log_file.flush()
 
@@ -731,24 +792,28 @@ def train(args: argparse.Namespace) -> None:
         restricted_embed=restricted_embed, output_norm_weight=output_norm_weight,
         output_norm_eps=output_norm_eps,
         sparse_k=sparse_k,
-        idk_weight=args.idk_weight,
+        conf_threshold=conf_threshold,
+        cycle_times=cycle_times,
     )
 
-    # Initial eval — skip if lm_head is untrained (stage1), resuming, or warm-starting IDK
-    run_initial_eval = not (args.resume or stage1_steps > 0 or (args.init_from and use_sparse))
+    # Initial eval — skip if lm_head is untrained (stage1), resuming, or warm-starting
+    run_initial_eval = not (args.resume or stage1_steps > 0 or args.init_from)
 
     if run_initial_eval:
         log("\nRunning initial eval (baseline)...")
-        val_loss, accept_rate, _, idk_m = run_eval(
+        val_loss, accept_rate, _, om = run_eval(
             mtp, val_cache_files, val_dl if not val_cache_files else None,
             gwen if not val_cache_files else None, **eval_kwargs,
         )
-        if use_sparse and idk_m:
-            log(f"  Baseline: val_loss={val_loss:.4f}, accept={accept_rate:.1%}")
-            log(f"  IDK: rate={idk_m['idk_rate']:.1%}, "
-                f"non-idk accept={idk_m['accept_rate_non_idk']:.1%}")
+        if use_sparse and om:
+            log(f"  Baseline: val_loss={val_loss:.4f}, accept={accept_rate:.1%}, cost={om['cost']:.3f} ms/tok")
+            log(f"  OOV acc={om['oov_accuracy']:.1%}, "
+                f"accepted={om['accepted']}, rejected={om['rejected']}, "
+                f"saved={om['saved_oov']+om['saved_conf']}, missed={om['missed_oov']+om['missed_conf']}")
             log_file.write(f"0,0.0000,0,,,{val_loss:.6f},{accept_rate:.4f},{args.lr:.6e},"
-                           f"{idk_m['idk_rate']:.4f},{idk_m['accept_rate_non_idk']:.4f}\n")
+                           f"{om['cost']:.4f},{om['oov_accuracy']:.4f},"
+                           f"{om['accepted']},{om['rejected']},"
+                           f"{om['saved_oov']+om['saved_conf']},{om['missed_oov']+om['missed_conf']}\n")
         else:
             log(f"  Baseline: val_loss={val_loss:.4f}, accept={accept_rate:.1%}")
             log_file.write(f"0,0.0000,0,,,{val_loss:.6f},{accept_rate:.4f},{args.lr:.6e}\n")
@@ -770,8 +835,7 @@ def train(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Fixed memory budget for chunked forward/backward.
-    # Budget must survive stage 2 (full optimizer states). v4 IDK used 150 MB safely.
-    lm_out = args.top_k + 1 if use_sparse else args.top_k
+    lm_out = args.top_k
     _seq_bytes = max(args.seq_len - 2, 1) * lm_out * 6  # student logits FP16 + F32 logsumexp
     gpu_chunk = max(1, int(150_000_000 / _seq_bytes))
     free_mb = torch.cuda.mem_get_info()[0] / 2**20
@@ -782,7 +846,7 @@ def train(args: argparse.Namespace) -> None:
     stage1_msg = f", stage 1 for first {stage1_steps} steps" if stage1_steps > 0 else ""
     log(f"\nStarting training: {total_epochs} epochs{stage1_msg}")
     if use_sparse:
-        log(f"Loss: sparse 65-cat KL (k={sparse_k}, T=1)")
+        log(f"Loss: sparse {sparse_k}-cat KL + OOV BCE (k={sparse_k}, T=1)")
     else:
         log(f"Loss: KL divergence (T={T})")
     if args.hidden_noise > 0:
@@ -793,8 +857,10 @@ def train(args: argparse.Namespace) -> None:
     t_start = time.time()
     tokens_at_start = tokens_seen
 
-    def save_checkpoint(val_loss, accept_rate, epoch, idk_metrics=None):
-        nonlocal best_val, best_accept, patience_counter
+    best_cost = float("inf")
+
+    def save_checkpoint(val_loss, accept_rate, epoch, outcome_metrics=None):
+        nonlocal best_val, best_accept, best_cost, patience_counter
         ckpt = {
             "model": mtp.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -808,7 +874,7 @@ def train(args: argparse.Namespace) -> None:
             "temperature": T,
             "stage": current_stage,
             "timestamp": time.time(),
-            "has_idk": use_sparse,
+            "has_oov_head": True,
             "sparse_k": sparse_k,
         }
         torch.save(ckpt, out_dir / "latest.pt")
@@ -821,13 +887,13 @@ def train(args: argparse.Namespace) -> None:
         else:
             patience_counter += 1
 
-        # For sparse: save best by estimated tok/s; otherwise by accept_rate
-        if use_sparse and idk_metrics:
-            score = idk_metrics["est_tok_per_sec"]
-            if score > best_accept:
-                best_accept = score
-                torch.save(ckpt, out_dir / "best_accept.pt")
-                log(f"  -> saved best_accept (est {score:.0f} tok/s)")
+        # For sparse: save best by cost (ms/tok, lower is better)
+        if use_sparse and outcome_metrics:
+            cost = outcome_metrics["cost"]
+            if cost < best_cost:
+                best_cost = cost
+                torch.save(ckpt, out_dir / "best_cost.pt")
+                log(f"  -> saved best_cost ({cost:.3f} ms/tok)")
         else:
             if accept_rate > best_accept:
                 best_accept = accept_rate
@@ -871,6 +937,10 @@ def train(args: argparse.Namespace) -> None:
                 teacher_topk_idx = topk_idx[:, 1:L-1]        # [B, L-2, k] — shifted
                 teacher_topk_val = topk_val[:, 1:L-1]        # [B, L-2, k] — shifted
                 teacher_log_z = log_z[:, 1:L-1]              # [B, L-2] — shifted
+
+                # OOV labels: target token IDs not in restricted vocab
+                target_tids = token_ids[:, 2:L].numpy()      # targets for positions 1..L-2
+                is_oov = torch.from_numpy(vocab.full_to_restricted[target_tids] == -1)
             else:
                 # Standard v3 mode: get hidden states + teacher logits from dev server
                 with torch.no_grad():
@@ -893,8 +963,8 @@ def train(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             batch_loss = 0.0
             skip = False
-            batch_idk_count = 0
-            batch_idk_total = 0
+            batch_oov_rate = 0.0
+            batch_oov_total = 0
 
             for ci in range(0, B, max_chunk):
                 ce = min(ci + max_chunk, B)
@@ -902,18 +972,28 @@ def train(args: argparse.Namespace) -> None:
                 h_chunk = hidden_input[ci:ce].to(device, dtype=torch.float16, non_blocking=True)
 
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-                    logits = mtp(e_chunk, h_chunk)
+                    logits, oov_logit = mtp(e_chunk, h_chunk)
 
                     if use_sparse:
                         idx_chunk = teacher_topk_idx[ci:ce].to(device, non_blocking=True)
                         val_chunk = teacher_topk_val[ci:ce].to(device, non_blocking=True)
                         lz_chunk = teacher_log_z[ci:ce].to(device, non_blocking=True)
-                        loss = sparse_distillation_loss(logits, idx_chunk, val_chunk, lz_chunk,
-                                                           idk_weight=idk_weight)
+                        oov_chunk = is_oov[ci:ce].to(device)
+
+                        # Token loss only on non-OOV positions
+                        non_oov = ~oov_chunk
+                        loss_token = sparse_distillation_loss(
+                            logits, idx_chunk, val_chunk, lz_chunk, mask=non_oov)
+
+                        # OOV loss: binary cross-entropy on all positions
+                        loss_oov = F.binary_cross_entropy_with_logits(
+                            oov_logit.float(), oov_chunk.float())
+
+                        loss = (loss_token + loss_oov) / n_chunks
                     else:
                         t_chunk = teacher_input[ci:ce].to(device, non_blocking=True)
                         loss = distillation_loss(logits, t_chunk, T=T_cur)
-                    loss = loss / n_chunks
+                        loss = loss / n_chunks
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     log(f"  WARNING: {loss.item()} loss at step {global_step}, skipping")
@@ -923,11 +1003,11 @@ def train(args: argparse.Namespace) -> None:
                 scaler.scale(loss).backward()
                 batch_loss += loss.item()
 
-                # Track batch IDK rate
+                # Track batch OOV gate rate
                 if use_sparse:
                     with torch.no_grad():
-                        batch_idk_count += (logits.detach().argmax(dim=-1) == args.top_k).sum().item()
-                        batch_idk_total += logits.shape[0] * logits.shape[1] if logits.dim() == 3 else logits.shape[0]
+                        batch_oov_rate += (oov_logit.detach() > 0).sum().item()
+                        batch_oov_total += oov_logit.numel()
 
             if skip:
                 optimizer.zero_grad(set_to_none=True)
@@ -962,10 +1042,10 @@ def train(args: argparse.Namespace) -> None:
             tok_per_sec = (tokens_seen - tokens_at_start) / max(elapsed, 1)
             pbar.update(batch_tokens / 1e6)
             if use_sparse:
-                batch_idk_rate = batch_idk_count / max(batch_idk_total, 1)
+                oov_gate_rate = batch_oov_rate / max(batch_oov_total, 1)
                 pbar.set_postfix_str(
                     f"step {global_step}, loss={avg:.4f} lr={lr_val:.1e} "
-                    f"idk={batch_idk_rate:.1%} ({tok_per_sec/1e3:.1f}K tok/s)"
+                    f"oov={oov_gate_rate:.1%} ({tok_per_sec/1e3:.1f}K tok/s)"
                 )
             else:
                 pbar.set_postfix_str(
@@ -978,7 +1058,7 @@ def train(args: argparse.Namespace) -> None:
             csv_line = (f"{global_step},{frac_epoch:.4f},{tokens_seen},"
                         f"{batch_loss:.6f},{avg:.6f},,,{lr_val:.6e}")
             if use_sparse:
-                csv_line += f",{batch_idk_rate:.4f},"
+                csv_line += ",,,,,,"
             log_file.write(csv_line + "\n")
             if global_step % 100 == 0:
                 log_file.flush()
@@ -998,28 +1078,30 @@ def train(args: argparse.Namespace) -> None:
                     "temperature": T,
                     "stage": current_stage,
                     "timestamp": time.time(),
-                    "has_idk": use_sparse,
+                    "has_oov_head": True,
                     "sparse_k": sparse_k,
                 }, out_dir / "latest.pt")
 
             # --- Periodic eval ---
             eval_now = eval_now or steps_since_eval >= args.eval_every
             if eval_now:
-                val_loss, accept_rate, _, idk_m = run_eval(
+                val_loss, accept_rate, _, om = run_eval(
                     mtp, val_cache_files, val_dl if not val_cache_files else None,
                     gwen if not val_cache_files else None, **eval_kwargs,
                 )
 
-                if use_sparse and idk_m:
+                if use_sparse and om:
                     log(f"  [{stage_label}:{epoch+1}:{n_batches}/{len(train_sampler)}]  "
                         f"train={avg:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
-                        f"lr={lr_val:.1e}  tokens={tokens_seen/1e6:.0f}M")
-                    log(f"    IDK: rate={idk_m['idk_rate']:.1%}, "
-                        f"non-idk accept={idk_m['accept_rate_non_idk']:.1%}, "
-                        f"est {idk_m['est_tok_per_sec']:.0f} tok/s")
+                        f"cost={om['cost']:.3f}  lr={lr_val:.1e}  tokens={tokens_seen/1e6:.0f}M")
+                    log(f"    OOV acc={om['oov_accuracy']:.1%}  "
+                        f"accepted={om['accepted']} rejected={om['rejected']} "
+                        f"saved={om['saved_oov']+om['saved_conf']} missed={om['missed_oov']+om['missed_conf']}")
                     log_file.write(f"{global_step},{frac_epoch:.4f},{tokens_seen},"
                                    f"{avg:.6f},{avg:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e},"
-                                   f"{idk_m['idk_rate']:.4f},{idk_m['accept_rate_non_idk']:.4f}\n")
+                                   f"{om['cost']:.4f},{om['oov_accuracy']:.4f},"
+                                   f"{om['accepted']},{om['rejected']},"
+                                   f"{om['saved_oov']+om['saved_conf']},{om['missed_oov']+om['missed_conf']}\n")
                 else:
                     log(f"  [{stage_label}:{epoch+1}:{n_batches}/{len(train_sampler)}]  "
                         f"train={avg:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
@@ -1029,7 +1111,7 @@ def train(args: argparse.Namespace) -> None:
                 log_file.flush()
 
                 save_checkpoint(val_loss, accept_rate, epoch,
-                                idk_metrics=idk_m if use_sparse else None)
+                                outcome_metrics=om if use_sparse else None)
 
                 steps_since_eval = 0
 
@@ -1049,23 +1131,25 @@ def train(args: argparse.Namespace) -> None:
         # --- End-of-epoch eval ---
         avg_train = epoch_loss / max(n_batches, 1)
 
-        val_loss, accept_rate, _, idk_m = run_eval(
+        val_loss, accept_rate, _, om = run_eval(
             mtp, val_cache_files, val_dl if not val_cache_files else None,
             gwen if not val_cache_files else None, **eval_kwargs,
         )
 
         lr_val = optimizer.param_groups[0]["lr"]
 
-        if use_sparse and idk_m:
+        if use_sparse and om:
             log(f"[{stage_label}] Epoch {epoch+1}/{total_epochs} done: "
                 f"train={avg_train:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
-                f"tokens={tokens_seen/1e6:.0f}M")
-            log(f"  IDK: rate={idk_m['idk_rate']:.1%}, "
-                f"non-idk accept={idk_m['accept_rate_non_idk']:.1%}, "
-                f"est {idk_m['est_tok_per_sec']:.0f} tok/s")
+                f"cost={om['cost']:.3f}  tokens={tokens_seen/1e6:.0f}M")
+            log(f"  OOV acc={om['oov_accuracy']:.1%}  "
+                f"accepted={om['accepted']} rejected={om['rejected']} "
+                f"saved={om['saved_oov']+om['saved_conf']} missed={om['missed_oov']+om['missed_conf']}")
             log_file.write(f"{global_step},{epoch+1:.4f},{tokens_seen},"
                            f"{avg_train:.6f},{avg_train:.6f},{val_loss:.6f},{accept_rate:.4f},{lr_val:.6e},"
-                           f"{idk_m['idk_rate']:.4f},{idk_m['accept_rate_non_idk']:.4f}\n")
+                           f"{om['cost']:.4f},{om['oov_accuracy']:.4f},"
+                           f"{om['accepted']},{om['rejected']},"
+                           f"{om['saved_oov']+om['saved_conf']},{om['missed_oov']+om['missed_conf']}\n")
         else:
             log(f"[{stage_label}] Epoch {epoch+1}/{total_epochs} done: "
                 f"train={avg_train:.4f}  val={val_loss:.4f}  accept={accept_rate:.1%}  "
@@ -1075,18 +1159,21 @@ def train(args: argparse.Namespace) -> None:
         log_file.flush()
 
         save_checkpoint(val_loss, accept_rate, epoch,
-                        idk_metrics=idk_m if use_sparse else None)
+                        outcome_metrics=om if use_sparse else None)
         mtp.train()
 
     elapsed = time.time() - t_start
     log_file.close()
     if use_sparse:
         log(f"\nTraining complete in {elapsed/60:.1f} min. "
-            f"Best val_loss={best_val:.4f}, best est_tok_s={best_accept:.0f}")
+            f"Best val_loss={best_val:.4f}, best cost={best_cost:.3f} ms/tok")
     else:
         log(f"\nTraining complete in {elapsed/60:.1f} min. "
             f"Best val_loss={best_val:.4f}, best accept={best_accept:.1%}")
-    log(f"Checkpoints: {out_dir}/best.pt, {out_dir}/best_accept.pt, {out_dir}/latest.pt")
+    if use_sparse:
+        log(f"Checkpoints: {out_dir}/best.pt, {out_dir}/best_cost.pt, {out_dir}/latest.pt")
+    else:
+        log(f"Checkpoints: {out_dir}/best.pt, {out_dir}/best_accept.pt, {out_dir}/latest.pt")
 
 
 # ---------------------------------------------------------------------------
@@ -1094,22 +1181,21 @@ def train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def export(args: argparse.Namespace) -> None:
-    """Export trained MTP weights to GWMT v3/v4 format for GWEN inference.
+    """Export trained MTP weights to GWMT v5 format for GWEN inference.
 
-    GWMT v3 format:
-        Header: "GWMT" [uint32 version=3] [uint32 n_tensors]
+    GWMT v5 format (v7 training, OOV gate):
+        Header: "GWMT" [uint32 version=5] [uint32 n_tensors]
         Tensors: for each tensor: [name_len][name][dtype][ndims][shape...][data_size][data]
-        Footer: [uint32 K] [int32 restricted_ids[K]]
+        Footer: [uint32 K] [int32 restricted_ids[K]] [uint8 has_oov_head=1]
 
-    GWMT v4 format (IDK):
-        Same as v3, but lm_head is [K+1, 1024] and footer has extra [uint8 has_idk=1]
+    lm_head is [K, 1024], oov_head is [1, 1024] weight + [1] bias.
     """
 
     ckpt_path = Path(args.checkpoint)
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     state_dict = ckpt["model"]
     vocab_k = ckpt.get("vocab_k", 20000)
-    has_idk = ckpt.get("has_idk", False)
+    has_oov_head = ckpt.get("has_oov_head", False)
 
     output = Path(args.output) if args.output else ckpt_path.parent / "mtp_finetuned.bin"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1122,8 +1208,9 @@ def export(args: argparse.Namespace) -> None:
     DTYPE_F32 = 0
     DTYPE_F16 = 1
 
-    # Version: 4 if IDK, 3 otherwise
-    version = 4 if has_idk else 3
+    # Version: 5 if OOV head, 4 if IDK (legacy), 3 otherwise
+    has_idk = ckpt.get("has_idk", False)
+    version = 5 if has_oov_head else (4 if has_idk else 3)
 
     name_map = {
         "fc.weight": "mtp.fc.weight",
@@ -1159,8 +1246,15 @@ def export(args: argparse.Namespace) -> None:
         lm_data = state_dict["lm_head.weight"].half().numpy()
         tensors.append(("mtp.lm_head.weight", lm_data, DTYPE_F16))
 
+    if "oov_head.weight" in state_dict:
+        oov_w = state_dict["oov_head.weight"].half().numpy()
+        tensors.append(("mtp.oov_head.weight", oov_w, DTYPE_F16))
+    if "oov_head.bias" in state_dict:
+        oov_b = state_dict["oov_head.bias"].float().numpy()
+        tensors.append(("mtp.oov_head.bias", oov_b, DTYPE_F32))
+
     log(f"Exporting {len(tensors)} tensors to {output} (GWMT v{version}, K={vocab_k}"
-        f"{', IDK' if has_idk else ''})")
+        f"{', OOV' if has_oov_head else ', IDK' if has_idk else ''})")
 
     with open(output, "wb") as f:
         f.write(b"GWMT")
@@ -1189,10 +1283,13 @@ def export(args: argparse.Namespace) -> None:
         log(f"  restricted_ids                                        [{vocab_k}]              "
             f"{vocab_k * 4 / 1024:.1f} KB")
 
-        # v4 footer: has_idk flag
-        if version >= 4:
-            f.write(struct.pack("<B", 1))  # has_idk = true
+        # v4/v5 footer
+        if version == 4:
+            f.write(struct.pack("<B", 1))  # has_idk = true (legacy)
             log(f"  has_idk                                               1")
+        elif version == 5:
+            f.write(struct.pack("<B", 1))  # has_oov_head = true
+            log(f"  has_oov_head                                          1")
 
     file_size = output.stat().st_size
     log(f"\nSaved: {output} ({file_size / 1024 / 1024:.2f} MB)")
@@ -1200,7 +1297,7 @@ def export(args: argparse.Namespace) -> None:
     accept_str = f"{accept:.1%}" if accept is not None else "?"
     log(f"  Vocab K={vocab_k}, epoch={ckpt.get('epoch', '?')}, "
         f"val_loss={ckpt.get('val_loss', '?'):.4f}, accept_rate={accept_str}"
-        f"{', IDK=true' if has_idk else ''}")
+        f"{', OOV head' if has_oov_head else ', IDK' if has_idk else ''}")
 
 
 # ---------------------------------------------------------------------------
@@ -1217,13 +1314,13 @@ def main():
     sub = parser.add_subparsers(dest="cmd")
 
     # --- train ---
-    p = sub.add_parser("train", help="Train MTP head with KL distillation (v3)")
+    p = sub.add_parser("train", help="Train MTP head (v7: OOV gate + sparse KL)")
     p.add_argument("--data", type=Path, required=True, help="Tokenized data (uint32 binary)")
     p.add_argument("--counts", type=Path, default=Path("data/token_counts.bin"))
     p.add_argument("--model-dir", type=Path, default=Path.home() / "models" / "hf" / "Qwen3.5-0.8B-Base")
     p.add_argument("--server-url", type=str, default="http://127.0.0.1:8090",
                     help="Dev server URL (gwen_dev_server with --restricted-vocab)")
-    p.add_argument("--out-dir", type=Path, default=Path("train/runs/mtp_v6_base_k4096"))
+    p.add_argument("--out-dir", type=Path, default=Path("train/runs/mtp_v7_base_k4096"))
     p.add_argument("--top-k", type=int, default=4096, help="Restricted vocab size")
     p.add_argument("--epochs", type=int, default=1,
                     help="Training epochs (1 pass over ~500M tokens is sufficient)")
@@ -1257,15 +1354,17 @@ def main():
     p.add_argument("--resume", type=Path, help="Resume from checkpoint")
     p.add_argument("--sparse", type=int, default=0,
                     help="Sparse distillation k (e.g. 64). 0 = dense v3 mode.")
-    p.add_argument("--idk", action="store_true", default=False,
-                    help="Alias for --sparse 64 (backward compat)")
-    p.add_argument("--idk-weight", type=float, default=1.0,
-                    help="Weight on IDK KL term (< 1.0 to reduce over-abstention)")
+    p.add_argument("--conf-threshold", type=float, default=0.0,
+                    help="Confidence gate: skip if max(softmax) < threshold (eval only)")
+    p.add_argument("--cycle-times", type=str, default=None,
+                    help="Path to bench/cycle_times.json (default: auto-detected)")
     p.add_argument("--init-from", type=Path, default=None,
-                    help="Initialize weights from a checkpoint (e.g. v3 best.pt for sparse warm-start)")
+                    help="Initialize weights from a checkpoint (e.g. v6 best.pt)")
+    p.add_argument("--drop-idk", action="store_true", default=False,
+                    help="Drop IDK row from v6 lm_head when warm-starting")
 
     # --- export ---
-    p = sub.add_parser("export", help="Export trained MTP to GWMT v3 binary")
+    p = sub.add_parser("export", help="Export trained MTP to GWMT v5 binary")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--counts", type=Path, default=Path("data/token_counts.bin"),
                     help="Token frequency counts (for restricted vocab ID mapping)")
@@ -1273,9 +1372,6 @@ def main():
 
     args = parser.parse_args()
     if args.cmd == "train":
-        # --idk backward compat alias
-        if hasattr(args, "idk") and args.idk and args.sparse == 0:
-            args.sparse = 64
         train(args)
     elif args.cmd == "export":
         export(args)

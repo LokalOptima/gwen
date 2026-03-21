@@ -1,0 +1,10 @@
+{
+  "forward_1tok_ms": 1.51,
+  "forward_2tok_ms": 1.98,
+  "forward_mtp_ms": 0.14,
+  "rollback_ms": 0.09,
+  "measured_on": "2026-03-21",
+  "gpu": "RTX 5070 Ti",
+  "model": "Qwen3.5-0.8B-Base-Q4_K_M",
+  "notes": "Averaged over 2 runs of 500 tokens each. forward_1tok includes graph launch + sync + memcpy. rollback includes S restore (18 layers) + conv1d undo + mtp_hidden swap."
+}
