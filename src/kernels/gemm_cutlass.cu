@@ -51,25 +51,8 @@ void gwen_gemm(const void* W_quant, GGMLType type,
     int n_elements = out_features * in_features;
     gwen_dequant(W_quant, temp_w, n_elements, type, stream);
 
-    // Step 2: CUTLASS GEMM
-    // C[M,N] = A[M,K] * B[K,N]
-    // M = out_features, N = seq_len, K = in_features
-    int M = out_features;
-    int N = seq_len;
-    int K = in_features;
-
-    CutlassGemm gemm_op;
-    CutlassGemm::Arguments args(
-        {M, N, K},                                              // problem size
-        {reinterpret_cast<cutlass::half_t*>(temp_w), K},        // A: [M, K] RowMajor, lda=K
-        {reinterpret_cast<const cutlass::half_t*>(x), K},       // B: [K, N] ColumnMajor, ldb=K
-        {reinterpret_cast<cutlass::half_t*>(y), M},             // C: [M, N] ColumnMajor, ldc=M
-        {reinterpret_cast<cutlass::half_t*>(y), M},             // D: [M, N] ColumnMajor, ldd=M
-        {1.0f, 0.0f}                                            // alpha, beta
-    );
-
-    cutlass::Status status = gemm_op(args, nullptr, stream);
-    GWEN_CHECK(status == cutlass::Status::kSuccess, "CUTLASS GEMM failed");
+    // Step 2: CUTLASS GEMM with auto tile selection (same as gwen_gemm_fp16)
+    gwen_gemm_fp16(temp_w, x, y, out_features, in_features, seq_len, stream);
 }
 
 // F32 output variant: same computation but stores F32 result without FP16 truncation.

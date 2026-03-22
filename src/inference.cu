@@ -2718,16 +2718,18 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
         prefill_ffn_out_f32   = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
     }
 
-    // Dequantized weight scratch — large enough for biggest weight matrix
-    // Biggest: QKV (6144 × 1024) or Q+gate (4096 × 1024) or FFN gate/up (3584 × 1024)
-    // or LM head (248320 × 1024)
-    // We'll cap at FFN-sized since LM head uses GEMV (single token at end)
-    size_t max_weight_elems = (size_t)std::max({
-        cfg.ssm_inner_size * 3 * cfg.n_embed,  // QKV: 6144 × 1024
-        cfg.n_head * cfg.head_dim * 2 * cfg.n_embed,  // Q+gate: 4096 × 1024
-        cfg.n_ff * cfg.n_embed                  // FFN: 3584 × 1024
-    });
-    prefill_temp_w = static_cast<half*>(a(max_weight_elems * sizeof(half)));
+    // MMQ scratch buffer — sized for the biggest GEMM at max_tokens
+    // Biggest M: QKV out = 6144 or FFN = 3584, biggest K: FFN down in = 3584
+    {
+        int max_M = (int)std::max({
+            (uint32_t)(cfg.ssm_inner_size * 3),         // 6144 (QKV)
+            (uint32_t)(cfg.n_head * cfg.head_dim * 2),  // 4096 (Q+gate)
+            cfg.n_ff                                    // 3584 (FFN)
+        });
+        int max_K = (int)std::max({cfg.n_embed, cfg.n_ff, (uint32_t)cfg.ssm_inner_size});
+        size_t scratch_size = gwen_gemm_mmq_scratch_size(max_M, max_K, max_tokens);
+        prefill_temp_w = static_cast<half*>(a(scratch_size));
+    }
 
     // Batch FFN buffers: [max_tokens, n_ff]
     // Cannot alias ffn_up/ffn_out with proj_qkv: full attention layers use ffn_up for V
@@ -4046,12 +4048,12 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
             // QKV and gate GEMMs → FP16 output
             int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
-            gwen_gemm_auto(w.attn_qkv.device_data, w.attn_qkv.type, w.attn_qkv.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.attn_qkv.device_data, w.attn_qkv.type,
                       pf_norm, prefill_proj_qkv,
-                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
-            gwen_gemm_auto(w.attn_gate.device_data, w.attn_gate.type, w.attn_gate.fp16_data, prefill_temp_w,
+                      prefill_temp_w, w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
+            gwen_gemm_mmq(w.attn_gate.device_data, w.attn_gate.type,
                       pf_norm, prefill_proj_gate,
-                      w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
+                      prefill_temp_w, w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
 
             // Conv1d + SiLU (FP16 QKV, F32 conv state)
             {
@@ -4102,9 +4104,9 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 prefill_proj_gate,
                 N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
             // Output projection GEMM → pf_b (FP16)
-            gwen_gemm_auto(w.ssm_out.device_data, w.ssm_out.type, w.ssm_out.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ssm_out.device_data, w.ssm_out.type,
                            prefill_proj_gate, pf_b,
-                           w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
+                           prefill_temp_w, w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
 
             // FP16 residual add: pf_b += pf_a
             {
@@ -4119,12 +4121,12 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
             // FFN GEMMs (FP16)
-            gwen_gemm_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_gate.device_data, w.ffn_gate.type,
                            pf_norm, prefill_ffn_gate,
-                           w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
+                           prefill_temp_w, w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_mmq(w.ffn_up.device_data, w.ffn_up.type,
                            pf_norm, prefill_ffn_up,
-                           w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+                           prefill_temp_w, w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
             {
                 int total = N * cfg.n_ff;
@@ -4133,9 +4135,9 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            gwen_gemm_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_down.device_data, w.ffn_down.type,
                            prefill_ffn_out, pf_a,
-                           w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+                           prefill_temp_w, w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
             // FP16 residual add: pf_a += pf_b
             {
@@ -4160,15 +4162,15 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             int q_proj_dim = w.attn_q.shape[1];  // 4096
 
             // Q, K, V projections (FP16 — per-token attention ops are FP16)
-            gwen_gemm_auto(w.attn_q.device_data, w.attn_q.type, w.attn_q.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.attn_q.device_data, w.attn_q.type,
                       pf_norm, prefill_proj_qkv,
-                      q_proj_dim, w.attn_q.shape[0], N, s);
-            gwen_gemm_auto(w.attn_k.device_data, w.attn_k.type, w.attn_k.fp16_data, prefill_temp_w,
+                      prefill_temp_w, q_proj_dim, w.attn_q.shape[0], N, s);
+            gwen_gemm_mmq(w.attn_k.device_data, w.attn_k.type,
                       pf_norm, prefill_ffn_gate,
-                      kv_dim, w.attn_k.shape[0], N, s);
-            gwen_gemm_auto(w.attn_v.device_data, w.attn_v.type, w.attn_v.fp16_data, prefill_temp_w,
+                      prefill_temp_w, kv_dim, w.attn_k.shape[0], N, s);
+            gwen_gemm_mmq(w.attn_v.device_data, w.attn_v.type,
                       pf_norm, prefill_ffn_up,
-                      kv_dim, w.attn_v.shape[0], N, s);
+                      prefill_temp_w, kv_dim, w.attn_v.shape[0], N, s);
 
             // Batched attention (replaces per-token loop)
             // 1. Batch deinterleave Q+gate
@@ -4233,9 +4235,9 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             }
 
             // Out projection GEMM → pf_b (FP16)
-            gwen_gemm_auto(w.attn_output.device_data, w.attn_output.type, w.attn_output.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.attn_output.device_data, w.attn_output.type,
                            prefill_proj_gate, pf_b,
-                           w.attn_output.shape[1], w.attn_output.shape[0], N, s);
+                           prefill_temp_w, w.attn_output.shape[1], w.attn_output.shape[0], N, s);
 
             // FP16 residual add: pf_b += pf_a
             {
@@ -4250,12 +4252,12 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
             // FFN GEMMs (FP16)
-            gwen_gemm_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_gate.device_data, w.ffn_gate.type,
                            pf_norm, prefill_ffn_gate,
-                           w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
+                           prefill_temp_w, w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_mmq(w.ffn_up.device_data, w.ffn_up.type,
                            pf_norm, prefill_ffn_up,
-                           w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+                           prefill_temp_w, w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
             {
                 int total = N * cfg.n_ff;
@@ -4264,9 +4266,9 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            gwen_gemm_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_down.device_data, w.ffn_down.type,
                            prefill_ffn_out, pf_a,
-                           w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+                           prefill_temp_w, w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
             // FP16 residual add: pf_a += pf_b
             {
@@ -4376,12 +4378,12 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
             // Batch GEMM projections on all B*L tokens (ONE weight read each)
             int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
         
-            gwen_gemm_auto(w.attn_qkv.device_data, w.attn_qkv.type, w.attn_qkv.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.attn_qkv.device_data, w.attn_qkv.type,
                       pf_norm, prefill_proj_qkv,
-                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
-            gwen_gemm_auto(w.attn_gate.device_data, w.attn_gate.type, w.attn_gate.fp16_data, prefill_temp_w,
+                      prefill_temp_w, w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
+            gwen_gemm_mmq(w.attn_gate.device_data, w.attn_gate.type,
                       pf_norm, prefill_proj_gate,
-                      w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
+                      prefill_temp_w, w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
 
             // Batch conv1d + SiLU: B independent conv states
             int n_heads = cfg.ssm_n_heads;
@@ -4462,9 +4464,9 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch output projection GEMM → pf_b
         
-            gwen_gemm_auto(w.ssm_out.device_data, w.ssm_out.type, w.ssm_out.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ssm_out.device_data, w.ssm_out.type,
                       prefill_proj_gate, pf_b,
-                      w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
+                      prefill_temp_w, w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
 
             // Batch residual add: pf_b += pf_a
         
@@ -4481,12 +4483,12 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch FFN GEMMs
         
-            gwen_gemm_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_gate.device_data, w.ffn_gate.type,
                       pf_norm, prefill_ffn_gate,
-                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
+                      prefill_temp_w, w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_mmq(w.ffn_up.device_data, w.ffn_up.type,
                       pf_norm, prefill_ffn_up,
-                      w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+                      prefill_temp_w, w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
         
             {
@@ -4497,9 +4499,9 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
             }
 
         
-            gwen_gemm_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_down.device_data, w.ffn_down.type,
                       prefill_ffn_out, pf_a,
-                      w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+                      prefill_temp_w, w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
         
             {
@@ -4524,15 +4526,15 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch Q, K, V projections via GEMM (ONE weight read each)
         
-            gwen_gemm_auto(w.attn_q.device_data, w.attn_q.type, w.attn_q.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.attn_q.device_data, w.attn_q.type,
                       pf_norm, prefill_proj_qkv,  // [N, q_proj_dim=4096]
-                      q_proj_dim, w.attn_q.shape[0], N, s);
-            gwen_gemm_auto(w.attn_k.device_data, w.attn_k.type, w.attn_k.fp16_data, prefill_temp_w,
+                      prefill_temp_w, q_proj_dim, w.attn_q.shape[0], N, s);
+            gwen_gemm_mmq(w.attn_k.device_data, w.attn_k.type,
                       pf_norm, prefill_ffn_gate,  // [N, kv_dim=512]
-                      kv_dim, w.attn_k.shape[0], N, s);
-            gwen_gemm_auto(w.attn_v.device_data, w.attn_v.type, w.attn_v.fp16_data, prefill_temp_w,
+                      prefill_temp_w, kv_dim, w.attn_k.shape[0], N, s);
+            gwen_gemm_mmq(w.attn_v.device_data, w.attn_v.type,
                       pf_norm, prefill_ffn_up,    // [N, kv_dim=512]
-                      kv_dim, w.attn_v.shape[0], N, s);
+                      prefill_temp_w, kv_dim, w.attn_v.shape[0], N, s);
 
             // Batch deinterleave Q+gate → prefill_proj_gate (Q) and prefill_ffn_out (gate)
         
@@ -4592,9 +4594,9 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch output projection GEMM → pf_b
         
-            gwen_gemm_auto(w.attn_output.device_data, w.attn_output.type, w.attn_output.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.attn_output.device_data, w.attn_output.type,
                       prefill_proj_gate, pf_b,
-                      w.attn_output.shape[1], w.attn_output.shape[0], N, s);
+                      prefill_temp_w, w.attn_output.shape[1], w.attn_output.shape[0], N, s);
 
             // Batch residual add: pf_b += pf_a
         
@@ -4611,12 +4613,12 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch FFN GEMMs
         
-            gwen_gemm_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_gate.device_data, w.ffn_gate.type,
                       pf_norm, prefill_ffn_gate,
-                      w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
+                      prefill_temp_w, w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_mmq(w.ffn_up.device_data, w.ffn_up.type,
                       pf_norm, prefill_ffn_up,
-                      w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+                      prefill_temp_w, w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
         
             {
@@ -4627,9 +4629,9 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
             }
 
         
-            gwen_gemm_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
+            gwen_gemm_mmq(w.ffn_down.device_data, w.ffn_down.type,
                       prefill_ffn_out, pf_a,
-                      w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+                      prefill_temp_w, w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
         
             {

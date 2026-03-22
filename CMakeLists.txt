@@ -27,6 +27,8 @@ set(LLAMA_CPP_PATH "$ENV{HOME}/git/llama.cpp" CACHE PATH "Path to llama.cpp sour
 # --- Library: gwen core ---
 file(GLOB GWEN_KERNEL_SOURCES src/kernels/*.cu)
 list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "fattn_mma\\.cu$")
+list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_mmq\\.cu$")
+list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_q4k\\.cu$")
 
 set(GWEN_SOURCES
     ${GWEN_KERNEL_SOURCES}
@@ -54,8 +56,18 @@ if(EXISTS ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda/common.cuh)
         ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
     )
     set_target_properties(gwen_fattn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-    target_link_libraries(gwen_core gwen_fattn)
-    message(STATUS "llama.cpp found — MMA flash attention enabled")
+    # MMQ fused Q4_K GEMM (same llama.cpp headers)
+    add_library(gwen_mmq STATIC src/kernels/gemm_mmq.cu)
+    target_include_directories(gwen_mmq PRIVATE
+        include
+        ${LLAMA_CPP_PATH}/ggml/include
+        ${LLAMA_CPP_PATH}/ggml/src
+        ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
+    )
+    set_target_properties(gwen_mmq PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+    target_link_libraries(gwen_core gwen_fattn gwen_mmq)
+    message(STATUS "llama.cpp found — MMA flash attention + MMQ GEMM enabled")
 else()
     message(WARNING "llama.cpp not found at ${LLAMA_CPP_PATH} — MMA flash attention disabled")
 endif()
@@ -91,10 +103,15 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/src/dev_server.cpp)
         ${CMAKE_SOURCE_DIR}/third_party/cpp-httplib)
 endif()
 
-# --- Micro-benchmark ---
+# --- Micro-benchmarks ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/bench/micro_bench.cu)
     add_executable(micro_bench bench/micro_bench.cu)
     target_link_libraries(micro_bench gwen_core)
+endif()
+
+if(EXISTS ${CMAKE_SOURCE_DIR}/bench/bench_gemm_approaches.cu)
+    add_executable(bench_gemm_approaches bench/bench_gemm_approaches.cu)
+    target_link_libraries(bench_gemm_approaches gwen_core)
 endif()
 
 # --- Kernel tests ---

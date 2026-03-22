@@ -279,16 +279,6 @@ static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
     }
 }
 
-// Upload + pre-dequantize to FP16 for prefill GEMMs (avoids per-call dequant overhead)
-static void upload_weight_with_fp16(CudaAllocator& alloc, WeightRef& w) {
-    upload_weight(alloc, w);
-    if (w.on_device() && w.type != GGMLType::F32 && w.type != GGMLType::F16 && w.n_elements > 0) {
-        size_t fp16_bytes = w.n_elements * sizeof(half);
-        w.fp16_data = static_cast<half*>(alloc.alloc(fp16_bytes));
-        gwen_dequant(w.device_data, w.fp16_data, w.n_elements, w.type, 0);
-    }
-}
-
 void Model::upload_weights(CudaAllocator& allocator) {
     upload_weight(allocator, token_embd);
     upload_weight(allocator, output_norm);
@@ -296,33 +286,33 @@ void Model::upload_weights(CudaAllocator& allocator) {
     for (auto& layer : layers) {
         if (layer.is_full_attention) {
             auto& w = layer.full_attn;
-            upload_weight(allocator, w.attn_norm);       // F32 norm — no FP16 needed
-            upload_weight_with_fp16(allocator, w.attn_q);
-            upload_weight_with_fp16(allocator, w.attn_k);
-            upload_weight_with_fp16(allocator, w.attn_v);
-            upload_weight(allocator, w.attn_q_norm);     // F32 norm
-            upload_weight(allocator, w.attn_k_norm);     // F32 norm
-            upload_weight_with_fp16(allocator, w.attn_output);
-            upload_weight(allocator, w.post_attn_norm);  // F32 norm
-            upload_weight_with_fp16(allocator, w.ffn_gate);
-            upload_weight_with_fp16(allocator, w.ffn_up);
-            upload_weight_with_fp16(allocator, w.ffn_down);
+            upload_weight(allocator, w.attn_norm);
+            upload_weight(allocator, w.attn_q);
+            upload_weight(allocator, w.attn_k);
+            upload_weight(allocator, w.attn_v);
+            upload_weight(allocator, w.attn_q_norm);
+            upload_weight(allocator, w.attn_k_norm);
+            upload_weight(allocator, w.attn_output);
+            upload_weight(allocator, w.post_attn_norm);
+            upload_weight(allocator, w.ffn_gate);
+            upload_weight(allocator, w.ffn_up);
+            upload_weight(allocator, w.ffn_down);
         } else {
             auto& w = layer.deltanet;
-            upload_weight(allocator, w.attn_norm);       // F32 norm
-            upload_weight_with_fp16(allocator, w.attn_qkv);
-            upload_weight_with_fp16(allocator, w.attn_gate);
-            upload_weight(allocator, w.ssm_conv1d);      // F32 conv weights
-            upload_weight(allocator, w.ssm_a);           // F32 scalar
-            upload_weight(allocator, w.ssm_dt_bias);     // F32 scalar
-            upload_weight(allocator, w.ssm_alpha);       // Q8_0 but small, keep as-is
-            upload_weight(allocator, w.ssm_beta);        // Q8_0 but small, keep as-is
-            upload_weight(allocator, w.ssm_norm);        // F32 norm
-            upload_weight_with_fp16(allocator, w.ssm_out);
-            upload_weight(allocator, w.post_attn_norm);  // F32 norm
-            upload_weight_with_fp16(allocator, w.ffn_gate);
-            upload_weight_with_fp16(allocator, w.ffn_up);
-            upload_weight_with_fp16(allocator, w.ffn_down);
+            upload_weight(allocator, w.attn_norm);
+            upload_weight(allocator, w.attn_qkv);
+            upload_weight(allocator, w.attn_gate);
+            upload_weight(allocator, w.ssm_conv1d);
+            upload_weight(allocator, w.ssm_a);
+            upload_weight(allocator, w.ssm_dt_bias);
+            upload_weight(allocator, w.ssm_alpha);
+            upload_weight(allocator, w.ssm_beta);
+            upload_weight(allocator, w.ssm_norm);
+            upload_weight(allocator, w.ssm_out);
+            upload_weight(allocator, w.post_attn_norm);
+            upload_weight(allocator, w.ffn_gate);
+            upload_weight(allocator, w.ffn_up);
+            upload_weight(allocator, w.ffn_down);
         }
     }
 
