@@ -1163,10 +1163,9 @@ kernel_l2_normalize_qkv_batch(
 }
 
 // Fast DeltaNet prefill — S in registers, warp-per-column layout.
-// Adapted from llama.cpp's gated_delta_net_cuda kernel.
-// Grid: (n_heads, 1, S_v / num_warps), Block: (32, num_warps=4)
-// Each warp owns one column of S[dk, dv]. 32 lanes hold 4 rows each (dk=128, 128/32=4).
-// QKV is interleaved FP16: [N, 3*ssm_inner] = [N, Q_all(2048) | K_all(2048) | V_all(2048)]
+// Matches llama.cpp's gated_delta_net_cuda: pointer-increment inner loop,
+// separate Q/K/V pointers (FP16, converted inline), stride-based addressing.
+// Grid: (n_heads, 1, dv / num_warps), Block: (32, num_warps=4)
 // Q and K MUST be pre-normalized (L2 norm + q_scale) before calling this kernel.
 template <int DK = 128>
 __global__ void __launch_bounds__(128, 2)
@@ -1180,29 +1179,33 @@ kernel_deltanet_prefill_fast(
     float q_scale)
 {
     const int head = blockIdx.x;
-    const int col  = blockIdx.z * blockDim.y + threadIdx.y;  // which column of S this warp owns
-    const int lane = threadIdx.x;  // 0..31
+    const int col  = blockIdx.z * blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
 
     if (col >= dv) return;
 
     constexpr int WARP_SIZE = 32;
-    constexpr int ROWS_PER_LANE = DK / WARP_SIZE;  // 128/32 = 4
+    constexpr int ROWS_PER_LANE = DK / WARP_SIZE;  // 4
 
-    // Load S column into registers (transposed: S_reg[r] = S[r*32+lane, col])
-    float* S_col = S + (size_t)head * dk * dv + (size_t)col;  // stride = dv between rows
+    // Load S column into registers
+    float* S_col = S + (size_t)head * dk * dv + (size_t)col;
     float s_reg[ROWS_PER_LANE];
     #pragma unroll
     for (int r = 0; r < ROWS_PER_LANE; r++) {
         s_reg[r] = S_col[(r * WARP_SIZE + lane) * dv];
     }
 
-    for (int t = 0; t < N; t++) {
-        const half* q_ptr = qkv_batch + (size_t)t * ssm_inner * 3 + head * dk;
-        const half* k_ptr = q_ptr + ssm_inner;
-        const half* v_ptr = k_ptr + ssm_inner;
+    // Set up pointers for Q, K, V sections + gate/beta — advance by stride each token
+    const int qkv_stride = ssm_inner * 3;          // stride between tokens in QKV tensor
+    const half* q_ptr = qkv_batch + head * dk;      // Q for head, token 0
+    const half* k_ptr = q_ptr + ssm_inner;           // K for head, token 0
+    const half* v_ptr = k_ptr + ssm_inner;           // V for head, token 0
+    const float* g_ptr = gate_batch + head;           // gate for head, token 0
+    const float* b_ptr = beta_batch + head;           // beta for head, token 0
+    half* o_ptr = output_batch + head * dv;           // output for head, token 0
 
-        // Load pre-normalized Q and K into registers (4 elements each)
-        // Q/K are already L2-normalized (+ q_scale applied to Q) by caller
+    for (int t = 0; t < N; t++) {
+        // Load Q and K from FP16 (pre-normalized)
         float q_reg[ROWS_PER_LANE];
         float k_reg[ROWS_PER_LANE];
         #pragma unroll
@@ -1212,11 +1215,11 @@ kernel_deltanet_prefill_fast(
             k_reg[r] = __half2float(k_ptr[i]);
         }
 
-        float decay = expf(gate_batch[t * n_heads + head]);
-        float beta_val = beta_batch[t * n_heads + head];
+        float decay = expf(*g_ptr);
+        float beta_val = *b_ptr;
         float v_col = __half2float(v_ptr[col]);
 
-        // kv_col = sum_i S[i][col] * k[i]  (dot product of column with k)
+        // kv_col = sum_i S[i][col] * k[i]
         float kv_partial = 0.0f;
         #pragma unroll
         for (int r = 0; r < ROWS_PER_LANE; r++) {
@@ -1226,11 +1229,9 @@ kernel_deltanet_prefill_fast(
         for (int off = 16; off > 0; off >>= 1)
             kv_col += __shfl_xor_sync(0xFFFFFFFF, kv_col, off);
 
-        // delta = (v[col] - decay * kv_col) * beta
         float delta_col = (v_col - decay * kv_col) * beta_val;
 
-        // Fused: S[i][col] = decay * S[i][col] + k[i] * delta
-        //        attn[col] = sum_i S[i][col] * q[i]
+        // S update + attn
         float attn_partial = 0.0f;
         #pragma unroll
         for (int r = 0; r < ROWS_PER_LANE; r++) {
@@ -1241,13 +1242,20 @@ kernel_deltanet_prefill_fast(
         for (int off = 16; off > 0; off >>= 1)
             attn_col += __shfl_xor_sync(0xFFFFFFFF, attn_col, off);
 
-        // Only lane 0 writes output
         if (lane == 0) {
-            output_batch[(size_t)t * ssm_inner + head * dv + col] = __float2half(attn_col);
+            o_ptr[col] = __float2half(attn_col);
         }
+
+        // Advance pointers (simple adds, no multiplications)
+        q_ptr += qkv_stride;
+        k_ptr += qkv_stride;
+        v_ptr += qkv_stride;
+        g_ptr += n_heads;
+        b_ptr += n_heads;
+        o_ptr += ssm_inner;
     }
 
-    // Write S column back to global memory
+    // Write S column back
     #pragma unroll
     for (int r = 0; r < ROWS_PER_LANE; r++) {
         S_col[(r * WARP_SIZE + lane) * dv] = s_reg[r];
