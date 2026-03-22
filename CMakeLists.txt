@@ -7,7 +7,7 @@ set(CMAKE_CUDA_ARCHITECTURES 120)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # CUDA flags — hyper-optimized for RTX 5070 Ti (SM_120)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-relaxed-constexpr --use_fast_math")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-relaxed-constexpr --use_fast_math --extended-lambda")
 
 # CUTLASS (header-only)
 if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/cutlass/include)
@@ -21,9 +21,15 @@ endif()
 # Project includes
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+# --- llama.cpp source path (for MMA flash attention kernel) ---
+set(LLAMA_CPP_PATH "$ENV{HOME}/git/llama.cpp" CACHE PATH "Path to llama.cpp source tree")
+
 # --- Library: gwen core ---
-file(GLOB_RECURSE GWEN_SOURCES
-    src/kernels/*.cu
+file(GLOB GWEN_KERNEL_SOURCES src/kernels/*.cu)
+list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "fattn_mma\\.cu$")
+
+set(GWEN_SOURCES
+    ${GWEN_KERNEL_SOURCES}
     src/gguf.cu
     src/model.cu
     src/memory.cu
@@ -36,6 +42,22 @@ if(GWEN_SOURCES)
     target_include_directories(gwen_core PUBLIC include)
     target_link_libraries(gwen_core)
     set_target_properties(gwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
+# --- MMA flash attention (compiled against llama.cpp headers) ---
+if(EXISTS ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda/common.cuh)
+    add_library(gwen_fattn STATIC src/kernels/fattn_mma.cu)
+    target_include_directories(gwen_fattn PRIVATE
+        include
+        ${LLAMA_CPP_PATH}/ggml/include
+        ${LLAMA_CPP_PATH}/ggml/src
+        ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
+    )
+    set_target_properties(gwen_fattn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    target_link_libraries(gwen_core gwen_fattn)
+    message(STATUS "llama.cpp found — MMA flash attention enabled")
+else()
+    message(WARNING "llama.cpp not found at ${LLAMA_CPP_PATH} — MMA flash attention disabled")
 endif()
 
 # --- Main executable ---

@@ -306,4 +306,17 @@ void gwen_topk(const half* logits, uint16_t* topk_indices, half* topk_values,
                int n_rows, int K, int k, cudaStream_t stream = 0);
 
 
+// ============================================================
+// MMA Flash Attention (ported from llama.cpp fattn-mma-f16)
+// ============================================================
+
+// MMA-based causal self-attention using m16n8k16 tensor core instructions.
+// Q: [N, n_head * head_dim] FP16, K/V: [N, n_kv_heads * head_dim] FP16
+// output: [N, n_head * head_dim] FP16
+// temp_f32: scratch buffer of N * n_head * head_dim floats (for F32 Q + output)
+void gwen_flash_attn_mma(const half* Q, const half* K, const half* V,
+                          half* output, float* temp_f32,
+                          int N, int n_head, int n_kv_heads, int head_dim,
+                          float scale, cudaStream_t stream = 0);
+
 } // namespace gwen

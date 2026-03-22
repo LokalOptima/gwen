@@ -4211,17 +4211,16 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     kv_dim, pos);
             }
 
-            // 5. Multi-query flash attention (4 queries/warp × 4 GQA heads/block)
+            // 5. MMA flash attention (ported from llama.cpp — tensor core m16n8k16)
             {
                 float scale = 1.0f / sqrtf((float)cfg.head_dim);
-                constexpr int QR = 4;
-                int gqa_ratio = cfg.n_head / cfg.n_head_kv;
-                int n_q_tiles = (N + QR - 1) / QR;
-                dim3 attn_grid(cfg.n_head_kv, n_q_tiles, 1);
-                kernel_flash_attn_multi<QR><<<attn_grid, gqa_ratio * 32, 0, s>>>(
-                    prefill_proj_gate, prefill_ffn_gate, prefill_ffn_up,
-                    prefill_proj_qkv,
-                    N, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale);
+                gwen_flash_attn_mma(
+                    prefill_proj_gate,   // Q [N, n_head * head_dim] FP16
+                    prefill_ffn_gate,    // K [N, n_kv_heads * head_dim] FP16
+                    prefill_ffn_up,      // V [N, n_kv_heads * head_dim] FP16
+                    prefill_proj_qkv,    // output [N, n_head * head_dim] FP16
+                    prefill_proj_qkv_f32,// F32 scratch (reuse DeltaNet QKV buffer)
+                    N, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale, s);
             }
 
             // 6. Batch sigmoid-mul: output = attn_out * sigmoid(gate)
