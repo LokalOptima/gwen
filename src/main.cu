@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <future>
 #include <getopt.h>
 #include <sstream>
 #include <vector>
@@ -110,44 +111,27 @@ int main(int argc, char** argv) {
     }
 
     // Load model
-    auto t0 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "Loading model: %s\n", model_path.c_str());
-
     auto model = Model::load(model_path);
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double load_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    fprintf(stderr, "GGUF parsed in %.1f ms\n", load_ms);
 
     // Load MTP weights (default: on, disable with --no-mtp)
     if (!mtp_path.empty()) {
         model->load_mtp(mtp_path);
     }
 
-    model->print_info();
-
     if (info_only) {
+        model->print_info();
         return 0;
     }
 
-    // Build tokenizer
-    fprintf(stderr, "\nBuilding tokenizer...\n");
-    auto tokenizer = Tokenizer::from_gguf(*model->gguf);
-    fprintf(stderr, "Vocab size: %d\n", tokenizer->vocab_size());
-
-    // Upload weights to GPU
-    fprintf(stderr, "\nUploading weights to GPU...\n");
-    auto t2 = std::chrono::high_resolution_clock::now();
+    // Build tokenizer concurrently with weight upload
+    auto tok_future = std::async(std::launch::async, [&]() {
+        return Tokenizer::from_gguf(*model->gguf);
+    });
 
     CudaAllocator allocator;
     model->upload_weights(allocator);
 
-    auto t3 = std::chrono::high_resolution_clock::now();
-    double upload_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    fprintf(stderr, "Weights uploaded in %.1f ms (%.1f MB, %zu allocations)\n",
-           upload_ms,
-           allocator.total_allocated() / 1024.0 / 1024.0,
-           allocator.n_allocations());
+    auto tokenizer = tok_future.get();
 
     // ========== Compare extract mode ==========
     if (compare_extract) {
@@ -361,15 +345,8 @@ int main(int argc, char** argv) {
 
     // Tokenize prompt
     auto prompt_tokens = tokenizer->encode(prompt);
-    fprintf(stderr, "\nPrompt: %s\n", prompt.c_str());
-    fprintf(stderr, "Prompt tokens (%zu): ", prompt_tokens.size());
-    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-        fprintf(stderr, "%d ", prompt_tokens[i]);
-    }
-    fprintf(stderr, "\n");
 
     // Allocate inference state
-    fprintf(stderr, "\nAllocating inference state...\n");
     InferenceState state;
     state.allocate(model->config, allocator);
     state.allocate_prefill(model->config, allocator, 4096);
@@ -379,7 +356,6 @@ int main(int argc, char** argv) {
         state.mtp_confidence_threshold = mtp_threshold;
         state.profile_cycles = profile_cycles;
     }
-    fprintf(stderr, "Total GPU memory: %.1f MB\n", allocator.total_allocated() / 1024.0 / 1024.0);
 
     // Parse teacher tokens if provided
     std::vector<int> teacher_tokens;
@@ -389,12 +365,10 @@ int main(int argc, char** argv) {
         while (std::getline(iss, tok, ',')) {
             if (!tok.empty()) teacher_tokens.push_back(std::stoi(tok));
         }
-        fprintf(stderr, "\nTeacher-forcing with %zu reference tokens\n", teacher_tokens.size());
     }
 
     // Generate
-    fprintf(stderr, "\nGenerating %d tokens (greedy=%s)...\n", n_predict, greedy ? "true" : "false");
-    auto t4 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::high_resolution_clock::now();
 
     std::vector<int> output_tokens;
     if (!teacher_tokens.empty()) {
@@ -406,40 +380,26 @@ int main(int argc, char** argv) {
     }
 
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
-    auto t5 = std::chrono::high_resolution_clock::now();
+    auto t1 = std::chrono::high_resolution_clock::now();
 
-    // Decode and print output — this is the only stdout output
+    // Output: generated text on stdout
     std::string output_text = tokenizer->decode(output_tokens);
     printf("%s%s\n", prompt.c_str(), output_text.c_str());
 
-    // Print token IDs for debugging
-    fprintf(stderr, "\nGenerated token IDs: ");
-    for (int id : output_tokens) fprintf(stderr, "%d ", id);
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Decoded per-token: ");
-    for (int id : output_tokens) fprintf(stderr, "[%s]", tokenizer->decode(id).c_str());
-    fprintf(stderr, "\n");
-
-    // Timing stats
-    double gen_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
-    int n_prompt = (int)prompt_tokens.size();
+    // Compact stats on stderr
+    double gen_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     int n_gen = (int)output_tokens.size();
     double tok_per_s = n_gen / (gen_ms / 1000.0);
-
-    fprintf(stderr, "\n--- Timing ---\n");
-    fprintf(stderr, "Prompt tokens: %d\n", n_prompt);
-    fprintf(stderr, "Generated tokens: %d\n", n_gen);
-    fprintf(stderr, "Total time: %.1f ms\n", gen_ms);
-    fprintf(stderr, "Tokens/sec: %.1f\n", tok_per_s);
+    fprintf(stderr, "[%d tokens, %.1f tok/s, %.1f ms]\n", n_gen, tok_per_s, gen_ms);
 
     if (benchmark) {
-        // JSON output for benchmark scripts
+        int n_prompt = (int)prompt_tokens.size();
         fprintf(stderr,
             "{\"prompt_tokens\": %d, \"decode_tokens\": %d, "
             "\"total_ms\": %.2f, \"decode_tok_per_s\": %.2f, "
             "\"ttft_ms\": %.2f, \"peak_vram_mb\": %.1f}\n",
             n_prompt, n_gen, gen_ms, tok_per_s,
-            gen_ms / (n_prompt + n_gen) * n_prompt,  // rough TTFT estimate
+            gen_ms / (n_prompt + n_gen) * n_prompt,
             allocator.total_allocated() / 1024.0 / 1024.0);
     }
 

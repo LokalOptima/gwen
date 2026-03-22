@@ -31,14 +31,8 @@ private:
     std::vector<std::string> id_to_token_;
     std::unordered_map<std::string, int> token_to_id_;
 
-    // BPE merges: pair → merged token
-    struct BPEMerge {
-        std::string first;
-        std::string second;
-        int rank;
-    };
-    std::vector<BPEMerge> merges_;
-    std::unordered_map<std::string, int> merge_rank_; // "first second" → rank
+    // BPE merge rank: "first second" → priority rank
+    std::unordered_map<std::string, int> merge_rank_;
 
     int eos_id_ = 248046;
     int pad_id_ = 248055;

@@ -12,6 +12,7 @@ std::unique_ptr<Tokenizer> Tokenizer::from_gguf(const GGUFFile& gguf) {
     if (it != gguf.metadata().end()) {
         const auto& tokens = std::get<std::vector<std::string>>(it->second);
         tok->id_to_token_ = tokens;
+        tok->token_to_id_.reserve(tokens.size());
         for (int i = 0; i < (int)tokens.size(); i++) {
             tok->token_to_id_[tokens[i]] = i;
         }
@@ -21,18 +22,9 @@ std::unique_ptr<Tokenizer> Tokenizer::from_gguf(const GGUFFile& gguf) {
     auto mit = gguf.metadata().find("tokenizer.ggml.merges");
     if (mit != gguf.metadata().end()) {
         const auto& merge_strs = std::get<std::vector<std::string>>(mit->second);
-        tok->merges_.reserve(merge_strs.size());
+        tok->merge_rank_.reserve(merge_strs.size());
         for (int i = 0; i < (int)merge_strs.size(); i++) {
-            // Each merge is "first second"
-            auto space_pos = merge_strs[i].find(' ');
-            if (space_pos != std::string::npos) {
-                BPEMerge m;
-                m.first = merge_strs[i].substr(0, space_pos);
-                m.second = merge_strs[i].substr(space_pos + 1);
-                m.rank = i;
-                tok->merge_rank_[merge_strs[i]] = i;
-                tok->merges_.push_back(std::move(m));
-            }
+            tok->merge_rank_[merge_strs[i]] = i;
         }
     }
 

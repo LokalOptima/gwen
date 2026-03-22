@@ -2805,11 +2805,11 @@ void InferenceState::allocate_batch_prefill(const ModelConfig& cfg, CudaAllocato
         + h_total                                                     // h_states
         + max_total_tokens * cfg.ssm_inner_size * sizeof(half);       // v_new
 
-    fprintf(stderr, "Batch prefill: max_seqs=%d, max_tokens=%d\n", max_seqs, max_total_tokens);
-    fprintf(stderr, "  DeltaNet S states: %.1f MB (%d seqs × %d layers × %.0f KB/layer)\n",
+    GWEN_LOG("Batch prefill: max_seqs=%d, max_tokens=%d\n", max_seqs, max_total_tokens);
+    GWEN_LOG("  DeltaNet S states: %.1f MB (%d seqs × %d layers × %.0f KB/layer)\n",
            S_total / 1024.0 / 1024.0, max_seqs, n_batch_dn_layers, S_per_layer / 1024.0);
-    fprintf(stderr, "  Conv states: %.1f MB\n", conv_total / 1024.0 / 1024.0);
-    fprintf(stderr, "  Chunkwise buffers: %.1f MB (NT_max=%d)\n", chunk_total / 1024.0 / 1024.0, chunk_NT_max);
+    GWEN_LOG("  Conv states: %.1f MB\n", conv_total / 1024.0 / 1024.0);
+    GWEN_LOG("  Chunkwise buffers: %.1f MB (NT_max=%d)\n", chunk_total / 1024.0 / 1024.0, chunk_NT_max);
 }
 
 // ============================================================
@@ -2869,11 +2869,13 @@ void InferenceState::allocate_mtp(const ModelConfig& cfg, CudaAllocator& alloc, 
         GWEN_CHECK_CUDA(cudaMemcpy(d_conv_ptrs, h_conv_ptrs.data(),
                                     n_dn_layers * sizeof(float*), cudaMemcpyHostToDevice));
 
+#ifdef GWEN_DEBUG
         size_t replay_total = n_dn_layers * S_bytes_per_layer + conv_replay_bytes;
-        fprintf(stderr, "MTP state allocated (KV cache: %.1f MB, replay buffers: %.1f KB)\n",
+        GWEN_LOG("MTP state allocated (KV cache: %.1f MB, replay buffers: %.1f KB)\n",
                2 * kv_bytes / 1024.0 / 1024.0, replay_total / 1024.0);
+#endif
     } else {
-        fprintf(stderr, "MTP state allocated (KV cache: %.1f MB, no DeltaNet layers)\n",
+        GWEN_LOG("MTP state allocated (KV cache: %.1f MB, no DeltaNet layers)\n",
                2 * kv_bytes / 1024.0 / 1024.0);
     }
 }
@@ -2918,7 +2920,7 @@ void InferenceState::allocate_batch2(const ModelConfig& cfg, CudaAllocator& allo
     b2_argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
 
     batch2_allocated = true;
-    fprintf(stderr, "Batch-2 verify buffers allocated\n");
+    GWEN_LOG("Batch-2 verify buffers allocated\n");
 }
 
 // ============================================================
@@ -4705,7 +4707,7 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t_prefill = std::chrono::high_resolution_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
-    fprintf(stderr, "TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
+    GWEN_LOG("TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
            prompt_tokens.size() / (ttft_ms / 1000.0));
 
     // Decode loop
@@ -5037,7 +5039,7 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t_prefill = std::chrono::high_resolution_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
-    fprintf(stderr, "TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
+    GWEN_LOG("TTFT: %.1f ms (%.0f prompt tok/s)\n", ttft_ms,
            prompt_tokens.size() / (ttft_ms / 1000.0));
 
     // First decode step: process the prefill prediction to set mtp_hidden
@@ -5079,9 +5081,7 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
             if (bonus == (int)model.config.eos_token_id) break;
             draft = forward_mtp(model, bonus);
         }
-        if (idk_count > 0) {
-            fprintf(stderr, "MTP IDK: %d tokens skipped speculation\n", idk_count);
-        }
+        GWEN_LOG("MTP IDK: %d tokens skipped speculation\n", idk_count);
         if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
         return output_tokens;
     }
@@ -5178,12 +5178,14 @@ std::vector<int> InferenceState::generate_speculative(Model& model,
             }
         }
         if ((int)output_tokens.size() > n_predict) output_tokens.resize(n_predict);
+#ifdef GWEN_DEBUG
         int total = accepted + rejected;
-        fprintf(stderr, "MTP stats: %d accepted, %d rejected, %d IDK (%.1f%% acceptance rate, %.1f%% IDK), %d cycles\n",
+        GWEN_LOG("MTP stats: %d accepted, %d rejected, %d IDK (%.1f%% acceptance rate, %.1f%% IDK), %d cycles\n",
                accepted, rejected, idk_count,
                total > 0 ? 100.0 * accepted / total : 0.0,
                (total + idk_count) > 0 ? 100.0 * idk_count / (total + idk_count) : 0.0,
                total + idk_count);
+#endif
 
         if (profile_cycles) {
             fprintf(stderr, "\n--- Cycle Timing (ms) ---\n");

@@ -99,3 +99,10 @@ struct ModelConfig {
 };
 
 } // namespace gwen
+
+// Debug logging macro — compiles to nop unless GWEN_DEBUG is defined
+#ifdef GWEN_DEBUG
+#define GWEN_LOG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define GWEN_LOG(...) ((void)0)
+#endif
