@@ -2127,57 +2127,58 @@ kernel_batch_causal_attn(
     half* __restrict__ output,        // [B*L, n_head * head_dim]
     int L, int n_head, int n_kv_heads, int head_dim, float scale)
 {
-    int block_id = blockIdx.x;
-    int b = block_id / n_head;
-    int h = block_id % n_head;
+    // One warp per (batch, head, query_position) — parallelizes across all N queries
+    int h = blockIdx.x;
+    int t = blockIdx.y;  // query position
+    int b = blockIdx.z;
     int kv_h = h * n_kv_heads / n_head;  // GQA mapping
     int lane = threadIdx.x;  // 0..31
+
+    if (t >= L) return;
 
     int q_stride = n_head * head_dim;
     int kv_stride = n_kv_heads * head_dim;
     int elems = head_dim / 32;  // 8 for head_dim=256
 
-    for (int t = 0; t < L; t++) {
-        const half* q_ptr = Q + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
+    const half* q_ptr = Q + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
 
-        float q_local[8];
+    float q_local[8];
+    #pragma unroll
+    for (int e = 0; e < 8; e++) q_local[e] = __half2float(q_ptr[e]) * scale;
+
+    float max_score = -FLT_MAX;
+    float sum_exp = 0.0f;
+    float o_local[8] = {};
+
+    for (int k = 0; k <= t; k++) {
+        const half* k_ptr = K + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
+        float dot = 0.0f;
         #pragma unroll
-        for (int e = 0; e < 8; e++) q_local[e] = __half2float(q_ptr[e]) * scale;
+        for (int e = 0; e < 8; e++) dot += q_local[e] * __half2float(k_ptr[e]);
 
-        float max_score = -FLT_MAX;
-        float sum_exp = 0.0f;
-        float o_local[8] = {};
+        // Warp reduction — all 32 lanes get the full dot product
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
 
-        for (int k = 0; k <= t; k++) {
-            const half* k_ptr = K + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
-            float dot = 0.0f;
-            #pragma unroll
-            for (int e = 0; e < 8; e++) dot += q_local[e] * __half2float(k_ptr[e]);
+        // Online softmax update
+        float old_max = max_score;
+        max_score = fmaxf(max_score, dot);
+        float rescale = expf(old_max - max_score);
+        sum_exp = sum_exp * rescale + expf(dot - max_score);
 
-            // Warp reduction — all 32 lanes get the full dot product
-            for (int off = 16; off > 0; off >>= 1)
-                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
-
-            // Online softmax update
-            float old_max = max_score;
-            max_score = fmaxf(max_score, dot);
-            float rescale = expf(old_max - max_score);
-            sum_exp = sum_exp * rescale + expf(dot - max_score);
-
-            #pragma unroll
-            for (int e = 0; e < 8; e++) o_local[e] *= rescale;
-
-            float w = expf(dot - max_score);
-            const half* v_ptr = V + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
-            #pragma unroll
-            for (int e = 0; e < 8; e++) o_local[e] += w * __half2float(v_ptr[e]);
-        }
-
-        float inv_sum = 1.0f / sum_exp;
-        half* o_ptr = output + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
         #pragma unroll
-        for (int e = 0; e < 8; e++) o_ptr[e] = __float2half(o_local[e] * inv_sum);
+        for (int e = 0; e < 8; e++) o_local[e] *= rescale;
+
+        float w = expf(dot - max_score);
+        const half* v_ptr = V + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) o_local[e] += w * __half2float(v_ptr[e]);
     }
+
+    float inv_sum = 1.0f / sum_exp;
+    half* o_ptr = output + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
+    #pragma unroll
+    for (int e = 0; e < 8; e++) o_ptr[e] = __float2half(o_local[e] * inv_sum);
 }
 
 // Batched sigmoid-mul: output[i] = attn[i] * sigmoid(gate[i]) for all B*L tokens
@@ -2412,6 +2413,26 @@ __global__ void kernel_confidence_gate(const float* __restrict__ logits,
     if (prob < threshold) {
         *argmax_result = -1;
     }
+}
+
+// Batch KV cache store: copy N tokens of K and V into cache at positions pos_offset..pos_offset+N-1
+// Grid: (ceil(kv_dim/256), N)
+__global__ void __launch_bounds__(256)
+kernel_kv_cache_store_batch(
+    half* __restrict__ k_cache,         // [max_seq, kv_dim]
+    half* __restrict__ v_cache,         // [max_seq, kv_dim]
+    const half* __restrict__ k_batch,   // [N, kv_dim]
+    const half* __restrict__ v_batch,   // [N, kv_dim]
+    int kv_dim, int pos_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= kv_dim) return;
+    int t = blockIdx.y;
+    int pos = pos_offset + t;
+    size_t cache_off = (size_t)pos * kv_dim + idx;
+    size_t src_off = (size_t)t * kv_dim + idx;
+    k_cache[cache_off] = k_batch[src_off];
+    v_cache[cache_off] = v_batch[src_off];
 }
 
 // ============================================================
@@ -4065,47 +4086,64 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                       pf_norm, prefill_ffn_up,
                       kv_dim, w.attn_v.shape[0], N, s);
 
-            // Per-token attention (FP16 internal — only 6 layers, non-recurrent)
-            for (int t = 0; t < N; t++) {
-                int cur_pos = pos + t;
-
+            // Batched attention (replaces per-token loop)
+            // 1. Batch deinterleave Q+gate
+            {
                 int deint_blocks = (attn_dim + 255) / 256;
-                kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
-                    prefill_proj_qkv + (size_t)t * q_proj_dim,
-                    fa_q, gated_out, cfg.n_head, cfg.head_dim);
+                dim3 grid(deint_blocks, N);
+                kernel_deinterleave_qgate_batch<<<grid, 256, 0, s>>>(
+                    prefill_proj_qkv, prefill_proj_gate, prefill_ffn_out,
+                    N, cfg.n_head, cfg.head_dim);
+            }
 
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_k, prefill_ffn_gate + (size_t)t * kv_dim,
-                    kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(fa_v, prefill_ffn_up + (size_t)t * kv_dim,
-                    kv_dim * sizeof(half), cudaMemcpyDeviceToDevice, s));
+            // 2. Batch Q/K RMSNorm
+            gwen_rmsnorm_batched_f32w(
+                prefill_proj_gate, static_cast<const float*>(w.attn_q_norm.device_data),
+                prefill_proj_gate, N * cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_batched_f32w(
+                prefill_ffn_gate, static_cast<const float*>(w.attn_k_norm.device_data),
+                prefill_ffn_gate, N * cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
 
-                gwen_rmsnorm_batched_f32w(fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
-                                          fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
-                gwen_rmsnorm_batched_f32w(fa_k, static_cast<const float*>(w.attn_k_norm.device_data),
-                                          fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
+            // 3. Batch RoPE
+            {
+                dim3 rope_grid(cfg.n_head + cfg.n_head_kv, N);
+                int n_pairs = cfg.rope_dim / 2;
+                int rope_threads = ((n_pairs + 31) / 32) * 32;
+                if (rope_threads < 32) rope_threads = 32;
+                if (rope_threads > 256) rope_threads = 256;
+                kernel_rope_batch<<<rope_grid, rope_threads, 0, s>>>(
+                    prefill_proj_gate, prefill_ffn_gate,
+                    cfg.n_head, cfg.n_head_kv, cfg.head_dim,
+                    N, cfg.rope_theta, cfg.rope_dim);
+            }
 
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(d_pos, &cur_pos, sizeof(int), cudaMemcpyHostToDevice, s));
-
-                gwen_rope(fa_q, fa_k,
-                          cfg.n_head, cfg.n_head_kv, cfg.head_dim,
-                          d_pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim, s);
-
+            // 4. Store K, V into KV cache for subsequent decode
+            {
                 int kv_blocks = (kv_dim + 255) / 256;
-                kernel_kv_cache_store<<<kv_blocks, 256, 0, s>>>(
-                    cache.k_cache, cache.v_cache, fa_k, fa_v, d_pos, kv_dim);
+                dim3 grid(kv_blocks, N);
+                kernel_kv_cache_store_batch<<<grid, 256, 0, s>>>(
+                    cache.k_cache, cache.v_cache,
+                    prefill_ffn_gate, prefill_ffn_up,
+                    kv_dim, pos);
+            }
 
+            // 5. Flash causal attention (one warp per query position per head)
+            {
                 float scale = 1.0f / sqrtf((float)cfg.head_dim);
-                kernel_gqa_attention_decode<<<cfg.n_head, 256, 0, s>>>(
-                    fa_q, cache.k_cache, cache.v_cache,
-                    attn_out, attn_scores, d_pos,
-                    cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
+                dim3 attn_grid(cfg.n_head, N, 1);
+                kernel_batch_causal_attn<<<attn_grid, 32, 0, s>>>(
+                    prefill_proj_gate, prefill_ffn_gate, prefill_ffn_up,
+                    prefill_proj_qkv,  // reuse for attention output
+                    N, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale);
+            }
 
-                gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
-
-                GWEN_CHECK_CUDA(cudaMemcpyAsync(
-                    prefill_proj_gate + (size_t)t * cfg.ssm_inner_size,
-                    gated_out, attn_dim * sizeof(half),
-                    cudaMemcpyDeviceToDevice, s));
+            // 6. Batch sigmoid-mul: output = attn_out * sigmoid(gate)
+            {
+                int total = N * attn_dim;
+                int blocks = (total + 255) / 256;
+                kernel_sigmoid_mul_batch<<<blocks, 256, 0, s>>>(
+                    prefill_proj_qkv, prefill_ffn_out, prefill_proj_gate,
+                    total);
             }
 
             // Out projection → F32 directly to residual
@@ -4466,10 +4504,13 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
             // Flash causal attention: one warp per (batch, head) pair
         
             float scale = 1.0f / sqrtf((float)cfg.head_dim);
-            kernel_batch_causal_attn<<<B * cfg.n_head, 32, 0, s>>>(
-                prefill_proj_gate, prefill_ffn_gate, prefill_ffn_up,
-                prefill_proj_qkv,  // reuse for attention output [N, n_head*head_dim]
-                L, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale);
+            {
+                dim3 attn_grid(cfg.n_head, L, B);
+                kernel_batch_causal_attn<<<attn_grid, 32, 0, s>>>(
+                    prefill_proj_gate, prefill_ffn_gate, prefill_ffn_up,
+                    prefill_proj_qkv,  // reuse for attention output [N, n_head*head_dim]
+                    L, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale);
+            }
 
             // Batch sigmoid-mul: output = attn_out * sigmoid(gate)
         
