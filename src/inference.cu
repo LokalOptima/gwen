@@ -1120,12 +1120,54 @@ kernel_deltanet_prefill(
     }
 }
 
+// L2-normalize Q and K heads within interleaved QKV tensor.
+// One warp per (token, head). Q gets extra_scale, K gets scale 1.0.
+// Grid: N * n_heads, Block: 32
+__global__ void __launch_bounds__(32)
+kernel_l2_normalize_qkv_batch(
+    half* __restrict__ qkv,       // [N, 3*ssm_inner] after conv1d+silu
+    int N, int ssm_inner, int n_heads, int dk, float q_scale)
+{
+    int idx = blockIdx.x;
+    int t = idx / n_heads;
+    int h = idx % n_heads;
+    int lane = threadIdx.x;
+    if (t >= N) return;
+
+    half* q = qkv + (size_t)t * ssm_inner * 3 + h * dk;
+    half* k = q + ssm_inner;
+
+    // L2 normalize Q with q_scale
+    float sq = 0.0f;
+    for (int i = lane; i < dk; i += 32) {
+        float v = __half2float(q[i]);
+        sq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_xor_sync(0xFFFFFFFF, sq, off);
+    float q_inv = rsqrtf(fmaxf(sq, 1e-12f)) * q_scale;
+    for (int i = lane; i < dk; i += 32)
+        q[i] = __float2half(__half2float(q[i]) * q_inv);
+
+    // L2 normalize K
+    sq = 0.0f;
+    for (int i = lane; i < dk; i += 32) {
+        float v = __half2float(k[i]);
+        sq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        sq += __shfl_xor_sync(0xFFFFFFFF, sq, off);
+    float k_inv = rsqrtf(fmaxf(sq, 1e-12f));
+    for (int i = lane; i < dk; i += 32)
+        k[i] = __float2half(__half2float(k[i]) * k_inv);
+}
+
 // Fast DeltaNet prefill — S in registers, warp-per-column layout.
 // Adapted from llama.cpp's gated_delta_net_cuda kernel.
 // Grid: (n_heads, 1, S_v / num_warps), Block: (32, num_warps=4)
 // Each warp owns one column of S[dk, dv]. 32 lanes hold 4 rows each (dk=128, 128/32=4).
 // QKV is interleaved FP16: [N, 3*ssm_inner] = [N, Q_all(2048) | K_all(2048) | V_all(2048)]
-// Inline L2 normalization of Q and K.
+// Q and K MUST be pre-normalized (L2 norm + q_scale) before calling this kernel.
 template <int DK = 128>
 __global__ void __launch_bounds__(128, 2)
 kernel_deltanet_prefill_fast(
@@ -1159,7 +1201,8 @@ kernel_deltanet_prefill_fast(
         const half* k_ptr = q_ptr + ssm_inner;
         const half* v_ptr = k_ptr + ssm_inner;
 
-        // Load Q and K into registers (4 elements each)
+        // Load pre-normalized Q and K into registers (4 elements each)
+        // Q/K are already L2-normalized (+ q_scale applied to Q) by caller
         float q_reg[ROWS_PER_LANE];
         float k_reg[ROWS_PER_LANE];
         #pragma unroll
@@ -1168,26 +1211,6 @@ kernel_deltanet_prefill_fast(
             q_reg[r] = __half2float(q_ptr[i]);
             k_reg[r] = __half2float(k_ptr[i]);
         }
-
-        // L2-normalize Q (warp reduction across 128 elements)
-        float q_sq = 0.0f;
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; r++) q_sq += q_reg[r] * q_reg[r];
-        for (int off = 16; off > 0; off >>= 1)
-            q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, off);
-        float q_inv = rsqrtf(fmaxf(q_sq, 1e-12f)) * q_scale;
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; r++) q_reg[r] *= q_inv;
-
-        // L2-normalize K
-        float k_sq = 0.0f;
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; r++) k_sq += k_reg[r] * k_reg[r];
-        for (int off = 16; off > 0; off >>= 1)
-            k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, off);
-        float k_inv = rsqrtf(fmaxf(k_sq, 1e-12f));
-        #pragma unroll
-        for (int r = 0; r < ROWS_PER_LANE; r++) k_reg[r] *= k_inv;
 
         float decay = expf(gate_batch[t * n_heads + head]);
         float beta_val = beta_batch[t * n_heads + head];
@@ -2114,71 +2137,129 @@ kernel_deinterleave_qgate_batch(
     gate_out[dst_offset] = interleaved[src_base + src_g];
 }
 
-// Flash-attention-style batched causal self-attention for prefill.
-// One warp (32 threads) per (batch, q_head) pair.
-// Each warp processes all L query positions with online softmax.
-// No materialized score matrix — O(1) extra memory per block.
-// GQA: n_head Q heads share n_kv_heads K/V heads.
-__global__ void __launch_bounds__(32)
-kernel_batch_causal_attn(
+// ============================================================
+// Multi-query Flash Attention for prefill
+// ============================================================
+// Each warp processes QR consecutive query positions for the same Q head.
+// K/V are loaded once per key position and reused across QR queries.
+// This cuts L2 bandwidth by QR× compared to one-query-per-warp.
+// GQA grouping: 4 Q heads per KV head share a block for L1 reuse.
+//
+// Grid: (n_kv_heads, ceil(N/QR), batch)
+// Block: GQA_RATIO warps, each processes QR queries on its Q head
+//
+// QR=4: 4 queries per warp, 4 Q heads per block → 16 outputs per block
+// Register budget: q[4][8] + o[4][8] + softmax[4×2] + k[8] + temps ≈ 90 regs/thread
+template<int QR = 4>
+__global__ void __launch_bounds__(128)
+kernel_flash_attn_multi(
     const half* __restrict__ Q,       // [B*L, n_head * head_dim]
     const half* __restrict__ K,       // [B*L, n_kv_heads * head_dim]
     const half* __restrict__ V,       // [B*L, n_kv_heads * head_dim]
     half* __restrict__ output,        // [B*L, n_head * head_dim]
     int L, int n_head, int n_kv_heads, int head_dim, float scale)
 {
-    // One warp per (batch, head, query_position) — parallelizes across all N queries
-    int h = blockIdx.x;
-    int t = blockIdx.y;  // query position
-    int b = blockIdx.z;
-    int kv_h = h * n_kv_heads / n_head;  // GQA mapping
-    int lane = threadIdx.x;  // 0..31
+    constexpr int ELEMS = 8;  // head_dim / 32 = 256 / 32
 
-    if (t >= L) return;
+    int kv_h = blockIdx.x;
+    int q_tile = blockIdx.y;
+    int b = blockIdx.z;
+    int gqa_ratio = n_head / n_kv_heads;  // 4
+    int q_h = kv_h * gqa_ratio + threadIdx.x / 32;  // warp selects Q head
+    int lane = threadIdx.x % 32;
+
+    int q_start = q_tile * QR;
 
     int q_stride = n_head * head_dim;
     int kv_stride = n_kv_heads * head_dim;
-    int elems = head_dim / 32;  // 8 for head_dim=256
 
-    const half* q_ptr = Q + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
+    // Load Q for QR consecutive query positions
+    float q_reg[QR][ELEMS];
+    float o_reg[QR][ELEMS];
+    float m_reg[QR];
+    float l_reg[QR];
 
-    float q_local[8];
     #pragma unroll
-    for (int e = 0; e < 8; e++) q_local[e] = __half2float(q_ptr[e]) * scale;
-
-    float max_score = -FLT_MAX;
-    float sum_exp = 0.0f;
-    float o_local[8] = {};
-
-    for (int k = 0; k <= t; k++) {
-        const half* k_ptr = K + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
-        float dot = 0.0f;
+    for (int qi = 0; qi < QR; qi++) {
+        int q_pos = q_start + qi;
+        m_reg[qi] = -FLT_MAX;
+        l_reg[qi] = 0.0f;
         #pragma unroll
-        for (int e = 0; e < 8; e++) dot += q_local[e] * __half2float(k_ptr[e]);
-
-        // Warp reduction — all 32 lanes get the full dot product
-        for (int off = 16; off > 0; off >>= 1)
-            dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
-
-        // Online softmax update
-        float old_max = max_score;
-        max_score = fmaxf(max_score, dot);
-        float rescale = expf(old_max - max_score);
-        sum_exp = sum_exp * rescale + expf(dot - max_score);
-
-        #pragma unroll
-        for (int e = 0; e < 8; e++) o_local[e] *= rescale;
-
-        float w = expf(dot - max_score);
-        const half* v_ptr = V + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * elems;
-        #pragma unroll
-        for (int e = 0; e < 8; e++) o_local[e] += w * __half2float(v_ptr[e]);
+        for (int e = 0; e < ELEMS; e++) o_reg[qi][e] = 0.0f;
+        if (q_pos < L) {
+            const half* q_ptr = Q + (size_t)(b * L + q_pos) * q_stride + q_h * head_dim + lane * ELEMS;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                q_reg[qi][e] = __half2float(q_ptr[e]) * scale;
+        } else {
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                q_reg[qi][e] = 0.0f;
+        }
     }
 
-    float inv_sum = 1.0f / sum_exp;
-    half* o_ptr = output + (size_t)(b * L + t) * q_stride + h * head_dim + lane * elems;
+    // Process all key positions up to the last valid query in this tile
+    int max_q = min(q_start + QR - 1, L - 1);
+
+    for (int k = 0; k <= max_q; k++) {
+        // Load K and V once — reused across QR queries
+        const half* k_ptr = K + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * ELEMS;
+        float k_local[ELEMS];
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) k_local[e] = __half2float(k_ptr[e]);
+
+        const half* v_ptr = V + (size_t)(b * L + k) * kv_stride + kv_h * head_dim + lane * ELEMS;
+        float v_local[ELEMS];
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++) v_local[e] = __half2float(v_ptr[e]);
+
+        // Process each query
+        #pragma unroll
+        for (int qi = 0; qi < QR; qi++) {
+            int q_pos = q_start + qi;
+            if (q_pos >= L || k > q_pos) continue;  // causal mask
+
+            // Dot product Q[qi] · K[k]
+            float dot = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                dot += q_reg[qi][e] * k_local[e];
+
+            // Warp reduction
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
+
+            // Online softmax update
+            float old_max = m_reg[qi];
+            float new_max = fmaxf(old_max, dot);
+            float rescale = expf(old_max - new_max);
+
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                o_reg[qi][e] *= rescale;
+            l_reg[qi] = l_reg[qi] * rescale + expf(dot - new_max);
+            m_reg[qi] = new_max;
+
+            // Accumulate weighted V (reused from v_local)
+            float w = expf(dot - new_max);
+            #pragma unroll
+            for (int e = 0; e < ELEMS; e++)
+                o_reg[qi][e] += w * v_local[e];
+        }
+    }
+
+    // Output
     #pragma unroll
-    for (int e = 0; e < 8; e++) o_ptr[e] = __float2half(o_local[e] * inv_sum);
+    for (int qi = 0; qi < QR; qi++) {
+        int q_pos = q_start + qi;
+        if (q_pos >= L) continue;
+        float inv_sum = (l_reg[qi] > 0.0f) ? 1.0f / l_reg[qi] : 0.0f;
+        half* o_ptr = output + (size_t)(b * L + q_pos) * q_stride + q_h * head_dim + lane * ELEMS;
+        #pragma unroll
+        for (int e = 0; e < ELEMS; e++)
+            o_ptr[e] = __float2half(o_reg[qi][e] * inv_sum);
+    }
 }
 
 // Batched sigmoid-mul: output[i] = attn[i] * sigmoid(gate[i]) for all B*L tokens
@@ -2601,6 +2682,7 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     GWEN_CHECK_CUDA(cudaFuncSetAttribute(
         (const void*)kernel_deltanet_fused_2tok,
         cudaFuncAttributeMaxDynamicSharedMemorySize, 65536));
+
 }
 
 void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
@@ -3981,6 +4063,15 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 prefill_dn_gate, prefill_dn_beta,
                 N, cfg.n_embed, cfg.ssm_n_heads);
 
+            // Pre-normalize Q and K (L2 norm) — avoids 10 warp reductions per token inside DeltaNet
+            // QKV layout: [N, Q(2048) | K(2048) | V(2048)] = [N, 3*ssm_inner]
+            {
+                int total_vecs = N * cfg.ssm_n_heads;  // N * 16
+                kernel_l2_normalize_qkv_batch<<<total_vecs, 32, 0, s>>>(
+                    prefill_proj_qkv, N, cfg.ssm_inner_size, cfg.ssm_n_heads,
+                    cfg.ssm_state_size, q_scale);
+            }
+
             // Fast DeltaNet: S in registers, warp-per-column (512 blocks vs old 16)
             {
                 int num_warps = 4;
@@ -4112,13 +4203,16 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     kv_dim, pos);
             }
 
-            // 5. Flash causal attention (one warp per query position per head)
+            // 5. Multi-query flash attention (4 queries/warp × 4 GQA heads/block)
             {
                 float scale = 1.0f / sqrtf((float)cfg.head_dim);
-                dim3 attn_grid(cfg.n_head, N, 1);
-                kernel_batch_causal_attn<<<attn_grid, 32, 0, s>>>(
+                constexpr int QR = 4;
+                int gqa_ratio = cfg.n_head / cfg.n_head_kv;
+                int n_q_tiles = (N + QR - 1) / QR;
+                dim3 attn_grid(cfg.n_head_kv, n_q_tiles, 1);
+                kernel_flash_attn_multi<QR><<<attn_grid, gqa_ratio * 32, 0, s>>>(
                     prefill_proj_gate, prefill_ffn_gate, prefill_ffn_up,
-                    prefill_proj_qkv,  // reuse for attention output
+                    prefill_proj_qkv,
                     N, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale);
             }
 
@@ -4466,14 +4560,16 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
                     L, cfg.rope_theta, cfg.rope_dim);
             }
 
-            // Flash causal attention: one warp per (batch, head) pair
-        
+            // Multi-query flash attention (4 queries/warp × 4 GQA heads/block)
             float scale = 1.0f / sqrtf((float)cfg.head_dim);
             {
-                dim3 attn_grid(cfg.n_head, L, B);
-                kernel_batch_causal_attn<<<attn_grid, 32, 0, s>>>(
+                constexpr int QR = 4;
+                int gqa_ratio = cfg.n_head / cfg.n_head_kv;
+                int n_q_tiles = (L + QR - 1) / QR;
+                dim3 attn_grid(cfg.n_head_kv, n_q_tiles, B);
+                kernel_flash_attn_multi<QR><<<attn_grid, gqa_ratio * 32, 0, s>>>(
                     prefill_proj_gate, prefill_ffn_gate, prefill_ffn_up,
-                    prefill_proj_qkv,  // reuse for attention output [N, n_head*head_dim]
+                    prefill_proj_qkv,
                     L, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale);
             }
 
