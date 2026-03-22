@@ -265,6 +265,19 @@ void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
                      int out_features, int in_features, int seq_len,
                      cudaStream_t stream = 0);
 
+// Auto-select: use pre-dequanted FP16 if available, else dequant+GEMM
+void gwen_gemm_auto(const void* W_quant, GGMLType type, const half* fp16_data,
+                     half* temp_w,
+                     const half* x, half* y,
+                     int out_features, int in_features, int seq_len,
+                     cudaStream_t stream = 0);
+
+void gwen_gemm_f32out_auto(const void* W_quant, GGMLType type, const half* fp16_data,
+                            half* temp_w,
+                            const half* x, float* y,
+                            int out_features, int in_features, int seq_len,
+                            cudaStream_t stream = 0);
+
 // ============================================================
 // Reduction: logsumexp + p_idk (for training server p_idk)
 // ============================================================
