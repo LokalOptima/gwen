@@ -1120,6 +1120,117 @@ kernel_deltanet_prefill(
     }
 }
 
+// Fast DeltaNet prefill — S in registers, warp-per-column layout.
+// Adapted from llama.cpp's gated_delta_net_cuda kernel.
+// Grid: (n_heads, 1, S_v / num_warps), Block: (32, num_warps=4)
+// Each warp owns one column of S[dk, dv]. 32 lanes hold 4 rows each (dk=128, 128/32=4).
+// QKV is interleaved FP16: [N, 3*ssm_inner] = [N, Q_all(2048) | K_all(2048) | V_all(2048)]
+// Inline L2 normalization of Q and K.
+template <int DK = 128>
+__global__ void __launch_bounds__(128, 2)
+kernel_deltanet_prefill_fast(
+    float* __restrict__ S,              // [n_heads, dk, dv] recurrent state (row-major)
+    const half* __restrict__ qkv_batch, // [N, 3*ssm_inner] after conv1d+silu
+    const float* __restrict__ gate_batch, // [N, n_heads]
+    const float* __restrict__ beta_batch, // [N, n_heads]
+    half* __restrict__ output_batch,    // [N, ssm_inner]
+    int N, int n_heads, int dk, int dv, int ssm_inner,
+    float q_scale)
+{
+    const int head = blockIdx.x;
+    const int col  = blockIdx.z * blockDim.y + threadIdx.y;  // which column of S this warp owns
+    const int lane = threadIdx.x;  // 0..31
+
+    if (col >= dv) return;
+
+    constexpr int WARP_SIZE = 32;
+    constexpr int ROWS_PER_LANE = DK / WARP_SIZE;  // 128/32 = 4
+
+    // Load S column into registers (transposed: S_reg[r] = S[r*32+lane, col])
+    float* S_col = S + (size_t)head * dk * dv + (size_t)col;  // stride = dv between rows
+    float s_reg[ROWS_PER_LANE];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_LANE; r++) {
+        s_reg[r] = S_col[(r * WARP_SIZE + lane) * dv];
+    }
+
+    for (int t = 0; t < N; t++) {
+        const half* q_ptr = qkv_batch + (size_t)t * ssm_inner * 3 + head * dk;
+        const half* k_ptr = q_ptr + ssm_inner;
+        const half* v_ptr = k_ptr + ssm_inner;
+
+        // Load Q and K into registers (4 elements each)
+        float q_reg[ROWS_PER_LANE];
+        float k_reg[ROWS_PER_LANE];
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; r++) {
+            int i = r * WARP_SIZE + lane;
+            q_reg[r] = __half2float(q_ptr[i]);
+            k_reg[r] = __half2float(k_ptr[i]);
+        }
+
+        // L2-normalize Q (warp reduction across 128 elements)
+        float q_sq = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; r++) q_sq += q_reg[r] * q_reg[r];
+        for (int off = 16; off > 0; off >>= 1)
+            q_sq += __shfl_xor_sync(0xFFFFFFFF, q_sq, off);
+        float q_inv = rsqrtf(fmaxf(q_sq, 1e-12f)) * q_scale;
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; r++) q_reg[r] *= q_inv;
+
+        // L2-normalize K
+        float k_sq = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; r++) k_sq += k_reg[r] * k_reg[r];
+        for (int off = 16; off > 0; off >>= 1)
+            k_sq += __shfl_xor_sync(0xFFFFFFFF, k_sq, off);
+        float k_inv = rsqrtf(fmaxf(k_sq, 1e-12f));
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; r++) k_reg[r] *= k_inv;
+
+        float decay = expf(gate_batch[t * n_heads + head]);
+        float beta_val = beta_batch[t * n_heads + head];
+        float v_col = __half2float(v_ptr[col]);
+
+        // kv_col = sum_i S[i][col] * k[i]  (dot product of column with k)
+        float kv_partial = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; r++) {
+            kv_partial += s_reg[r] * k_reg[r];
+        }
+        float kv_col = kv_partial;
+        for (int off = 16; off > 0; off >>= 1)
+            kv_col += __shfl_xor_sync(0xFFFFFFFF, kv_col, off);
+
+        // delta = (v[col] - decay * kv_col) * beta
+        float delta_col = (v_col - decay * kv_col) * beta_val;
+
+        // Fused: S[i][col] = decay * S[i][col] + k[i] * delta
+        //        attn[col] = sum_i S[i][col] * q[i]
+        float attn_partial = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_LANE; r++) {
+            s_reg[r] = decay * s_reg[r] + k_reg[r] * delta_col;
+            attn_partial += s_reg[r] * q_reg[r];
+        }
+        float attn_col = attn_partial;
+        for (int off = 16; off > 0; off >>= 1)
+            attn_col += __shfl_xor_sync(0xFFFFFFFF, attn_col, off);
+
+        // Only lane 0 writes output
+        if (lane == 0) {
+            output_batch[(size_t)t * ssm_inner + head * dv + col] = __float2half(attn_col);
+        }
+    }
+
+    // Write S column back to global memory
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_LANE; r++) {
+        S_col[(r * WARP_SIZE + lane) * dv] = s_reg[r];
+    }
+}
+
 // Batch gated RMSNorm for all N tokens.
 // Grid: N * n_heads blocks, 32 threads each.
 __global__ void __launch_bounds__(32)
@@ -3817,94 +3928,63 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
         const auto& layer = model.layers[layer_idx];
 
         if (!layer.is_full_attention) {
-            // ===== DeltaNet Layer — Full F32 internal pipeline =====
-            // RMSNorm(F32→half) → GEMM(half→F32) → Conv1d/DeltaNet/GatedRMSNorm(F32) →
-            // convert(F32→half) → GEMM(half→F32, direct to residual) → F32 add
+            // ===== DeltaNet Layer — FP16 pipeline with fast register-based kernel =====
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
 
-            // RMSNorm: pf_a(F32) → pf_norm(half) for GEMM input
+            // RMSNorm: pf_a(F32) → pf_norm(half)
             kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
                 pf_a, static_cast<const float*>(w.attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // Dump layer 0 intermediates for bisection
-            if (layer_idx == 0 && dump_layers) {
-                // Dump RMSNorm output (FP16 → F32 for comparison)
-                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
-                {
-                    std::vector<half> h16(cfg.n_embed);
-                    GWEN_CHECK_CUDA(cudaMemcpy(h16.data(), pf_norm + (N-1)*cfg.n_embed,
-                        cfg.n_embed * sizeof(half), cudaMemcpyDeviceToHost));
-                    std::vector<float> h32(cfg.n_embed);
-                    for (int j = 0; j < (int)cfg.n_embed; j++) h32[j] = __half2float(h16[j]);
-                    int count = cfg.n_embed;
-                    FILE* fp = fopen("/tmp/gwen_l0_rmsnorm.bin", "wb");
-                    fwrite(&count, sizeof(int), 1, fp);
-                    fwrite(h32.data(), sizeof(float), count, fp);
-                    fclose(fp);
-                }
-            }
-
-            // QKV and gate GEMM with F32 output
+            // QKV and gate GEMMs → FP16 output
             int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
-            gwen_gemm_f32out(w.attn_qkv.device_data, w.attn_qkv.type, prefill_temp_w,
-                             pf_norm, prefill_proj_qkv_f32,
-                             w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
-            gwen_gemm_f32out(w.attn_gate.device_data, w.attn_gate.type, prefill_temp_w,
-                             pf_norm, prefill_proj_gate_f32,
-                             w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
+            gwen_gemm(w.attn_qkv.device_data, w.attn_qkv.type, prefill_temp_w,
+                      pf_norm, prefill_proj_qkv,
+                      w.attn_qkv.shape[1], w.attn_qkv.shape[0], N, s);
+            gwen_gemm(w.attn_gate.device_data, w.attn_gate.type, prefill_temp_w,
+                      pf_norm, prefill_proj_gate,
+                      w.attn_gate.shape[1], w.attn_gate.shape[0], N, s);
 
-            // Dump layer 0 QKV GEMM output
-            if (layer_idx == 0) {
-                dump_f32_buf(prefill_proj_qkv_f32, (N-1)*qkv_dim, qkv_dim,
-                             "/tmp/gwen_l0_qkv.bin");
-                dump_f32_buf(prefill_proj_gate_f32, (N-1)*cfg.ssm_inner_size, cfg.ssm_inner_size,
-                             "/tmp/gwen_l0_gate.bin");
+            // Conv1d + SiLU (FP16 QKV, F32 conv state)
+            {
+                int conv_grid_x = (qkv_dim + 255) / 256;
+                kernel_batch_conv1d_silu_multi<<<conv_grid_x, 256, 0, s>>>(
+                    prefill_proj_qkv, state.conv_state,
+                    static_cast<const float*>(w.ssm_conv1d.device_data),
+                    1, N, qkv_dim, cfg.ssm_conv_kernel);
             }
 
-            // F32 DeltaNet state ops
+            // Gate/beta computation
+            kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_heads, N), 32, 0, s>>>(
+                pf_norm,
+                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                static_cast<const float*>(w.ssm_a.device_data),
+                static_cast<const float*>(w.ssm_dt_bias.device_data),
+                prefill_dn_gate, prefill_dn_beta,
+                N, cfg.n_embed, cfg.ssm_n_heads);
+
+            // Fast DeltaNet: S in registers, warp-per-column (512 blocks vs old 16)
             {
-                // Conv1d + SiLU on F32 QKV data
-                int conv_grid = (qkv_dim + 255) / 256;
-                kernel_batch_conv1d_silu_f32<<<conv_grid, 256, 0, s>>>(
-                    prefill_proj_qkv_f32, state.conv_state,
-                    static_cast<const float*>(w.ssm_conv1d.device_data),
-                    N, qkv_dim, cfg.ssm_conv_kernel);
-
-                // Gate/beta (reads FP16 pf_norm, outputs F32 — unchanged)
-                kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_heads, N), 32, 0, s>>>(
-                    pf_norm,
-                    w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                    static_cast<const float*>(w.ssm_a.device_data),
-                    static_cast<const float*>(w.ssm_dt_bias.device_data),
+                int num_warps = 4;
+                int dv = cfg.ssm_state_size;  // 128
+                dim3 grid(cfg.ssm_n_heads, 1, (dv + num_warps - 1) / num_warps);
+                dim3 block(32, num_warps);
+                kernel_deltanet_prefill_fast<<<grid, block, 0, s>>>(
+                    state.S, prefill_proj_qkv,
                     prefill_dn_gate, prefill_dn_beta,
-                    N, cfg.n_embed, cfg.ssm_n_heads);
-
-                // DeltaNet with F32 I/O
-                kernel_deltanet_prefill_f32<<<cfg.ssm_n_heads, 128, 0, s>>>(
-                    state.S, prefill_proj_qkv_f32,
-                    prefill_dn_gate, prefill_dn_beta,
-                    prefill_dn_out_f32,
+                    prefill_ffn_gate,  // reuse as DeltaNet output
                     N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size,
                     cfg.ssm_inner_size, q_scale);
-
-                // Gated RMSNorm with F32 I/O
-                kernel_batch_gated_rmsnorm_f32<<<N * cfg.ssm_n_heads, 32, 0, s>>>(
-                    prefill_dn_out_f32,
-                    static_cast<const float*>(w.ssm_norm.device_data),
-                    prefill_proj_gate_f32,
-                    prefill_proj_gate_f32,
-                    N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
             }
 
-            // Convert F32→FP16 for Out GEMM input, then GEMM→F32 directly to residual
-            {
-                int total_gate = N * cfg.ssm_inner_size;
-                int blocks_gate = (total_gate + 255) / 256;
-                kernel_f32_to_half<<<blocks_gate, 256, 0, s>>>(
-                    prefill_proj_gate_f32, prefill_proj_gate, total_gate);
-            }
+            // Gated RMSNorm (FP16)
+            kernel_batch_gated_rmsnorm<<<N * cfg.ssm_n_heads, 32, 0, s>>>(
+                prefill_ffn_gate,
+                static_cast<const float*>(w.ssm_norm.device_data),
+                prefill_proj_gate,
+                prefill_proj_gate,
+                N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
             gwen_gemm_f32out(w.ssm_out.device_data, w.ssm_out.type, prefill_temp_w,
                              prefill_proj_gate, pf_b,
                              w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
