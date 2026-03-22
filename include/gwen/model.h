@@ -10,7 +10,6 @@ namespace gwen {
 struct WeightRef {
     const void* host_data = nullptr;  // mmap'd pointer (stays valid as long as GGUFFile lives)
     void* device_data = nullptr;      // GPU pointer (after upload)
-    half* fp16_data = nullptr;        // Pre-dequantized FP16 copy (for prefill GEMMs, avoids per-call dequant)
     GGMLType type = GGMLType::F32;
     size_t n_elements = 0;
     size_t size_bytes = 0;

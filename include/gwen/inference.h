@@ -129,7 +129,7 @@ struct InferenceState {
     float* prefill_ffn_gate_f32 = nullptr; // [max_prefill, n_ff] F32 FFN gate
     float* prefill_ffn_up_f32 = nullptr;   // [max_prefill, n_ff] F32 FFN up
     float* prefill_ffn_out_f32 = nullptr;  // [max_prefill, n_ff] F32 FFN SwiGLU output
-    half* prefill_temp_w = nullptr;  // scratch for dequantized weights
+    half* prefill_temp_w = nullptr;  // mmq scratch buffer (Q8_1 quantized activations + stream-K fixup)
     half* prefill_ffn_gate = nullptr; // [max_prefill, n_ff]
     half* prefill_ffn_up = nullptr;   // [max_prefill, n_ff]
     half* prefill_ffn_out = nullptr;  // [max_prefill, n_ff]

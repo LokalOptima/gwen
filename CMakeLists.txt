@@ -28,7 +28,6 @@ set(LLAMA_CPP_PATH "$ENV{HOME}/git/llama.cpp" CACHE PATH "Path to llama.cpp sour
 file(GLOB GWEN_KERNEL_SOURCES src/kernels/*.cu)
 list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "fattn_mma\\.cu$")
 list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_mmq\\.cu$")
-list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_q4k\\.cu$")
 
 set(GWEN_SOURCES
     ${GWEN_KERNEL_SOURCES}

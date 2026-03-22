@@ -39,68 +39,8 @@ using CutlassGemm_128x64 = cutlass::gemm::device::Gemm<
     cutlass::gemm::GemmShape<16, 8, 16>
 >;
 
-// Default alias — will be replaced by auto-selection in gwen_gemm_fp16
-using CutlassGemm = CutlassGemm_128x128;
-
-void gwen_gemm(const void* W_quant, GGMLType type,
-               half* temp_w,
-               const half* x, half* y,
-               int out_features, int in_features, int seq_len,
-               cudaStream_t stream) {
-    // Step 1: Dequantize weight to FP16 in temp_w [out_features, in_features]
-    int n_elements = out_features * in_features;
-    gwen_dequant(W_quant, temp_w, n_elements, type, stream);
-
-    // Step 2: CUTLASS GEMM with auto tile selection (same as gwen_gemm_fp16)
-    gwen_gemm_fp16(temp_w, x, y, out_features, in_features, seq_len, stream);
-}
-
-// F32 output variant: same computation but stores F32 result without FP16 truncation.
-// Used by the verified reference path (GWEN_GEMM_DECODE=1) for correctness vs llama.cpp.
-using CutlassGemmF32Out = cutlass::gemm::device::Gemm<
-    cutlass::half_t,                           // ElementA (dequantized weights)
-    cutlass::layout::RowMajor,
-    cutlass::half_t,                           // ElementB (activations)
-    cutlass::layout::ColumnMajor,
-    float,                                     // ElementC — F32 output!
-    cutlass::layout::ColumnMajor,
-    float,                                     // ElementAccumulator
-    cutlass::arch::OpClassTensorOp,
-    cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<128, 128, 32>,
-    cutlass::gemm::GemmShape<64, 64, 32>,
-    cutlass::gemm::GemmShape<16, 8, 16>
->;
-
-void gwen_gemm_f32out(const void* W_quant, GGMLType type,
-                       half* temp_w,
-                       const half* x, float* y,
-                       int out_features, int in_features, int seq_len,
-                       cudaStream_t stream) {
-    int n_elements = out_features * in_features;
-    gwen_dequant(W_quant, temp_w, n_elements, type, stream);
-
-    int M = out_features;
-    int N = seq_len;
-    int K = in_features;
-
-    CutlassGemmF32Out gemm_op;
-    CutlassGemmF32Out::Arguments args(
-        {M, N, K},
-        {reinterpret_cast<cutlass::half_t*>(temp_w), K},
-        {reinterpret_cast<const cutlass::half_t*>(x), K},
-        {y, M},                                                    // C: float*
-        {y, M},                                                    // D: float*
-        {1.0f, 0.0f}
-    );
-
-    cutlass::Status status = gemm_op(args, nullptr, stream);
-    GWEN_CHECK(status == cutlass::Status::kSuccess, "CUTLASS GEMM F32 output failed");
-}
-
-// FP16 weight GEMM: same as gwen_gemm but weights are already FP16 (no dequant).
-// Used for restricted_embed and fine-tuned lm_head where weights are stored as FP16.
-// Reuses the same CutlassGemm type — just skips the dequant step.
+// FP16 weight GEMM — weights already in FP16 (no dequant).
+// Used for restricted_embed and fine-tuned lm_head.
 template<typename GemmType>
 static void run_gemm_fp16(const half* W_fp16, const half* x, half* y,
                            int M, int K, int N, cudaStream_t stream) {
@@ -129,42 +69,6 @@ void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
         run_gemm_fp16<CutlassGemm_128x64>(W_fp16, x, y, M, K, N, stream);
     } else {
         run_gemm_fp16<CutlassGemm_128x128>(W_fp16, x, y, M, K, N, stream);
-    }
-}
-
-// Auto-select: use pre-dequanted FP16 if available, else dequant+GEMM
-void gwen_gemm_auto(const void* W_quant, GGMLType type, const half* fp16_data,
-                     half* temp_w,
-                     const half* x, half* y,
-                     int out_features, int in_features, int seq_len,
-                     cudaStream_t stream) {
-    if (fp16_data) {
-        gwen_gemm_fp16(fp16_data, x, y, out_features, in_features, seq_len, stream);
-    } else {
-        gwen_gemm(W_quant, type, temp_w, x, y, out_features, in_features, seq_len, stream);
-    }
-}
-
-// F32 output variant with auto FP16 selection
-void gwen_gemm_f32out_auto(const void* W_quant, GGMLType type, const half* fp16_data,
-                            half* temp_w,
-                            const half* x, float* y,
-                            int out_features, int in_features, int seq_len,
-                            cudaStream_t stream) {
-    if (fp16_data) {
-        // Use FP16 weights directly — skip dequant
-        int M = out_features, N = seq_len, K = in_features;
-        CutlassGemmF32Out gemm_op;
-        CutlassGemmF32Out::Arguments args(
-            {M, N, K},
-            {reinterpret_cast<const cutlass::half_t*>(fp16_data), K},
-            {reinterpret_cast<const cutlass::half_t*>(x), K},
-            {y, M}, {y, M}, {1.0f, 0.0f}
-        );
-        cutlass::Status status = gemm_op(args, nullptr, stream);
-        GWEN_CHECK(status == cutlass::Status::kSuccess, "CUTLASS GEMM F32 auto failed");
-    } else {
-        gwen_gemm_f32out(W_quant, type, temp_w, x, y, out_features, in_features, seq_len, stream);
     }
 }
 

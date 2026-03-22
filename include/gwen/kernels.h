@@ -227,21 +227,6 @@ void gwen_deltanet_decode(float* S, const half* q, const half* k, const half* v,
 // GEMM (for prefill — batch of tokens)
 // ============================================================
 
-// Dequant + CUTLASS GEMM: y[seq_len, out] = x[seq_len, in] * W^T[in, out]
-// temp_w: scratch for dequantized FP16 weights [out_features * in_features]
-void gwen_gemm(const void* W_quant, GGMLType type,
-               half* temp_w,
-               const half* x, half* y,
-               int out_features, int in_features, int seq_len,
-               cudaStream_t stream = 0);
-
-// F32 output variant: same as gwen_gemm but writes F32 output (no FP16 truncation)
-void gwen_gemm_f32out(const void* W_quant, GGMLType type,
-                       half* temp_w,
-                       const half* x, float* y,
-                       int out_features, int in_features, int seq_len,
-                       cudaStream_t stream = 0);
-
 // ============================================================
 // Row dequantization (selective rows from quantized matrix)
 // ============================================================
@@ -265,24 +250,13 @@ void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
                      int out_features, int in_features, int seq_len,
                      cudaStream_t stream = 0);
 
-// Auto-select: use pre-dequanted FP16 if available, else dequant+GEMM
-void gwen_gemm_auto(const void* W_quant, GGMLType type, const half* fp16_data,
-                     half* temp_w,
-                     const half* x, half* y,
-                     int out_features, int in_features, int seq_len,
-                     cudaStream_t stream = 0);
-
 // ============================================================
-// Fused Q4_K × Q8_1 GEMM (no pre-dequant, no temp buffer)
+// Fused quantized GEMM (no pre-dequant, no FP16 weight copy)
 // ============================================================
 
 // Fused quantized GEMM via llama.cpp's mmq kernel.
 // Reads Q4_K/Q5_K/Q6_K/Q8_0 weights directly — no pre-dequant, no FP16 copy.
 // scratch: temp buffer (see gwen_gemm_mmq_scratch_size for required size)
-void gwen_gemm_q4k(const void* W, const half* X, half* Y, void* scratch,
-                     int out_features, int in_features, int seq_len,
-                     cudaStream_t stream = 0);
-
 void gwen_gemm_mmq(const void* W, GGMLType type, const half* X, half* Y, void* scratch,
                      int out_features, int in_features, int seq_len,
                      cudaStream_t stream = 0);
@@ -291,15 +265,8 @@ void gwen_gemm_mmq(const void* W, GGMLType type, const half* X, half* Y, void* s
 inline size_t gwen_gemm_mmq_scratch_size(int M, int K, int N) {
     int K_padded = (K + 511) / 512 * 512;
     return (size_t)(K_padded / 128) * N * 144         // Q8_1_mmq blocks
-         + (size_t)M * N * sizeof(float)              // F32 output
-         + 70 * 128 * 128 * sizeof(float);            // stream-K fixup
+         + 70 * 128 * 128 * sizeof(float);            // stream-K fixup (F32)
 }
-
-void gwen_gemm_f32out_auto(const void* W_quant, GGMLType type, const half* fp16_data,
-                            half* temp_w,
-                            const half* x, float* y,
-                            int out_features, int in_features, int seq_len,
-                            cudaStream_t stream = 0);
 
 // ============================================================
 // Reduction: logsumexp + p_idk (for training server p_idk)

@@ -181,13 +181,13 @@ int main(int argc, char** argv) {
 
             // Approach B: Per-call dequant + CUTLASS
             auto res_b = benchmark([&]() {
-                gwen::gwen_gemm(d_w_q4k, gwen::GGMLType::Q4_K, d_temp,
-                                d_x, d_y_b, M, K, N, 0);
+                gwen::gwen_dequant(d_w_q4k, d_temp, n_elements, gwen::GGMLType::Q4_K, 0);
+                gwen::gwen_gemm_fp16(d_temp, d_x, d_y_b, M, K, N, 0);
             }, warmup, iters);
 
-            // Approach C: Fused Q4K×Q8_1 dp4a GEMM (no temp buffer, no pre-dequant)
+            // Approach C: Fused mmq GEMM (no temp buffer, no pre-dequant)
             auto res_c = benchmark([&]() {
-                gwen::gwen_gemm_q4k(d_w_q4k, d_x, d_y_c, d_scratch, M, K, N, 0);
+                gwen::gwen_gemm_mmq(d_w_q4k, gwen::GGMLType::Q4_K, d_x, d_y_c, d_scratch, M, K, N, 0);
             }, warmup, iters);
 
             // Dequant only (measure raw overhead)

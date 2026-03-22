@@ -4016,22 +4016,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     int dn_state_idx = 0;
     int kv_cache_idx = 0;
 
-    // Per-layer dump for debugging (GWEN_DUMP_LAYERS=1)
-    bool dump_layers = (getenv("GWEN_DUMP_LAYERS") != nullptr);
-    auto dump_f32_buf = [&](const float* d_ptr, int offset_elems, int count, const std::string& path) {
-        if (!dump_layers) return;
-        GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
-        std::vector<float> host(count);
-        GWEN_CHECK_CUDA(cudaMemcpy(host.data(), d_ptr + offset_elems,
-                                    count * sizeof(float), cudaMemcpyDeviceToHost));
-        FILE* fp = fopen(path.c_str(), "wb");
-        fwrite(&count, sizeof(int), 1, fp);
-        fwrite(host.data(), sizeof(float), count, fp);
-        fclose(fp);
-    };
-
-    // Debug dumps removed — FP16 pipeline
-
     // 2. Process each layer
     for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
         const auto& layer = model.layers[layer_idx];

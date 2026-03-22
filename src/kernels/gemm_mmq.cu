@@ -129,10 +129,320 @@ static void quantize_mmq_q8_1_fp16_cuda(
     }
 }
 
-// F32 → FP16 output conversion
-static __global__ void kernel_f2h(const float* __restrict__ src, half* __restrict__ dst, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = __float2half(src[idx]);
+// ============================================================
+// FP16-output mmq kernel (eliminates F32 output buffer)
+// ============================================================
+// Writes half* directly instead of float*. The fixup buffer
+// remains F32 for partial-sum accumulation; the fixup kernel
+// reads existing FP16 from dst, adds the F32 correction, and
+// writes FP16 back.
+
+// Write-back identical to mmq_write_back_mma but stores FP16.
+template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
+static __device__ __forceinline__ void mmq_write_back_fp16(
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, half * __restrict__ dst,
+        const int stride, const int i_max, const int j_max) {
+
+    constexpr int granularity = mmq_get_granularity_device(mmq_x);
+    constexpr int nwarps = mmq_get_nwarps_device();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int tileC_IJ = mmq_get_granularity_device(0);
+    typedef tile<tileC_IJ, tileC_IJ, int, DATA_LAYOUT_J_MAJOR> tile_C;
+    constexpr int rows_per_warp = granularity;
+#else
+    typedef tile<16, 8, int> tile_C;
+    constexpr int rows_per_warp = 2 * granularity;
+#endif
+
+    constexpr int ntx = rows_per_warp / tile_C::I;
+    const int i0 = (threadIdx.y / ntx) * (ntx * tile_C::I);
+
+#if defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    static_assert(nwarps * tile_C::I == mmq_y, "nwarps*tile_C::I != mmq_y");
+#else
+    GGML_UNUSED(nwarps);
+#endif
+
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C::J) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                if (j > j_max) { continue; }
+                const int i = i0 + n * tile_C::I + tile_C::get_i(l);
+                if (need_check && i > i_max) { continue; }
+                dst[ids_dst[j] * stride + i] = __float2half(sum[(j0 / tile_C::J + n) * tile_C::ne + l]);
+            }
+        }
+    }
+}
+
+// Process tile: same computation as mul_mat_q_process_tile,
+// but non-fixup path writes FP16; fixup path writes F32 to tmp_fixup.
+template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+static __device__ __forceinline__ void gwen_process_tile(
+        const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+        const int * __restrict__ ids_dst, half * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+
+    constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
+    constexpr int              nwarps     = mmq_get_nwarps_device();
+    constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
+    constexpr int              mmq_y      = get_mmq_y_device();
+    constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
+
+    extern __shared__ int data_mul_mat_q[];
+    int * tile_y_sh = data_mul_mat_q + mmq_x;
+    int * tile_x    = tile_y_sh + GGML_PAD(mmq_x * MMQ_TILE_Y_K, nwarps * warp_size);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr vec_dot_mmq_t vec_dot = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
+#else
+    constexpr vec_dot_mmq_t vec_dot = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
+#endif
+
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    constexpr int ne_block = (type == GGML_TYPE_MXFP4) ? 8 * QK_MXFP4 : 4 * QK8_1;
+#else
+    constexpr int ne_block = 4 * QK8_1;
+#endif
+
+    constexpr int ITER_K          = get_iter_k(type);
+    constexpr int blocks_per_iter = ITER_K / qk;
+
+    float sum[mmq_x * mmq_y / (nwarps * warp_size)] = {0.0f};
+
+    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+
+    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        {
+            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                int l = l0 + threadIdx.y * warp_size + threadIdx.x;
+                tile_y_sh[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        vec_dot(tile_x, tile_y_sh, sum, 0);
+        __syncthreads();
+        {
+            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+            for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                int l = l0 + threadIdx.y * warp_size + threadIdx.x;
+                tile_y_sh[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        vec_dot(tile_x, tile_y_sh, sum, MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    if (fixup) {
+        // Fixup buffer is always F32 (partial sums accumulated across blocks)
+        mmq_write_back_mma<type, mmq_x, mmq_y, need_check>(
+            sum, ids_dst, tmp_fixup + blockIdx.x * (mmq_x * mmq_y), mmq_y, mmq_y, mmq_x);
+    } else {
+        // Output directly as FP16
+        mmq_write_back_fp16<type, mmq_x, mmq_y, need_check>(
+            sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    }
+}
+
+// Simplified stream-K mmq kernel with FP16 output.
+// No MoE (ids_dst/expert_bounds), single channel/sample.
+template <ggml_type type, int mmq_x, bool need_check>
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __launch_bounds__(ggml_cuda_get_physical_warp_size() * mmq_get_nwarps_device(), 1)
+#endif
+static __global__ void gwen_mul_mat_q(
+        const char * __restrict__ x, const int * __restrict__ y,
+        half * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const int ncols_max) {
+
+    constexpr int nwarps    = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int mmq_y     = get_mmq_y_device();
+    constexpr int ITER_K    = get_iter_k(type);
+    constexpr int blocks_per_iter = ITER_K / qk;
+
+    const int64_t blocks_per_ne00 = ncols_x / qk;
+    const int ntx = (ncols_max + mmq_x - 1) / mmq_x;
+    const int nty = (nrows_x   + mmq_y - 1) / mmq_y;
+
+    // Initialize ids_dst with identity mapping (no MoE)
+    extern __shared__ int ids_dst_shared[];
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps * warp_size) {
+        const int j = j0 + threadIdx.y * warp_size + threadIdx.x;
+        if (j0 + nwarps * warp_size > mmq_x && j >= mmq_x) { break; }
+        ids_dst_shared[j] = j;
+    }
+    __syncthreads();
+
+    // Stream-K work partitioning
+    const int64_t total_tiles_k = (int64_t)ntx * nty * blocks_per_ne00;
+    int64_t kbc      = (int64_t) blockIdx.x      * total_tiles_k / gridDim.x;
+    int64_t kbc_stop = (int64_t)(blockIdx.x + 1) * total_tiles_k / gridDim.x;
+    kbc      -= (kbc      % blocks_per_ne00) % blocks_per_iter;
+    kbc_stop -= (kbc_stop % blocks_per_ne00) % blocks_per_iter;
+
+    int kb0_start = kbc % blocks_per_ne00;
+    int kb0_stop  = min(blocks_per_ne00, kb0_start + kbc_stop - kbc);
+
+    // Complete tiles (fixup=false)
+    while (kbc < kbc_stop && kb0_stop == blocks_per_ne00) {
+        int64_t tmp = kbc;
+        const int it = tmp / (ntx * blocks_per_ne00);
+        tmp -= (int64_t)it * ntx * blocks_per_ne00;
+        const int jt = tmp / blocks_per_ne00;
+
+        constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+        const int offset_y   = jt * mmq_x * sz;
+        const int offset_dst = jt * mmq_x * stride_col_dst + it * mmq_y;
+        const int offset_x   = it * mmq_y * stride_row_x;
+
+        constexpr bool fixup = false;
+        gwen_process_tile<type, mmq_x, need_check, fixup>(
+            x, offset_x, y + offset_y, ids_dst_shared,
+            dst + offset_dst, tmp_fixup,
+            stride_row_x, ncols_y, stride_col_dst,
+            nrows_x - it * mmq_y - 1, ncols_dst - jt * mmq_x - 1,
+            kb0_start, kb0_stop);
+
+        kbc += blocks_per_ne00;
+        kbc -= kbc % blocks_per_ne00;
+        kb0_start = 0;
+        kb0_stop  = min(blocks_per_ne00, kbc_stop - kbc);
+    }
+
+    if (kbc >= kbc_stop) { return; }
+
+    // Last (partial) tile — writes to fixup buffer
+    {
+        int64_t tmp = kbc;
+        const int it = tmp / (ntx * blocks_per_ne00);
+        tmp -= (int64_t)it * ntx * blocks_per_ne00;
+        const int jt = tmp / blocks_per_ne00;
+
+        constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+        const int offset_y   = jt * mmq_x * sz;
+        const int offset_dst = jt * mmq_x * stride_col_dst + it * mmq_y;
+        const int offset_x   = it * mmq_y * stride_row_x;
+
+        constexpr bool fixup = true;
+        gwen_process_tile<type, mmq_x, need_check, fixup>(
+            x, offset_x, y + offset_y, ids_dst_shared,
+            dst + offset_dst, tmp_fixup,
+            stride_row_x, ncols_y, stride_col_dst,
+            nrows_x - it * mmq_y - 1, ncols_dst - jt * mmq_x - 1,
+            kb0_start, kb0_stop);
+    }
+}
+
+// Stream-K fixup kernel — reads F32 fixup buffer, writes FP16 to output.
+// Each block checks if it wrote a partial tile that needs correction.
+template <ggml_type type, int mmq_x, bool need_check>
+static __global__ void gwen_stream_k_fixup(
+        half * __restrict__ dst,
+        const float * __restrict__ tmp_last_tile,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_col_dst, const int ncols_max) {
+
+    constexpr int mmq_y     = get_mmq_y_device();
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int ITER_K    = get_iter_k(type);
+    constexpr int blocks_per_iter = ITER_K / qk;
+    constexpr int nwarps    = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const int64_t blocks_per_ne00 = ncols_x / qk;
+    const int ntx = (ncols_max + mmq_x - 1) / mmq_x;
+    const int nty = (nrows_x   + mmq_y - 1) / mmq_y;
+
+    const int64_t total_tiles_k = (int64_t)ntx * nty * blocks_per_ne00;
+    const int bidx0 = blockIdx.x;
+
+    int64_t kbc0      = (int64_t) bidx0      * total_tiles_k / gridDim.x;
+    int64_t kbc0_stop = (int64_t)(bidx0 + 1) * total_tiles_k / gridDim.x;
+    kbc0      -= (kbc0      % blocks_per_ne00) % blocks_per_iter;
+    kbc0_stop -= (kbc0_stop % blocks_per_ne00) % blocks_per_iter;
+
+    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+    const bool wrote_beginning_of_tile = kbc0 % blocks_per_ne00 == 0;
+    const bool did_not_write_last      = kbc0 / blocks_per_ne00 == kbc0_stop / blocks_per_ne00
+                                      && kbc0_stop % blocks_per_ne00 != 0;
+    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) { return; }
+
+    float sum[mmq_x * mmq_y / (nwarps * warp_size)] = {0.0f};
+    bool any_fixup = false;
+
+    int64_t bidx = bidx0 - 1;
+    int64_t kbc_stop = kbc0;
+    while (true) {
+        int64_t kbc = bidx * total_tiles_k / gridDim.x;
+        kbc -= (kbc % blocks_per_ne00) % blocks_per_iter;
+
+        if (kbc == kbc_stop) {
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+
+        any_fixup = true;
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+#pragma unroll
+            for (int i0 = 0; i0 < mmq_y; i0 += warp_size) {
+                const int i = i0 + threadIdx.x;
+                sum[(j0 / nwarps) * (mmq_y / warp_size) + i0 / warp_size]
+                    += tmp_last_tile[bidx * (mmq_x * mmq_y) + j * mmq_y + i];
+            }
+        }
+
+        if (kbc % blocks_per_ne00 == 0 || kbc / blocks_per_ne00 < kbc0 / blocks_per_ne00) { break; }
+        bidx--;
+        kbc_stop = kbc;
+    }
+
+    if (!any_fixup) { return; }
+
+    // Compute output tile coordinates
+    int64_t tmp = kbc0;
+    const int it = tmp / (ntx * blocks_per_ne00);
+    tmp -= (int64_t)it * ntx * blocks_per_ne00;
+    const int jt = tmp / blocks_per_ne00;
+
+    const int offset_dst = jt * mmq_x * stride_col_dst + it * mmq_y;
+    dst += offset_dst;
+
+    const int i_max = nrows_x   - it * mmq_y - 1;
+    const int j_max = ncols_dst - jt * mmq_x - 1;
+
+    // Read existing FP16 from dst, add F32 fixup, write FP16 back
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
+        if (j > j_max) { return; }
+#pragma unroll
+        for (int i0 = 0; i0 < mmq_y; i0 += warp_size) {
+            const int i = i0 + threadIdx.x;
+            if (need_check && i > i_max) { continue; }
+            const float existing = __half2float(dst[j * stride_col_dst + i]);
+            dst[j * stride_col_dst + i] = __float2half(
+                existing + sum[(j0 / nwarps) * (mmq_y / warp_size) + i0 / warp_size]);
+        }
+    }
 }
 
 // SM_120 device properties
@@ -148,14 +458,14 @@ static void ensure_smem_limit() {
     const int nwarps = mmq_get_nwarps_host(GWEN_CC, GWEN_WARP_SIZE);
     const int mmq_y = get_mmq_y_host(GWEN_CC);
     const int nbytes = mmq_get_nbytes_shared<type>(MMQ_X, mmq_y, GWEN_CC, GWEN_WARP_SIZE, nwarps);
-    cudaFuncSetAttribute((const void*)(mul_mat_q<type, MMQ_X, false>),
+    cudaFuncSetAttribute((const void*)(gwen_mul_mat_q<type, MMQ_X, false>),
         cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes);
-    cudaFuncSetAttribute((const void*)(mul_mat_q<type, MMQ_X, true>),
+    cudaFuncSetAttribute((const void*)(gwen_mul_mat_q<type, MMQ_X, true>),
         cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes);
     done = true;
 }
 
-// Core mmq launch — FP16 in, FP16 out, no F32 intermediate for activations
+// Core mmq launch — FP16 in, FP16 out, no F32 intermediate anywhere
 template<ggml_type type>
 static void launch_mmq(
     const void* W, const half* X, half* Y, void* scratch,
@@ -166,17 +476,15 @@ static void launch_mmq(
     int n_q8_blocks_per_col = K_padded / 128;
     size_t q8_size = (size_t)n_q8_blocks_per_col * N * sizeof(block_q8_1_mmq);
 
-    // Scratch layout (no F32 activation buffer!):
-    //   [0 .. q8_size)           : Q8_1_mmq quantized activations
-    //   [q8_size .. +M*N*4)     : F32 GEMM output
-    //   [+M*N*4 .. +fixup)      : stream-K fixup buffer
-    void*  X_q8_mmq = scratch;
-    float* dst_f32  = reinterpret_cast<float*>(reinterpret_cast<char*>(scratch) + q8_size);
+    // Scratch layout:
+    //   [0 .. q8_size)     : Q8_1_mmq quantized activations
+    //   [q8_size .. +fixup): stream-K fixup buffer (F32)
+    void* X_q8_mmq = scratch;
 
-    // FP16 → Q8_1_mmq directly (no F32 intermediate)
+    // FP16 → Q8_1_mmq directly
     quantize_mmq_q8_1_fp16_cuda(X, X_q8_mmq, type, K, K, K_padded, N, stream);
 
-    // Launch mmq kernel
+    // Launch mmq kernel — output goes directly to Y (FP16)
     ensure_smem_limit<type>();
     const int nwarps = mmq_get_nwarps_host(GWEN_CC, GWEN_WARP_SIZE);
     const int mmq_y = get_mmq_y_host(GWEN_CC);
@@ -188,39 +496,25 @@ static void launch_mmq(
     const int ntx = (N + MMQ_X - 1) / MMQ_X;
     const dim3 grid_sk(GWEN_NSM, 1, 1);
     const bool fixup_needed = ntx * nty % GWEN_NSM != 0;
-    float* tmp_fixup = fixup_needed ? (dst_f32 + M * N) : nullptr;
+    float* tmp_fixup = fixup_needed
+        ? reinterpret_cast<float*>(reinterpret_cast<char*>(scratch) + q8_size)
+        : nullptr;
 
     if (M % mmq_y == 0) {
-        mul_mat_q<type, MMQ_X, false><<<grid_sk, block_dims, nbytes_shared, stream>>>(
+        gwen_mul_mat_q<type, MMQ_X, false><<<grid_sk, block_dims, nbytes_shared, stream>>>(
             reinterpret_cast<const char*>(W), reinterpret_cast<const int*>(X_q8_mmq),
-            nullptr, nullptr, dst_f32, tmp_fixup,
-            K, M, N, blocks_per_row, N, M,
-            1, 1, 0, 0, 0, 1, 1, 0, 0, 0, N);
+            Y, tmp_fixup, K, M, N, blocks_per_row, N, M, N);
     } else {
-        mul_mat_q<type, MMQ_X, true><<<grid_sk, block_dims, nbytes_shared, stream>>>(
+        gwen_mul_mat_q<type, MMQ_X, true><<<grid_sk, block_dims, nbytes_shared, stream>>>(
             reinterpret_cast<const char*>(W), reinterpret_cast<const int*>(X_q8_mmq),
-            nullptr, nullptr, dst_f32, tmp_fixup,
-            K, M, N, blocks_per_row, N, M,
-            1, 1, 0, 0, 0, 1, 1, 0, 0, 0, N);
+            Y, tmp_fixup, K, M, N, blocks_per_row, N, M, N);
     }
 
     if (fixup_needed) {
-        mul_mat_q_stream_k_fixup<type, MMQ_X, true><<<grid_sk, block_dims, 0, stream>>>(
-            nullptr, nullptr, dst_f32, tmp_fixup,
-            K, M, N, (size_t)M, 1, (size_t)0, 1, (size_t)0, N);
+        gwen_stream_k_fixup<type, MMQ_X, true><<<grid_sk, block_dims, 0, stream>>>(
+            Y, tmp_fixup, K, M, N, M, N);
     }
     GWEN_CHECK_CUDA(cudaGetLastError());
-
-    // F32 → FP16 (mmq kernel outputs F32)
-    int out_total = M * N;
-    kernel_f2h<<<(out_total + 255) / 256, 256, 0, stream>>>(dst_f32, Y, out_total);
-}
-
-void gwen_gemm_q4k(
-    const void* W, const half* X, half* Y, void* scratch,
-    int M, int K, int N, cudaStream_t stream)
-{
-    launch_mmq<GGML_TYPE_Q4_K>(W, X, Y, scratch, M, K, N, stream);
 }
 
 void gwen_gemm_mmq(
