@@ -12,6 +12,7 @@
 
 #include "gwen/model.h"
 #include "gwen/inference.h"
+#include "gwen/paths.h"
 #include "gwen/tokenizer.h"
 
 #include <cstdio>
@@ -87,7 +88,7 @@ static std::vector<int> json_get_int_array(const std::string& json, const std::s
 static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("Options:\n");
-    printf("  --model PATH       Path to GGUF model file (required)\n");
+    printf("  --model PATH       Path to GGUF model file (default: ~/.cache/gwen/%s)\n", gwen::DEFAULT_MODEL);
     printf("  --host HOST        Listen address (default: 127.0.0.1)\n");
     printf("  --port PORT        Listen port (default: 8090)\n");
     printf("  --max-seq N        Max sequence length (default: 4096)\n");
@@ -98,7 +99,6 @@ static void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     std::string model_path;
     std::string mtp_path;
-    std::string mtp_lm_head_path;
     std::string host = "127.0.0.1";
     int port = 8090;
     int max_seq = 512;
@@ -107,7 +107,6 @@ int main(int argc, char** argv) {
     static struct option long_options[] = {
         {"model",     required_argument, nullptr, 'm'},
         {"mtp",       required_argument, nullptr, 'M'},
-        {"mtp-lm-head", required_argument, nullptr, 'L'},
         {"host",      required_argument, nullptr, 'H'},
         {"port",      required_argument, nullptr, 'p'},
         {"max-seq",   required_argument, nullptr, 's'},
@@ -117,11 +116,10 @@ int main(int argc, char** argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:L:H:p:s:b:h", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:H:p:s:b:h", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
-            case 'L': mtp_lm_head_path = optarg; break;
             case 'H': host = optarg; break;
             case 'p': port = atoi(optarg); break;
             case 's': max_seq = atoi(optarg); break;
@@ -131,11 +129,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (model_path.empty()) {
-        fprintf(stderr, "Error: --model is required\n");
-        print_usage(argv[0]);
-        return 1;
-    }
+    // Apply defaults from ~/.cache/gwen/ (auto-download if needed)
+    if (model_path.empty()) model_path = gwen::default_model_path();
+    gwen::ensure_file(model_path, (std::string(gwen::RELEASE_BASE) + "/" + gwen::DEFAULT_MODEL).c_str());
 
     // Load model
     printf("Loading model: %s\n", model_path.c_str());
@@ -149,9 +145,6 @@ int main(int argc, char** argv) {
     // Load MTP weights if provided (must be before upload_weights)
     if (!mtp_path.empty()) {
         model->load_mtp(mtp_path);
-    }
-    if (!mtp_lm_head_path.empty()) {
-        model->load_reduced_lm_head(mtp_lm_head_path);
     }
 
     // Upload weights to GPU

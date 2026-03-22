@@ -5,9 +5,8 @@ Architecture matches the pre-trained MTP weights exactly:
     concat(RMSNorm(embed[t+1]), RMSNorm(hidden[t])) → FC(2048→1024)
     → 1 GQA layer (8Q+gate, 2KV, head_dim=256, QK-Norm)
     → SwiGLU FFN (1024→3584→1024)
-    → RMSNorm → LM head (1024→K) + OOV gate (1024→1)
+    → RMSNorm → LM head (1024→K)
 
-v7: separate OOV gate (binary classifier) + clean K-class token head.
 The LM head outputs over a restricted vocab of size K (not full 248K).
 Pre-trained weights loaded from safetensors, lm_head initialized fresh.
 """
@@ -169,7 +168,6 @@ class MTPHead(nn.Module):
         - hidden[t]: main model's last-layer hidden state at position t
 
     Output is over a restricted vocab of size K (mapped from full 248K vocab).
-    OOV gate is a separate binary classifier ("is the next token OOV?").
     """
 
     def __init__(
@@ -181,10 +179,12 @@ class MTPHead(nn.Module):
         num_kv_heads: int = 2,
         head_dim: int = 256,
         eps: float = 1e-6,
+        idk: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
+        self.idk = idk
 
         # Input norms
         self.pre_fc_norm_embedding = RMSNorm(hidden_size, eps=eps)
@@ -203,14 +203,14 @@ class MTPHead(nn.Module):
 
         # Output
         self.norm = RMSNorm(hidden_size, eps=eps)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-        self.oov_head = nn.Linear(hidden_size, 1, bias=True)
+        lm_head_size = vocab_size + 1 if idk else vocab_size
+        self.lm_head = nn.Linear(hidden_size, lm_head_size, bias=False)
 
     def forward(
         self,
         embeddings: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Args:
             embeddings: [B, L, 1024] — token embeddings at positions t+1
@@ -218,7 +218,6 @@ class MTPHead(nn.Module):
 
         Returns:
             logits: [B, L, K] — logits over restricted vocab
-            oov_logit: [B, L] — raw logit for OOV classification (sigmoid → P(OOV))
         """
         # Normalize and concatenate
         x = torch.cat(
@@ -245,7 +244,7 @@ class MTPHead(nn.Module):
 
         # Output
         x = self.norm(x)
-        return self.lm_head(x), self.oov_head(x).squeeze(-1)
+        return self.lm_head(x)
 
     @classmethod
     def from_pretrained(
@@ -254,6 +253,7 @@ class MTPHead(nn.Module):
         vocab_size: int,
         device: str = "cpu",
         vocab_ids: list[int] | None = None,
+        idk: bool = False,
     ) -> "MTPHead":
         """Load pre-trained MTP weights from Qwen3.5-0.8B safetensors.
 
@@ -261,12 +261,13 @@ class MTPHead(nn.Module):
         vocab), initializes lm_head from the corresponding rows of the pre-trained
         lm_head. Otherwise lm_head is randomly initialized.
 
-        oov_head is always initialized randomly (tiny, trains fast).
+        If idk=True, lm_head has K+1 outputs. First K rows initialized from
+        embed_tokens (when vocab_ids given), row K initialized to zeros.
         """
         from safetensors import safe_open
 
         model_dir = Path(model_dir)
-        model = cls(vocab_size=vocab_size)
+        model = cls(vocab_size=vocab_size, idk=idk)
 
         # Find safetensors files
         index_path = model_dir / "model.safetensors.index.json"
@@ -352,14 +353,21 @@ class MTPHead(nn.Module):
                         break
             if full_lm_head is not None:
                 ids = np.array(vocab_ids, dtype=np.int64)
-                state_dict["lm_head.weight"] = full_lm_head[ids]  # [K, 1024]
-                loaded += 1
-                print(f"Loaded {loaded}/16 pre-trained MTP tensors (lm_head from embed_tokens top-{vocab_size} slice)")
+                restricted_rows = full_lm_head[ids]  # [K, 1024]
+                if idk:
+                    # K+1 output: first K rows from embed_tokens, row K = zeros
+                    idk_row = torch.zeros(1, restricted_rows.shape[1], dtype=restricted_rows.dtype)
+                    state_dict["lm_head.weight"] = torch.cat([restricted_rows, idk_row], dim=0)
+                    loaded += 1
+                    print(f"Loaded {loaded}/16 pre-trained MTP tensors (lm_head from embed_tokens top-{vocab_size} + IDK row)")
+                else:
+                    state_dict["lm_head.weight"] = restricted_rows  # [K, 1024]
+                    loaded += 1
+                    print(f"Loaded {loaded}/16 pre-trained MTP tensors (lm_head from embed_tokens top-{vocab_size} slice)")
             else:
                 print(f"Loaded {loaded}/15 pre-trained MTP tensors (lm_head: embed_tokens not found, random init)")
         else:
             print(f"Loaded {loaded}/15 pre-trained MTP tensors (lm_head initialized randomly)")
-        # oov_head always starts random (1025 params, trains fast)
 
         model.load_state_dict(state_dict, strict=False)
         # Keep FP32 for training (GradScaler needs FP32 gradients).
@@ -375,7 +383,6 @@ class MTPHead(nn.Module):
             "ffn": 0,
             "output_norm": 0,
             "lm_head": 0,
-            "oov_head": 0,
         }
         for name, p in self.named_parameters():
             n = p.numel()
@@ -389,8 +396,6 @@ class MTPHead(nn.Module):
                 groups["ffn"] += n
             elif name == "norm.weight":
                 groups["output_norm"] += n
-            elif "oov_head" in name:
-                groups["oov_head"] += n
             elif "lm_head" in name:
                 groups["lm_head"] += n
         groups["total"] = sum(groups.values())

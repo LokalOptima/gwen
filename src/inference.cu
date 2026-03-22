@@ -2303,43 +2303,6 @@ __global__ void kernel_confidence_gate(const float* __restrict__ logits,
     }
 }
 
-// OOV gate: dot(weight, input) + bias → d_oov_logit
-// Launched with <<<1, 256>>>. 256 threads reduce 1024 elements.
-__global__ void __launch_bounds__(256)
-kernel_oov_gate(const half* __restrict__ weight,   // [n_embed]
-                const half* __restrict__ input,    // [n_embed] (x_norm)
-                float* __restrict__ result,        // [1]
-                float bias, int n_embed) {
-    float sum = 0.0f;
-    for (int i = threadIdx.x; i < n_embed; i += blockDim.x) {
-        sum += __half2float(weight[i]) * __half2float(input[i]);
-    }
-    // Warp reduce
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-    }
-    __shared__ float warp_sums[8];  // 256/32 = 8 warps
-    int warp_id = threadIdx.x / 32;
-    int lane = threadIdx.x % 32;
-    if (lane == 0) warp_sums[warp_id] = sum;
-    __syncthreads();
-    if (warp_id == 0) {
-        sum = lane < 8 ? warp_sums[lane] : 0.0f;
-        for (int offset = 4; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-        }
-        if (lane == 0) result[0] = sum + bias;
-    }
-}
-
-// OOV override: if oov_logit > 0, set argmax to -1 (skip)
-__global__ void kernel_oov_override(const float* __restrict__ oov_logit,
-                                     int* __restrict__ argmax_result) {
-    if (oov_logit[0] > 0.0f) {
-        *argmax_result = -1;
-    }
-}
-
 // ============================================================
 // KV cache store kernel (reads pos from device memory for graph capture)
 // ============================================================
@@ -2654,9 +2617,6 @@ void InferenceState::allocate_mtp(const ModelConfig& cfg, CudaAllocator& alloc, 
 
     // Token A hidden state backup (for reject path: swap into mtp_hidden)
     mtp_hidden_b = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
-
-    // OOV gate output (v7)
-    d_oov_logit = static_cast<float*>(a(sizeof(float)));
 
     // Activation replay buffers (replaces 19.3 MB checkpoint with ~578 KB cache)
     n_dn_layers = (int)deltanet_states.size();
@@ -4810,13 +4770,6 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
             gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(mtp_w.output_norm.device_data),
                               norm_out, cfg.n_embed, cfg.rms_norm_eps, s);
 
-            // OOV gate (v7): dot(oov_weight, norm_out) + bias → d_oov_logit
-            if (mtp_w.has_oov_head) {
-                kernel_oov_gate<<<1, 256, 0, s>>>(
-                    static_cast<const half*>(mtp_w.oov_weight.device_data),
-                    norm_out, d_oov_logit, mtp_w.oov_bias, cfg.n_embed);
-            }
-
             gwen_gemv_fp16(static_cast<const half*>(rl.weights.device_data),
                            norm_out, logits_h, lm_rows, cfg.n_embed, s);
         } else {
@@ -4833,14 +4786,10 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
             kernel_confidence_gate<<<1, 1, 0, s>>>(logits_f, d_argmax_token, lm_rows, mtp_confidence_threshold);
         }
         // Remap index → real token ID (IDK/confidence: index < 0 or >= K maps to -1)
-        if (rl.has_idk || mtp_confidence_threshold > 0.0f || mtp_w.has_oov_head) {
+        if (rl.has_idk || mtp_confidence_threshold > 0.0f) {
             kernel_remap_token_idk<<<1, 1, 0, s>>>(rl.d_token_ids, d_argmax_token, K);
         } else {
             kernel_remap_token<<<1, 1, 0, s>>>(rl.d_token_ids, d_argmax_token);
-        }
-        // OOV gate override: if oov_logit > 0, force skip (-1)
-        if (mtp_w.has_oov_head) {
-            kernel_oov_override<<<1, 1, 0, s>>>(d_oov_logit, d_argmax_token);
         }
     } else {
         // Full LM head: score all vocab tokens

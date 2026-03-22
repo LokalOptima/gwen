@@ -28,14 +28,14 @@ Measured on RTX 5070 Ti (SM\_120, Blackwell), GDDR7 896 GB/s, clocks locked:
 | | tok/s |
 |---|---:|
 | Baseline decode (no speculation) | 643 |
-| With MTP speculative decoding (v5) | **816** |
+| With MTP speculative decoding (v6) | **816** |
 | Peak speculative decode | 928 |
 
 The theoretical bandwidth limit for this model is ~1,594 tok/s. GWEN reaches 51% of that ceiling in sustained decode and 58% at peak. The gap is well-understood: Q4\_K's struct-of-arrays layout causes 71% sector waste in small GEMVs, and CUDA graph dispatch adds ~260 us per step.
 
 ### Speculative decoding
 
-Qwen3.5 ships with a built-in MTP (Multi-Token Prediction) draft head. GWEN fine-tunes this head on spoken English data using knowledge distillation from the base model's own logits, then uses it for speculative decoding during inference. The v5 head uses sparse top-64 distillation with an IDK (I Don't Know) neuron that learns to abstain on out-of-vocabulary tokens rather than guess wrong.
+Qwen3.5 ships with a built-in MTP (Multi-Token Prediction) draft head. GWEN fine-tunes this head on spoken English data using knowledge distillation from the base model's own logits, then uses it for speculative decoding during inference. The v6 head uses sparse top-64 distillation with an IDK (I Don't Know) neuron that learns to abstain on out-of-vocabulary tokens rather than guess wrong.
 
 ---
 
@@ -49,27 +49,24 @@ cd gwen
 make
 ```
 
-Requires CUDA 13.1+ and CMake 3.24+. CUTLASS is included as a git submodule.
+CUTLASS is included as a git submodule.
 
 ---
 
 ## Usage
 
-Set your model paths once at the top of `Makefile`, then:
+Weights are auto-downloaded to `~/.cache/gwen/` on first run:
 
 ```bash
-make run PROMPT="The meaning of life is"      # baseline decode
-make run-mtp PROMPT="The meaning of life is"  # with speculative decoding
-make bench                                     # benchmark (baseline)
-make bench-mtp                                 # benchmark (speculative)
-make info                                      # print model info
-make test                                      # correctness tests vs llama.cpp
+./build/gwen "The meaning of life is"                    # speculative decode (default)
+./build/gwen --no-mtp "The meaning of life is"           # baseline decode
+./build/gwen --max-predict 200 "The meaning of life is"  # generate 200 tokens
 ```
 
-All flags (`MODEL`, `MTP`, `MTP_HEAD`, `PROMPT`, `N`) can be overridden on the command line:
+Override model paths for testing:
 
 ```bash
-make run MODEL=~/models/gguf/Qwen3.5-0.8B-Q8_0.gguf PROMPT="Hello" N=200
+./build/gwen --model /path/to/model.gguf --mtp /path/to/mtp.bin "Hello"
 ```
 
 ---

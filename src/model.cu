@@ -90,7 +90,7 @@ void Model::load_mtp(const std::string& mtp_path) {
     uint32_t version, n_tensors;
     f.read(reinterpret_cast<char*>(&version), 4);
     f.read(reinterpret_cast<char*>(&n_tensors), 4);
-    GWEN_CHECK(version >= 1 && version <= 5, "Unsupported MTP file version (expected 1-5)");
+    GWEN_CHECK(version >= 1 && version <= 4, "Unsupported MTP file version (expected 1-4)");
 
     fprintf(stderr, "Loading MTP weights: %u tensors from %s\n", n_tensors, mtp_path.c_str());
 
@@ -174,12 +174,6 @@ void Model::load_mtp(const std::string& mtp_path) {
             if (w.type == GGMLType::F16) {
                 reduced_lm_head.row_bytes = config.n_embed * 2;
             }
-        } else if (name == "mtp.oov_head.weight") {
-            mtp.oov_weight = w;
-        } else if (name == "mtp.oov_head.bias") {
-            // Single float bias — read directly from host buffer
-            GWEN_CHECK(dtype == 0 && n_elements == 1, "OOV bias must be F32 scalar");
-            memcpy(&mtp.oov_bias, w.host_data, sizeof(float));
         } else {
             fprintf(stderr, "  Warning: unknown MTP tensor: %s\n", name.c_str());
         }
@@ -213,20 +207,13 @@ void Model::load_mtp(const std::string& mtp_path) {
             fprintf(stderr, "GWMT v%u: restricted vocab K=%u embedded in MTP file\n", version, K);
         }
 
-        // v4/v5 footer: has_idk or has_oov_head flag
+        // v4 footer: has_idk flag
         if (version >= 4 && f.peek() != EOF) {
             uint8_t flag;
             f.read(reinterpret_cast<char*>(&flag), 1);
-            if (version == 4) {
-                reduced_lm_head.has_idk = (flag != 0);
-                if (reduced_lm_head.has_idk) {
-                    fprintf(stderr, "GWMT v4: IDK token enabled (index %u maps to -1)\n", K);
-                }
-            } else if (version == 5) {
-                mtp.has_oov_head = (flag != 0);
-                if (mtp.has_oov_head) {
-                    fprintf(stderr, "GWMT v5: OOV gate enabled (bias=%.4f)\n", mtp.oov_bias);
-                }
+            reduced_lm_head.has_idk = (flag != 0);
+            if (reduced_lm_head.has_idk) {
+                fprintf(stderr, "GWMT v4: IDK token enabled (index %u maps to -1)\n", K);
             }
         }
     }
@@ -355,9 +342,6 @@ void Model::upload_weights(CudaAllocator& allocator) {
         upload_weight(allocator, mtp.layer.ffn_up);
         upload_weight(allocator, mtp.layer.ffn_down);
         upload_weight(allocator, mtp.output_norm);
-        if (mtp.has_oov_head) {
-            upload_weight(allocator, mtp.oov_weight);
-        }
     }
 }
 

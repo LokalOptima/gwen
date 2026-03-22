@@ -1,5 +1,6 @@
 #include "gwen/model.h"
 #include "gwen/inference.h"
+#include "gwen/paths.h"
 #include "gwen/tokenizer.h"
 
 #include <chrono>
@@ -13,9 +14,9 @@ using namespace gwen;
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s [options]\n", prog);
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  --model PATH         Path to GGUF model file (required)\n");
-    fprintf(stderr, "  --mtp PATH           Path to MTP weights file (enables speculative decoding)\n");
-    fprintf(stderr, "  --mtp-lm-head PATH   Path to reduced LM head for faster MTP (GWRL format)\n");
+    fprintf(stderr, "  --model PATH         Path to GGUF model file (default: ~/.cache/gwen/%s)\n", gwen::DEFAULT_MODEL);
+    fprintf(stderr, "  --mtp PATH           Path to MTP weights file (default: ~/.cache/gwen/%s)\n", gwen::DEFAULT_MTP);
+    fprintf(stderr, "  --no-mtp             Disable MTP speculative decoding\n");
     fprintf(stderr, "  --template STR/FILE  Template (file or string); {input} replaced with input text\n");
     fprintf(stderr, "  --max-predict N        Number of tokens to generate (default: 50)\n");
     fprintf(stderr, "  --greedy             Use greedy decoding\n");
@@ -34,7 +35,7 @@ static void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     std::string model_path;
     std::string mtp_path;
-    std::string mtp_lm_head_path;
+    bool no_mtp = false;
     std::string tmpl_path;
     std::string teacher_tokens_str;
     std::string batch_extract_file;
@@ -51,7 +52,7 @@ int main(int argc, char** argv) {
     static struct option long_options[] = {
         {"model",        required_argument, nullptr, 'm'},
         {"mtp",          required_argument, nullptr, 'M'},
-        {"mtp-lm-head",  required_argument, nullptr, 'L'},
+        {"no-mtp",       no_argument,       nullptr, 'N'},
         {"mtp-threshold",required_argument, nullptr, 'T'},
         {"template",     required_argument, nullptr, 'p'},
         {"max-predict",    required_argument, nullptr, 'n'},
@@ -69,11 +70,11 @@ int main(int argc, char** argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:M:L:T:p:n:t:B:S:CPgblih", long_options, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:M:NT:p:n:t:B:S:CPgblih", long_options, nullptr)) != -1) {
         switch (opt) {
             case 'm': model_path = optarg; break;
             case 'M': mtp_path = optarg; break;
-            case 'L': mtp_lm_head_path = optarg; break;
+            case 'N': no_mtp = true; break;
             case 'T': mtp_threshold = atof(optarg); break;
             case 'p': tmpl_path = optarg; break;
             case 'n': n_predict = atoi(optarg); break;
@@ -99,10 +100,13 @@ int main(int argc, char** argv) {
         input_text = argv[optind];
     }
 
-    if (model_path.empty()) {
-        fprintf(stderr, "Error: --model is required\n");
-        print_usage(argv[0]);
-        return 1;
+    // Apply defaults from ~/.cache/gwen/ (auto-download if needed)
+    if (model_path.empty()) model_path = gwen::default_model_path();
+    if (mtp_path.empty() && !no_mtp) mtp_path = gwen::default_mtp_path();
+
+    gwen::ensure_file(model_path, (std::string(gwen::RELEASE_BASE) + "/" + gwen::DEFAULT_MODEL).c_str());
+    if (!mtp_path.empty()) {
+        gwen::ensure_file(mtp_path, (std::string(gwen::RELEASE_BASE) + "/" + gwen::DEFAULT_MTP).c_str());
     }
 
     // Load model
@@ -115,14 +119,9 @@ int main(int argc, char** argv) {
     double load_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     fprintf(stderr, "GGUF parsed in %.1f ms\n", load_ms);
 
-    // Load MTP weights if provided
+    // Load MTP weights (default: on, disable with --no-mtp)
     if (!mtp_path.empty()) {
         model->load_mtp(mtp_path);
-    }
-
-    // Load reduced LM head if provided
-    if (!mtp_lm_head_path.empty()) {
-        model->load_reduced_lm_head(mtp_lm_head_path);
     }
 
     model->print_info();

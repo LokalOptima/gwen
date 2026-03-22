@@ -1,5 +1,4 @@
 # ── Paths ────────────────────────────────────────────────────────────
-MODEL     ?= $(HOME)/models/gguf/Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf
 PROMPT    ?= The meaning of life is
 N         ?= 100
 
@@ -17,17 +16,17 @@ $(BUILD_DIR)/gwen: CMakeLists.txt $(wildcard src/*.cu src/*.cpp src/kernels/*.cu
 clean:
 	rm -rf $(BUILD_DIR)
 
-# ── Run ──────────────────────────────────────────────────────────────
+# ── Run (weights auto-downloaded to ~/.cache/gwen/) ─────────────────
 run: $(BUILD_DIR)/gwen
-	$(BUILD_DIR)/gwen --model $(MODEL) "$(PROMPT)" --max-predict $(N) --greedy
+	$(BUILD_DIR)/gwen "$(PROMPT)" --max-predict $(N) --greedy
 
 # ── Benchmark ────────────────────────────────────────────────────────
 bench: $(BUILD_DIR)/gwen
-	$(BUILD_DIR)/gwen --model $(MODEL) "$(PROMPT)" --max-predict $(N) --greedy --benchmark
+	$(BUILD_DIR)/gwen "$(PROMPT)" --max-predict $(N) --greedy --benchmark
 
 # ── Utility ──────────────────────────────────────────────────────────
 info: $(BUILD_DIR)/gwen
-	$(BUILD_DIR)/gwen --model $(MODEL) --info
+	$(BUILD_DIR)/gwen --info
 
 test: $(BUILD_DIR)/gwen
 	./scripts/test_correctness.sh
