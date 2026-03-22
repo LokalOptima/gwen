@@ -3909,20 +3909,17 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     int* d_token_ids = d_prefill_tokens;
     GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
-    // 1. Batch embedding lookup → F32 residual accumulator [N, 1024]
+    // 1. Batch embedding lookup → FP16 residual [N, 1024]
     {
         dim3 grid(1, N);
-        kernel_embed_lookup_batch_q6k_f32<<<grid, 256, 0, s>>>(
-            model.token_embd.device_data, d_token_ids, prefill_x_f32, cfg.n_embed, N);
+        kernel_embed_lookup_batch_q6k<<<grid, 256, 0, s>>>(
+            model.token_embd.device_data, d_token_ids, prefill_x, cfg.n_embed, N);
     }
 
-    // Working buffers: F32 residual accumulators swap between pf_a/pf_b each half-layer.
-    // pf_norm stays FP16 — it's the RMSNorm output feeding GEMMs (which expect half*).
-    // GEMM outputs go to pf_norm (reused as temp), then are added to the F32 residual.
-    // This eliminates 48 accumulated FP16 truncations (2 adds × 24 layers) in the residual stream.
-    float* pf_a = prefill_x_f32;     // F32 residual accumulator A
-    float* pf_b = prefill_out_f32;   // F32 residual accumulator B
-    half* pf_norm = prefill_norm;     // FP16 normalized (GEMM input/output temp)
+    // FP16 residual accumulators (matching extract_hidden_batch pipeline)
+    half* pf_a = prefill_x;       // FP16 residual accumulator A
+    half* pf_b = prefill_out;     // FP16 residual accumulator B
+    half* pf_norm = prefill_norm;  // FP16 normalized (GEMM input/output temp)
 
     int dn_state_idx = 0;
     int kv_cache_idx = 0;
@@ -3941,8 +3938,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
         fclose(fp);
     };
 
-    // Dump embedding before any layers
-    dump_f32_buf(pf_a, (N-1)*cfg.n_embed, cfg.n_embed, "/tmp/gwen_embed.bin");
+    // Debug dumps removed — FP16 pipeline
 
     // 2. Process each layer
     for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
@@ -3953,8 +3949,8 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
 
-            // RMSNorm: pf_a(F32) → pf_norm(half)
-            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
+            // RMSNorm: pf_a(FP16) → pf_norm(FP16)
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
                 pf_a, static_cast<const float*>(w.attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
@@ -4006,68 +4002,57 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 prefill_proj_gate,
                 prefill_proj_gate,
                 N, cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
-            gwen_gemm_f32out_auto(w.ssm_out.device_data, w.ssm_out.type, w.ssm_out.fp16_data, prefill_temp_w,
-                             prefill_proj_gate, pf_b,
-                             w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
+            // Output projection GEMM → pf_b (FP16)
+            gwen_gemm_auto(w.ssm_out.device_data, w.ssm_out.type, w.ssm_out.fp16_data, prefill_temp_w,
+                           prefill_proj_gate, pf_b,
+                           w.ssm_out.shape[1], w.ssm_out.shape[0], N, s);
 
-            // F32 residual add: pf_b += pf_a
+            // FP16 residual add: pf_b += pf_a
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
             }
-            // Dump attn_residual (last token in pf_b)
-            dump_f32_buf(pf_b, (N-1)*cfg.n_embed, cfg.n_embed,
-                         "/tmp/gwen_attn_res_" + std::to_string(layer_idx) + ".bin");
 
-            // Post-attention RMSNorm: pf_b(F32) → pf_norm(half)
-            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
+            // Post-attention RMSNorm: pf_b(FP16) → pf_norm(FP16)
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
                 pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // FFN with F32 output GEMMs and F32 SwiGLU
-            gwen_gemm_f32out_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
-                             pf_norm, prefill_ffn_gate_f32,
-                             w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm_f32out_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
-                             pf_norm, prefill_ffn_up_f32,
-                             w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+            // FFN GEMMs (FP16)
+            gwen_gemm_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
+                           pf_norm, prefill_ffn_gate,
+                           w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
+                           pf_norm, prefill_ffn_up,
+                           w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
             {
                 int total = N * cfg.n_ff;
                 int blocks = (total + 255) / 256;
-                kernel_swiglu_batch_f32<<<blocks, 256, 0, s>>>(
-                    prefill_ffn_gate_f32, prefill_ffn_up_f32, prefill_ffn_out_f32, N, cfg.n_ff);
+                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
+                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            // Convert F32 SwiGLU output → FP16 for FFN down GEMM, then GEMM→F32 to residual
-            {
-                int total_ffn = N * cfg.n_ff;
-                int blocks_ffn = (total_ffn + 255) / 256;
-                kernel_f32_to_half<<<blocks_ffn, 256, 0, s>>>(
-                    prefill_ffn_out_f32, prefill_ffn_out, total_ffn);
-            }
-            gwen_gemm_f32out_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
-                             prefill_ffn_out, pf_a,
-                             w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+            gwen_gemm_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
+                           prefill_ffn_out, pf_a,
+                           w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
-            // F32 residual add: pf_a += pf_b
+            // FP16 residual add: pf_a += pf_b
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
             }
-            // Dump post_ffn (last token in pf_a)
-            dump_f32_buf(pf_a, (N-1)*cfg.n_embed, cfg.n_embed,
-                         "/tmp/gwen_post_ffn_" + std::to_string(layer_idx) + ".bin");
+            // (debug dumps removed — FP16 pipeline)
 
         } else {
             // ===== Full Attention Layer — F32 residual + F32 FFN =====
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            // RMSNorm: pf_a(F32) → pf_norm(half)
-            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
+            // RMSNorm: pf_a(FP16) → pf_norm(FP16)
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
                 pf_a, static_cast<const float*>(w.attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
@@ -4146,71 +4131,55 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     total);
             }
 
-            // Out projection → F32 directly to residual
-            gwen_gemm_f32out_auto(w.attn_output.device_data, w.attn_output.type, w.attn_output.fp16_data, prefill_temp_w,
-                             prefill_proj_gate, pf_b,
-                             w.attn_output.shape[1], w.attn_output.shape[0], N, s);
+            // Out projection GEMM → pf_b (FP16)
+            gwen_gemm_auto(w.attn_output.device_data, w.attn_output.type, w.attn_output.fp16_data, prefill_temp_w,
+                           prefill_proj_gate, pf_b,
+                           w.attn_output.shape[1], w.attn_output.shape[0], N, s);
 
-            // F32 residual add: pf_b += pf_a
+            // FP16 residual add: pf_b += pf_a
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_b, pf_a, total);
             }
-            // Dump attn_residual (last token in pf_b)
-            dump_f32_buf(pf_b, (N-1)*cfg.n_embed, cfg.n_embed,
-                         "/tmp/gwen_attn_res_" + std::to_string(layer_idx) + ".bin");
 
-            // Post-attention RMSNorm: pf_b(F32) → pf_norm(half)
-            kernel_rmsnorm_batch_f32in_f32w<<<N, 256, 0, s>>>(
+            // Post-attention RMSNorm: pf_b(FP16) → pf_norm(FP16)
+            kernel_rmsnorm_batch_f32w<<<N, 256, 0, s>>>(
                 pf_b, static_cast<const float*>(w.post_attn_norm.device_data),
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-            // FFN with F32 output GEMMs and F32 SwiGLU
-            gwen_gemm_f32out_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
-                             pf_norm, prefill_ffn_gate_f32,
-                             w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
-            gwen_gemm_f32out_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
-                             pf_norm, prefill_ffn_up_f32,
-                             w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
+            // FFN GEMMs (FP16)
+            gwen_gemm_auto(w.ffn_gate.device_data, w.ffn_gate.type, w.ffn_gate.fp16_data, prefill_temp_w,
+                           pf_norm, prefill_ffn_gate,
+                           w.ffn_gate.shape[1], w.ffn_gate.shape[0], N, s);
+            gwen_gemm_auto(w.ffn_up.device_data, w.ffn_up.type, w.ffn_up.fp16_data, prefill_temp_w,
+                           pf_norm, prefill_ffn_up,
+                           w.ffn_up.shape[1], w.ffn_up.shape[0], N, s);
 
             {
                 int total = N * cfg.n_ff;
                 int blocks = (total + 255) / 256;
-                kernel_swiglu_batch_f32<<<blocks, 256, 0, s>>>(
-                    prefill_ffn_gate_f32, prefill_ffn_up_f32, prefill_ffn_out_f32, N, cfg.n_ff);
+                kernel_swiglu_batch<<<blocks, 256, 0, s>>>(
+                    prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            // Convert F32→FP16 for FFN down GEMM, then GEMM→F32 to residual
-            {
-                int total_ffn = N * cfg.n_ff;
-                int blocks_ffn = (total_ffn + 255) / 256;
-                kernel_f32_to_half<<<blocks_ffn, 256, 0, s>>>(
-                    prefill_ffn_out_f32, prefill_ffn_out, total_ffn);
-            }
-            gwen_gemm_f32out_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
-                             prefill_ffn_out, pf_a,
-                             w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
+            gwen_gemm_auto(w.ffn_down.device_data, w.ffn_down.type, w.ffn_down.fp16_data, prefill_temp_w,
+                           prefill_ffn_out, pf_a,
+                           w.ffn_down.shape[1], w.ffn_down.shape[0], N, s);
 
-            // F32 residual add: pf_a += pf_b
+            // FP16 residual add: pf_a += pf_b
             {
                 int total = N * cfg.n_embed;
                 int blocks = (total + 255) / 256;
-                kernel_add_inplace_f32<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
+                kernel_add_inplace_batch<<<blocks, 256, 0, s>>>(pf_a, pf_b, total);
             }
-            // Dump post_ffn (last token in pf_a)
-            dump_f32_buf(pf_a, (N-1)*cfg.n_embed, cfg.n_embed,
-                         "/tmp/gwen_post_ffn_" + std::to_string(layer_idx) + ".bin");
         }
     }
 
-    // 3. Final RMSNorm on last token: convert F32→half, then normalize
-    // This also leaves buf_a with the FP16 hidden state for subsequent decode tokens
-    float* last_hidden_f32 = pf_a + (size_t)(N - 1) * cfg.n_embed;
-    {
-        int blocks = (cfg.n_embed + 255) / 256;
-        kernel_f32_to_half<<<blocks, 256, 0, s>>>(last_hidden_f32, buf_a, cfg.n_embed);
-    }
+    // 3. Copy last token hidden → buf_a (FP16), RMSNorm, LM head
+    GWEN_CHECK_CUDA(cudaMemcpyAsync(buf_a, pf_a + (size_t)(N - 1) * cfg.n_embed,
+                                     cfg.n_embed * sizeof(half), cudaMemcpyDeviceToDevice, s));
+
     gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
                       x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
@@ -4220,10 +4189,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
-
-    // Dump result_norm (F32 hidden state before LM head) and result_output (F32 logits)
-    dump_f32_buf(last_hidden_f32, 0, cfg.n_embed, "/tmp/gwen_result_norm.bin");
-    dump_f32_buf(logits_f, 0, cfg.n_vocab, "/tmp/gwen_result_output.bin");
 
     kernel_argmax_partial<<<ARGMAX_BLOCKS, 256, 0, s>>>(logits_f, argmax_partial_max, argmax_partial_idx, cfg.n_vocab);
     kernel_argmax_reduce<<<1, 256, 0, s>>>(argmax_partial_max, argmax_partial_idx, d_argmax_token, ARGMAX_BLOCKS);
