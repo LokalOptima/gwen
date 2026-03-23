@@ -2590,6 +2590,10 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     x = buf_a;
     residual = buf_b;
 
+    // F32 residual accumulators for FP8 decode path
+    buf_a_f32 = static_cast<float*>(a(cfg.n_embed * sizeof(float)));
+    buf_b_f32 = static_cast<float*>(a(cfg.n_embed * sizeof(float)));
+
     // DeltaNet scratch — Q/K/V alias into qkv (no separate allocation)
     int qkv_dim = cfg.ssm_inner_size * 3;  // 6144
     qkv      = static_cast<half*>(a(qkv_dim * sizeof(half)));
@@ -3031,9 +3035,14 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
     const auto& cfg = model.config;
     const float q_scale = 1.0f / sqrtf((float)cfg.ssm_state_size);
 
-    // 1. Embedding lookup → buf_a (reads token_id from device memory)
+    // Detect weight format: FP8 path uses F32 residuals, no Q8_1 quantization
+    bool fp8_mode = (model.token_embd.type == GGMLType::FP8_E4M3);
+
+    // 1. Embedding lookup → buf_a, then convert to F32 if FP8 mode
     gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
-                      d_token_id, buf_a, cfg.n_embed, s);
+                      d_token_id, buf_a, cfg.n_embed, s, model.token_embd.device_scales);
+    if (fp8_mode)
+        gwen_fp16_to_f32(buf_a, buf_a_f32, cfg.n_embed, s);
 
     int dn_state_idx = 0;
     int kv_cache_idx = 0;
@@ -3045,6 +3054,64 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
         if (!layer.is_full_attention) {
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
+
+          if (fp8_mode) {
+            // === FP8 decode path: F32 residuals, no Q8_1 quantization ===
+
+            // RMSNorm: F32 input → FP16 x_norm
+            gwen_rmsnorm_f32_input(buf_a_f32, static_cast<const float*>(w.attn_norm.device_data),
+                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            // QKV + gate projections: FP8 GEMV (FP16 input, FP16 output)
+            gwen_gemv_fp8(w.attn_qkv.device_data, w.attn_qkv.device_scales, x_norm, qkv,
+                          w.attn_qkv.shape[0], w.attn_qkv.shape[1], s);
+            gwen_gemv_fp8(w.attn_gate.device_data, w.attn_gate.device_scales, x_norm, gate_z,
+                          w.attn_gate.shape[0], w.attn_gate.shape[1], s);
+
+            int qkv_dim = cfg.ssm_inner_size * 3;
+            int conv_blocks = (qkv_dim + 255) / 256;
+            kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
+                qkv, qkv, state.conv_state,
+                static_cast<const float*>(w.ssm_conv1d.device_data),
+                qkv_dim, cfg.ssm_conv_kernel);
+
+            half* q = qkv;
+            half* k = qkv + cfg.ssm_inner_size;
+            half* v = qkv + 2 * cfg.ssm_inner_size;
+
+            // Fused: L2-norm(Q,K) + gate/beta + S update
+            // TODO Phase 5: update DeltaNet to read FP8 alpha/beta directly
+            kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
+                state.S, q, k, v, x_norm,
+                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                static_cast<const float*>(w.ssm_a.device_data),
+                static_cast<const float*>(w.ssm_dt_bias.device_data),
+                attn_out, q_scale,
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.n_embed);
+
+            // Gated RMSNorm (no Q8_1 quantize — FP8 path reads FP16 directly)
+            kernel_gated_rmsnorm<<<cfg.ssm_n_heads, 32, 0, s>>>(
+                attn_out, static_cast<const float*>(w.ssm_norm.device_data),
+                gate_z, gated_out,
+                cfg.ssm_n_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
+            // Output projection: FP8 GEMV with F32 residual
+            gwen_gemv_fp8_residual_f32(w.ssm_out.device_data, w.ssm_out.device_scales,
+                          gated_out, buf_b_f32, buf_a_f32,
+                          w.ssm_out.shape[0], w.ssm_out.shape[1], s);
+
+            // FFN: RMSNorm F32→FP16, then FP8 GEMV for gate/up, SwiGLU, FP8 GEMV down
+            gwen_rmsnorm_f32_input(buf_b_f32, static_cast<const float*>(w.post_attn_norm.device_data),
+                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_gemv_fp8(w.ffn_gate.device_data, w.ffn_gate.device_scales, x_norm, ffn_gate,
+                          w.ffn_gate.shape[0], w.ffn_gate.shape[1], s);
+            gwen_gemv_fp8(w.ffn_up.device_data, w.ffn_up.device_scales, x_norm, ffn_up,
+                          w.ffn_up.shape[0], w.ffn_up.shape[1], s);
+            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
+            gwen_gemv_fp8_residual_f32(w.ffn_down.device_data, w.ffn_down.device_scales,
+                          ffn_out, buf_a_f32, buf_b_f32,
+                          w.ffn_down.shape[0], w.ffn_down.shape[1], s);
+
+          } else {
+            // === Q4_K decode path (legacy GGUF) ===
 
             // Fused RMSNorm + Q8_1 quantize (also writes FP16 x_norm for gate/beta computation)
             gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
@@ -3094,12 +3161,73 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
             gwen_gemv_dp4a_residual(w.ffn_down.device_data, x_q8_b, buf_a, buf_b,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
+          }
 
         } else {
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            // Fused RMSNorm + Q8_1 quantize (no FP16 output needed)
+          if (fp8_mode) {
+            // === FP8 full attention path ===
+            gwen_rmsnorm_f32_input(buf_a_f32, static_cast<const float*>(w.attn_norm.device_data),
+                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_gemv_fp8(w.attn_q.device_data, w.attn_q.device_scales, x_norm, qkv,
+                          w.attn_q.shape[0], w.attn_q.shape[1], s);
+            {
+                int attn_dim = cfg.n_head * cfg.head_dim;
+                int deint_blocks = (attn_dim + 255) / 256;
+                kernel_deinterleave_qgate<<<deint_blocks, 256, 0, s>>>(
+                    qkv, fa_q, gated_out, cfg.n_head, cfg.head_dim);
+            }
+            gwen_gemv_fp8(w.attn_k.device_data, w.attn_k.device_scales, x_norm, fa_k,
+                          w.attn_k.shape[0], w.attn_k.shape[1], s);
+            gwen_gemv_fp8(w.attn_v.device_data, w.attn_v.device_scales, x_norm, fa_v,
+                          w.attn_v.shape[0], w.attn_v.shape[1], s);
+
+            gwen_rmsnorm_batched_f32w(fa_q, static_cast<const float*>(w.attn_q_norm.device_data),
+                                      fa_q, cfg.n_head, cfg.head_dim, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_batched_f32w(fa_k, static_cast<const float*>(w.attn_k_norm.device_data),
+                                      fa_k, cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps, s);
+
+            gwen_rope(fa_q, fa_k, cfg.n_head, cfg.n_head_kv, cfg.head_dim,
+                      d_pos, cfg.rope_theta, cfg.rope_sections, cfg.rope_dim, s);
+
+            {
+                int kv_dim = cfg.n_head_kv * cfg.head_dim;
+                int kv_blocks = (kv_dim + 255) / 256;
+                kernel_kv_cache_store<<<kv_blocks, 256, 0, s>>>(
+                    cache.k_cache, cache.v_cache, fa_k, fa_v, d_pos, kv_dim);
+            }
+
+            float scale = 1.0f / sqrtf((float)cfg.head_dim);
+            kernel_gqa_attention_decode<<<cfg.n_head, 256, 0, s>>>(
+                fa_q, cache.k_cache, cache.v_cache,
+                attn_out, attn_scores, d_pos,
+                cfg.n_head, cfg.n_head_kv, cfg.head_dim, max_seq_alloc, scale);
+            {
+                int attn_dim = cfg.n_head * cfg.head_dim;
+                gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
+            }
+
+            // Output projection with F32 residual
+            gwen_gemv_fp8_residual_f32(w.attn_output.device_data, w.attn_output.device_scales,
+                          gated_out, buf_b_f32, buf_a_f32,
+                          w.attn_output.shape[0], w.attn_output.shape[1], s);
+
+            // FFN
+            gwen_rmsnorm_f32_input(buf_b_f32, static_cast<const float*>(w.post_attn_norm.device_data),
+                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_gemv_fp8(w.ffn_gate.device_data, w.ffn_gate.device_scales, x_norm, ffn_gate,
+                          w.ffn_gate.shape[0], w.ffn_gate.shape[1], s);
+            gwen_gemv_fp8(w.ffn_up.device_data, w.ffn_up.device_scales, x_norm, ffn_up,
+                          w.ffn_up.shape[0], w.ffn_up.shape[1], s);
+            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
+            gwen_gemv_fp8_residual_f32(w.ffn_down.device_data, w.ffn_down.device_scales,
+                          ffn_out, buf_a_f32, buf_b_f32,
+                          w.ffn_down.shape[0], w.ffn_down.shape[1], s);
+
+          } else {
+            // === Q4_K full attention path (legacy GGUF) ===
             gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
                               x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
             gwen_gemv_dp4a(w.attn_q.device_data, x_q8_a, qkv,
@@ -3145,39 +3273,47 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                 gwen_sigmoid_mul(attn_out, gated_out, gated_out, attn_dim, s);
             }
 
-            // Quantize gated_out for output projection (fused residual add)
             gwen_quantize_q8_1(gated_out, x_q8_b, cfg.n_head * cfg.head_dim, s);
             gwen_gemv_dp4a_residual(w.attn_output.device_data, x_q8_b, buf_b, buf_a,
                       w.attn_output.shape[1], w.attn_output.shape[0], w.attn_output.type, s);
 
-            // Fused RMSNorm + Q8_1 quantize (no FP16 output needed)
             gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
                               x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
             gwen_gemv_dp4a(w.ffn_gate.device_data, x_q8_a, ffn_gate,
                       w.ffn_gate.shape[1], w.ffn_gate.shape[0], w.ffn_gate.type, s);
             gwen_gemv_dp4a(w.ffn_up.device_data, x_q8_a, ffn_up,
                       w.ffn_up.shape[1], w.ffn_up.shape[0], w.ffn_up.type, s);
-            // Fused SwiGLU + Q8_1 quantize (skips FP16 intermediate)
             gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_b, cfg.n_ff, s);
             gwen_gemv_dp4a_residual(w.ffn_down.device_data, x_q8_b, buf_a, buf_b,
                       w.ffn_down.shape[1], w.ffn_down.shape[0], w.ffn_down.type, s);
+          }
         }
     }
 
     // 3. Save hidden state for MTP (before LM head destroys it)
-    // buf_a holds the final hidden state after all 24 layers.
-    // Copy to mtp_hidden for use by forward_mtp_body().
-    // This is a 2KB D2D copy — negligible cost, CUDA graph capturable.
     if (mtp_hidden) {
-        GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, buf_a, cfg.n_embed * sizeof(half),
-                                          cudaMemcpyDeviceToDevice, s));
+        if (fp8_mode) {
+            // Convert F32 residual → FP16 for MTP
+            gwen_f32_to_fp16(buf_a_f32, mtp_hidden, cfg.n_embed, s);
+        } else {
+            GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, buf_a, cfg.n_embed * sizeof(half),
+                                              cudaMemcpyDeviceToDevice, s));
+        }
     }
 
-    // 4. Fused RMSNorm + Q8_1 quantize + LM Head + argmax
-    gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(model.output_norm.device_data),
-                      x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
-    gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
-              cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
+    // 4. LM Head + argmax
+    if (fp8_mode) {
+        // F32 residual → FP16 x_norm via RMSNorm, then FP8 GEMV for logits
+        gwen_rmsnorm_f32_input(buf_a_f32, static_cast<const float*>(model.output_norm.device_data),
+                               x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+        gwen_gemv_fp8(model.token_embd.device_data, model.token_embd.device_scales, x_norm, logits_h,
+                      cfg.n_vocab, cfg.n_embed, s);
+    } else {
+        gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(model.output_norm.device_data),
+                          x_q8_a, nullptr, cfg.n_embed, cfg.rms_norm_eps, s);
+        gwen_gemv_dp4a(model.token_embd.device_data, x_q8_a, logits_h,
+                  cfg.n_vocab, cfg.n_embed, model.token_embd.type, s);
+    }
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);

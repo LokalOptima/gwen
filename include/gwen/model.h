@@ -15,6 +15,11 @@ struct WeightRef {
     size_t size_bytes = 0;
     std::vector<uint64_t> shape;
 
+    // FP8 per-row scaling (only used when type == FP8_E4M3)
+    const float* host_scales = nullptr;   // mmap'd scale array (one float per row)
+    float* device_scales = nullptr;       // GPU pointer for scales
+    uint32_t n_scale_rows = 0;            // number of scale values
+
     bool on_device() const { return device_data != nullptr; }
 };
 
@@ -88,6 +93,9 @@ struct Model {
     ModelConfig config;
     std::unique_ptr<GGUFFile> gguf;
 
+    // GWFP8 mmap'd file data (kept alive while model is loaded)
+    std::vector<uint8_t> gwfp8_file_data_;  // file contents (mmap'd or loaded)
+
     // Global weights
     WeightRef token_embd;       // [n_embed, n_vocab] Q6_K
     WeightRef output_norm;      // [n_embed] F32
@@ -106,6 +114,9 @@ struct Model {
 
     // Load from GGUF file
     static std::unique_ptr<Model> load(const std::string& gguf_path);
+
+    // Load from GWFP8 file (FP8 E4M3 weights with per-row scales)
+    static std::unique_ptr<Model> load_fp8(const std::string& fp8_path);
 
     // Load MTP weights from binary file (GWMT format)
     void load_mtp(const std::string& mtp_path);

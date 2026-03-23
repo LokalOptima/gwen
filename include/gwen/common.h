@@ -58,6 +58,7 @@ enum class GGMLType : uint32_t {
     I64    = 27,
     F64    = 28,
     BF16   = 30,
+    FP8_E4M3 = 31,  // GWEN-specific: 8-bit float (E4M3), 1 byte per element
 };
 
 const char* ggml_type_name(GGMLType type);

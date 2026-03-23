@@ -35,6 +35,10 @@ struct InferenceState {
     half* buf_a = nullptr;      // backing storage (one of x/residual points here)
     half* buf_b = nullptr;      // backing storage (the other of x/residual points here)
 
+    // F32 residual accumulators (FP8 path — avoids FP16 precision loss over 24 layers)
+    float* buf_a_f32 = nullptr; // [n_embed] F32 residual buffer A
+    float* buf_b_f32 = nullptr; // [n_embed] F32 residual buffer B
+
     // DeltaNet scratch
     half* qkv = nullptr;        // [3 * ssm_inner] = [6144] — Q/K/V aliased into this
     half* gate_z = nullptr;     // [ssm_inner] = [2048]

@@ -2,6 +2,7 @@
 #include "gwen/inference.h"
 #include "gwen/paths.h"
 #include "gwen/tokenizer.h"
+#include "gwen/gguf.h"
 
 #include <chrono>
 #include <fstream>
@@ -110,8 +111,13 @@ int main(int argc, char** argv) {
         gwen::ensure_file(mtp_path, (std::string(gwen::RELEASE_BASE) + "/" + gwen::DEFAULT_MTP).c_str());
     }
 
-    // Load model
-    auto model = Model::load(model_path);
+    // Load model — auto-detect format by extension
+    std::unique_ptr<Model> model;
+    if (model_path.size() >= 6 && model_path.substr(model_path.size() - 6) == ".gwfp8") {
+        model = Model::load_fp8(model_path);
+    } else {
+        model = Model::load(model_path);
+    }
 
     // Load MTP weights (default: on, disable with --no-mtp)
     if (!mtp_path.empty()) {
@@ -123,9 +129,15 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Build tokenizer concurrently with weight upload
+    // Build tokenizer concurrently with weight upload.
+    // For GWFP8 models: tokenizer comes from the default GGUF file (metadata only, no weight upload)
+    std::unique_ptr<GGUFFile> tok_gguf;
+    if (!model->gguf) {
+        tok_gguf = GGUFFile::open(gwen::default_model_path());
+    }
+    const GGUFFile& tok_source = model->gguf ? *model->gguf : *tok_gguf;
     auto tok_future = std::async(std::launch::async, [&]() {
-        return Tokenizer::from_gguf(*model->gguf);
+        return Tokenizer::from_gguf(tok_source);
     });
 
     CudaAllocator allocator;

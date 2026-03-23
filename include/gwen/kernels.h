@@ -85,6 +85,47 @@ void gwen_gemv_dp4a_residual_batch2(const void* W,
                                      GGMLType type, cudaStream_t stream = 0);
 
 // ============================================================
+// FP8 E4M3 GEMV (primary decode path for GWFP8 weights)
+// ============================================================
+// W: [out_features, in_features] FP8 E4M3, scales: [out_features] F32 per-row
+
+// y_fp16 = W * x * scale (no residual, FP16 output)
+void gwen_gemv_fp8(const void* W, const float* scales, const half* x, half* y,
+                    int out_features, int in_features, cudaStream_t stream = 0);
+
+// y_f32 = W * x * scale + residual_f32 (F32 residual stream)
+void gwen_gemv_fp8_residual_f32(const void* W, const float* scales, const half* x,
+                                  float* y_f32, const float* residual_f32,
+                                  int out_features, int in_features, cudaStream_t stream = 0);
+
+// Batch2: read weights once, 2 dot products → FP16 output
+void gwen_gemv_fp8_batch2(const void* W, const float* scales,
+                            const half* x0, const half* x1,
+                            half* y0, half* y1,
+                            int out_features, int in_features, cudaStream_t stream = 0);
+
+// Batch2 with F32 residual
+void gwen_gemv_fp8_batch2_residual_f32(const void* W, const float* scales,
+                                         const half* x0, const half* x1,
+                                         float* y0_f32, float* y1_f32,
+                                         const float* res0_f32, const float* res1_f32,
+                                         int out_features, int in_features, cudaStream_t stream = 0);
+
+// ============================================================
+// F32-input RMSNorm (reads F32 residual stream, writes FP16)
+// ============================================================
+void gwen_rmsnorm_f32_input(const float* x_f32, const float* weight, half* y,
+                              int dim, float eps, cudaStream_t stream = 0);
+
+// FP16→F32 / F32→FP16 conversion
+void gwen_fp16_to_f32(const half* x, float* y, int n, cudaStream_t stream = 0);
+void gwen_f32_to_fp16(const float* x, half* y, int n, cudaStream_t stream = 0);
+
+// FP8→FP16 bulk dequant with per-row scaling (for prefill GEMM via CUTLASS FP16 fallback)
+void gwen_dequant_fp8_to_fp16(const void* data, const float* scales, half* out,
+                                int rows, int cols, cudaStream_t stream = 0);
+
+// ============================================================
 // FP16 GEMV (for MTP weights stored as FP16)
 // ============================================================
 
@@ -204,7 +245,7 @@ void gwen_rope(half* q, half* k,
 // d_token_id: device pointer to token ID (for CUDA graph compatibility)
 void gwen_embed_lookup(const void* table, GGMLType table_type,
                        const int* d_token_id, half* y, int dim,
-                       cudaStream_t stream = 0);
+                       cudaStream_t stream = 0, const float* scales = nullptr);
 
 // ============================================================
 // L2 Normalization

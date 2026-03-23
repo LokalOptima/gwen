@@ -26,6 +26,7 @@ const char* ggml_type_name(GGMLType type) {
         case GGMLType::Q6_K: return "Q6_K";
         case GGMLType::Q8_K: return "Q8_K";
         case GGMLType::BF16: return "BF16";
+        case GGMLType::FP8_E4M3: return "FP8_E4M3";
         default: return "UNKNOWN";
     }
 }
@@ -36,6 +37,7 @@ uint32_t ggml_type_block_size(GGMLType type) {
         case GGMLType::F32:  return 1;
         case GGMLType::F16:  return 1;
         case GGMLType::BF16: return 1;
+        case GGMLType::FP8_E4M3: return 1;
         case GGMLType::Q4_0: return 32;
         case GGMLType::Q4_1: return 32;
         case GGMLType::Q5_0: return 32;
@@ -58,6 +60,7 @@ size_t ggml_type_block_bytes(GGMLType type) {
         case GGMLType::F32:  return 4;
         case GGMLType::F16:  return 2;
         case GGMLType::BF16: return 2;
+        case GGMLType::FP8_E4M3: return 1;  // 1 byte per element
         case GGMLType::Q4_0: return 18;   // 2 (d) + 16 (qs)
         case GGMLType::Q4_1: return 20;   // 2 (d) + 2 (m) + 16 (qs)
         case GGMLType::Q5_0: return 22;   // 2 (d) + 4 (qh) + 16 (qs)

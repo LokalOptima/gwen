@@ -1,5 +1,6 @@
 #include "gwen/model.h"
 #include <fstream>
+#include <unordered_map>
 
 namespace gwen {
 
@@ -272,6 +273,240 @@ void Model::load_reduced_lm_head(const std::string& path) {
            (float)config.n_vocab / K);
 }
 
+// ============================================================
+// GWFP8 loader — FP8 E4M3 weights with per-row scales
+// ============================================================
+
+std::unique_ptr<Model> Model::load_fp8(const std::string& fp8_path) {
+    auto model = std::make_unique<Model>();
+
+    // Read entire file into memory (will be mmap'd in future)
+    std::ifstream f(fp8_path, std::ios::binary | std::ios::ate);
+    GWEN_CHECK(f.is_open(), ("Failed to open: " + fp8_path).c_str());
+    size_t file_size = f.tellg();
+    f.seekg(0);
+    model->gwfp8_file_data_.resize(file_size);
+    f.read(reinterpret_cast<char*>(model->gwfp8_file_data_.data()), file_size);
+    f.close();
+
+    const uint8_t* base = model->gwfp8_file_data_.data();
+    size_t offset = 0;
+
+    // Parse header
+    auto read_u32 = [&]() -> uint32_t {
+        uint32_t v;
+        memcpy(&v, base + offset, 4);
+        offset += 4;
+        return v;
+    };
+    auto read_u64 = [&]() -> uint64_t {
+        uint64_t v;
+        memcpy(&v, base + offset, 8);
+        offset += 8;
+        return v;
+    };
+
+    GWEN_CHECK(memcmp(base, "GWF8", 4) == 0, "Invalid GWFP8 magic");
+    offset = 4;
+    uint32_t version = read_u32();
+    GWEN_CHECK(version == 1, "Unsupported GWFP8 version");
+    uint32_t n_tensors = read_u32();
+    uint64_t header_size = read_u64();
+    (void)header_size;
+
+    // Parse tensor headers and build name→WeightRef map
+    struct TensorInfo {
+        std::string name;
+        uint32_t dtype;
+        std::vector<uint64_t> shape;
+        uint32_t scale_mode;
+        uint32_t n_scales;
+        uint64_t scale_offset;
+        uint64_t data_offset;
+        uint64_t data_size;
+    };
+    std::vector<TensorInfo> tensor_infos;
+    tensor_infos.reserve(n_tensors);
+
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        TensorInfo ti;
+        uint32_t name_len = read_u32();
+        ti.name = std::string(reinterpret_cast<const char*>(base + offset), name_len);
+        offset += name_len;
+        ti.dtype = read_u32();
+        uint32_t ndims = read_u32();
+        ti.shape.resize(ndims);
+        for (uint32_t d = 0; d < ndims; d++)
+            ti.shape[d] = read_u64();
+        ti.scale_mode = read_u32();
+        ti.n_scales = read_u32();
+        ti.scale_offset = read_u64();
+        ti.data_offset = read_u64();
+        ti.data_size = read_u64();
+        tensor_infos.push_back(std::move(ti));
+    }
+
+    // Build WeightRef from TensorInfo, pointing into the file buffer
+    auto make_weight = [&](const TensorInfo& ti) -> WeightRef {
+        WeightRef w;
+        w.host_data = base + ti.data_offset;
+        w.size_bytes = ti.data_size;
+        w.shape = ti.shape;
+
+        // Compute n_elements from shape
+        w.n_elements = 1;
+        for (auto s : ti.shape) w.n_elements *= s;
+
+        if (ti.dtype == 0) {  // FP8_E4M3
+            w.type = GGMLType::FP8_E4M3;
+            w.host_scales = reinterpret_cast<const float*>(base + ti.scale_offset);
+            w.n_scale_rows = ti.n_scales;
+        } else if (ti.dtype == 1) {  // F32
+            w.type = GGMLType::F32;
+        } else if (ti.dtype == 2) {  // F16
+            w.type = GGMLType::F16;
+        }
+        return w;
+    };
+
+    // Build name lookup
+    std::unordered_map<std::string, size_t> name_to_idx;
+    for (size_t i = 0; i < tensor_infos.size(); i++)
+        name_to_idx[tensor_infos[i].name] = i;
+
+    auto get = [&](const std::string& name) -> WeightRef {
+        auto it = name_to_idx.find(name);
+        GWEN_CHECK(it != name_to_idx.end(), ("Missing tensor: " + name).c_str());
+        return make_weight(tensor_infos[it->second]);
+    };
+
+    auto try_get = [&](const std::string& name) -> WeightRef {
+        auto it = name_to_idx.find(name);
+        if (it == name_to_idx.end()) return {};
+        return make_weight(tensor_infos[it->second]);
+    };
+
+    // Set config from tensor shapes (infer from the weight dimensions)
+    auto& cfg = model->config;
+    {
+        auto& te = tensor_infos[name_to_idx.at("token_embd.weight")];
+        cfg.n_vocab = te.shape[0];
+        cfg.n_embed = te.shape[1];
+    }
+
+    // Count layers by finding the highest blk.N index
+    uint32_t max_layer = 0;
+    for (auto& [name, idx] : name_to_idx) {
+        if (name.substr(0, 4) == "blk.") {
+            auto dot = name.find('.', 4);
+            if (dot != std::string::npos) {
+                uint32_t li = std::stoi(name.substr(4, dot - 4));
+                if (li > max_layer) max_layer = li;
+            }
+        }
+    }
+    cfg.n_layers = max_layer + 1;
+
+    // Infer other params from tensor shapes
+    {
+        auto& qkv = tensor_infos[name_to_idx.at("blk.0.attn_qkv.weight")];
+        uint32_t qkv_out = qkv.shape[0];  // 6144 for 0.8B
+        // QKV = 3 * ssm_inner_size (for symmetric k/v heads)
+        cfg.ssm_inner_size = qkv_out / 3;
+        cfg.ssm_state_size = 128;  // always 128 for Qwen3.5
+        cfg.ssm_n_heads = cfg.ssm_inner_size / cfg.ssm_state_size;
+    }
+    {
+        auto& ffn = tensor_infos[name_to_idx.at("blk.0.ffn_gate.weight")];
+        cfg.n_ff = ffn.shape[0];
+    }
+    // Full attention params from the first full attention layer (layer 3)
+    {
+        std::string fa_prefix = "blk." + std::to_string(cfg.full_attn_interval - 1);
+        auto it = name_to_idx.find(fa_prefix + ".attn_q.weight");
+        if (it != name_to_idx.end()) {
+            auto& q = tensor_infos[it->second];
+            // Q shape: [n_head * (head_dim + head_dim), n_embed] = [n_head * 2 * head_dim, n_embed]
+            // But actually Q is [n_head * head_dim * 2, n_embed] for Qwen3.5 (Q + gate interleaved)
+            uint32_t q_out = q.shape[0];
+            cfg.n_head = q_out / (cfg.head_dim * 2);  // divide by 2 for Q+gate
+        }
+        auto it_k = name_to_idx.find(fa_prefix + ".attn_k.weight");
+        if (it_k != name_to_idx.end()) {
+            auto& k = tensor_infos[it_k->second];
+            cfg.n_head_kv = k.shape[0] / cfg.head_dim;
+        }
+    }
+
+    fprintf(stderr, "GWFP8: %u layers, embed=%u, ff=%u, vocab=%u, heads=%u/%u, ssm_heads=%u\n",
+            cfg.n_layers, cfg.n_embed, cfg.n_ff, cfg.n_vocab, cfg.n_head, cfg.n_head_kv, cfg.ssm_n_heads);
+
+    // Load global weights
+    model->token_embd = get("token_embd.weight");
+    model->output_norm = get("output_norm.weight");
+
+    // Load per-layer weights
+    model->layers.resize(cfg.n_layers);
+    for (uint32_t i = 0; i < cfg.n_layers; i++) {
+        auto& layer = model->layers[i];
+        std::string prefix = "blk." + std::to_string(i) + ".";
+        layer.is_full_attention = cfg.is_full_attention_layer(i);
+
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            w.attn_norm      = get(prefix + "attn_norm.weight");
+            w.attn_q         = get(prefix + "attn_q.weight");
+            w.attn_k         = get(prefix + "attn_k.weight");
+            w.attn_v         = get(prefix + "attn_v.weight");
+            w.attn_q_norm    = get(prefix + "attn_q_norm.weight");
+            w.attn_k_norm    = get(prefix + "attn_k_norm.weight");
+            w.attn_output    = get(prefix + "attn_output.weight");
+            w.post_attn_norm = get(prefix + "post_attention_norm.weight");
+            w.ffn_gate       = get(prefix + "ffn_gate.weight");
+            w.ffn_up         = get(prefix + "ffn_up.weight");
+            w.ffn_down       = get(prefix + "ffn_down.weight");
+        } else {
+            auto& w = layer.deltanet;
+            w.attn_norm      = get(prefix + "attn_norm.weight");
+            w.attn_qkv       = get(prefix + "attn_qkv.weight");
+            w.attn_gate      = get(prefix + "attn_gate.weight");
+            w.ssm_conv1d     = get(prefix + "ssm_conv1d.weight");
+            w.ssm_a          = get(prefix + "ssm_a");
+            w.ssm_dt_bias    = get(prefix + "ssm_dt.bias");
+            w.ssm_alpha      = get(prefix + "ssm_alpha.weight");
+            w.ssm_beta       = get(prefix + "ssm_beta.weight");
+            w.ssm_norm       = get(prefix + "ssm_norm.weight");
+            w.ssm_out        = get(prefix + "ssm_out.weight");
+            w.post_attn_norm = get(prefix + "post_attention_norm.weight");
+            w.ffn_gate       = get(prefix + "ffn_gate.weight");
+            w.ffn_up         = get(prefix + "ffn_up.weight");
+            w.ffn_down       = get(prefix + "ffn_down.weight");
+        }
+    }
+
+    // Count total weight bytes
+    size_t total = model->token_embd.size_bytes + model->output_norm.size_bytes;
+    for (auto& layer : model->layers) {
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            total += w.attn_norm.size_bytes + w.attn_q.size_bytes + w.attn_k.size_bytes +
+                     w.attn_v.size_bytes + w.attn_q_norm.size_bytes + w.attn_k_norm.size_bytes +
+                     w.attn_output.size_bytes + w.post_attn_norm.size_bytes +
+                     w.ffn_gate.size_bytes + w.ffn_up.size_bytes + w.ffn_down.size_bytes;
+        } else {
+            auto& w = layer.deltanet;
+            total += w.attn_norm.size_bytes + w.attn_qkv.size_bytes + w.attn_gate.size_bytes +
+                     w.ssm_conv1d.size_bytes + w.ssm_a.size_bytes + w.ssm_dt_bias.size_bytes +
+                     w.ssm_alpha.size_bytes + w.ssm_beta.size_bytes + w.ssm_norm.size_bytes +
+                     w.ssm_out.size_bytes + w.post_attn_norm.size_bytes +
+                     w.ffn_gate.size_bytes + w.ffn_up.size_bytes + w.ffn_down.size_bytes;
+        }
+    }
+    fprintf(stderr, "GWFP8: loaded %.1f MB of weights from %s\n", total / 1024.0 / 1024.0, fp8_path.c_str());
+
+    return model;
+}
+
 // Upload all weight tensors to GPU
 // Forward declarations for dequant kernels
 void gwen_dequant(const void* src, half* dst, int n, GGMLType type, cudaStream_t stream);
@@ -279,6 +514,11 @@ void gwen_dequant(const void* src, half* dst, int n, GGMLType type, cudaStream_t
 static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
     if (w.host_data && w.size_bytes > 0 && !w.on_device()) {
         w.device_data = alloc.upload(w.host_data, w.size_bytes);
+    }
+    // Upload FP8 per-row scales if present
+    if (w.host_scales && w.n_scale_rows > 0 && !w.device_scales) {
+        w.device_scales = static_cast<float*>(
+            alloc.upload(w.host_scales, w.n_scale_rows * sizeof(float)));
     }
 }
 
@@ -353,7 +593,7 @@ void Model::upload_weights(CudaAllocator& allocator) {
 
 void Model::print_info() const {
     fprintf(stderr, "=== GWEN Model Info ===\n");
-    fprintf(stderr, "Model: %s\n", gguf->path().c_str());
+    fprintf(stderr, "Model: %s\n", gguf ? gguf->path().c_str() : "(GWFP8)");
     fprintf(stderr, "Layers: %u (%u DeltaNet + %u FullAttn)\n",
            config.n_layers,
            config.n_layers - config.n_layers / config.full_attn_interval,
@@ -404,7 +644,7 @@ void Model::print_info() const {
         }
     }
     fprintf(stderr, "Total weight size: %.1f MB\n", total_bytes / 1024.0 / 1024.0);
-    fprintf(stderr, "Tensors: %zu\n", gguf->n_tensors());
+    if (gguf) fprintf(stderr, "Tensors: %zu\n", gguf->n_tensors());
 }
 
 } // namespace gwen
