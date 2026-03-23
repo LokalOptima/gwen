@@ -130,7 +130,8 @@ int main(int argc, char** argv) {
     }
 
     // Build tokenizer concurrently with weight upload.
-    // For GWFP8 models: tokenizer comes from the default GGUF file (metadata only, no weight upload)
+    // For GWFP8: load tokenizer from the default GGUF (metadata only, no weight upload)
+    // TODO: embed tokenizer in GWFP8 format or load from HF tokenizer.json
     std::unique_ptr<GGUFFile> tok_gguf;
     if (!model->gguf) {
         tok_gguf = GGUFFile::open(gwen::default_model_path());

@@ -7,11 +7,13 @@
 
 namespace gwen {
 
-// Minimal tokenizer from GGUF metadata
-// Uses the token vocabulary and BPE merges from the model file
+// BPE tokenizer — loads from HuggingFace model directory or GGUF
 class Tokenizer {
 public:
     static std::unique_ptr<Tokenizer> from_gguf(const GGUFFile& gguf);
+
+    // Load from HuggingFace model directory (tokenizer.json + merges.txt)
+    static std::unique_ptr<Tokenizer> from_hf_dir(const std::string& dir);
 
     // Encode text to token IDs (handles <|special|> tokens, then BPE)
     std::vector<int> encode(const std::string& text) const;

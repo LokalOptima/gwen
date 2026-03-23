@@ -1,8 +1,187 @@
 #include "gwen/tokenizer.h"
 #include <algorithm>
 #include <sstream>
+#include <fstream>
 
 namespace gwen {
+
+// ============================================================
+// Load from HuggingFace model directory
+// ============================================================
+
+// Minimal JSON string parser — extracts vocab from tokenizer.json
+// Format: { "model": { "vocab": { "token": id, ... } }, "added_tokens": [...] }
+static std::unordered_map<std::string, int> parse_vocab_from_tokenizer_json(const std::string& path) {
+    std::ifstream f(path);
+    GWEN_CHECK(f.is_open(), ("Failed to open " + path).c_str());
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+
+    std::unordered_map<std::string, int> vocab;
+
+    // Find "vocab": { ... } section
+    size_t vocab_start = content.find("\"vocab\"");
+    if (vocab_start == std::string::npos) return vocab;
+    vocab_start = content.find('{', vocab_start);
+    if (vocab_start == std::string::npos) return vocab;
+    vocab_start++;
+
+    // Parse key-value pairs: "token": id
+    size_t pos = vocab_start;
+    int brace_depth = 1;
+    while (pos < content.size() && brace_depth > 0) {
+        // Skip whitespace
+        while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\n' ||
+               content[pos] == '\r' || content[pos] == '\t' || content[pos] == ',')) pos++;
+        if (pos >= content.size() || content[pos] == '}') { brace_depth--; pos++; continue; }
+        if (content[pos] == '{') { brace_depth++; pos++; continue; }
+
+        // Parse key (quoted string)
+        if (content[pos] != '"') { pos++; continue; }
+        pos++; // skip opening quote
+        std::string key;
+        while (pos < content.size() && content[pos] != '"') {
+            if (content[pos] == '\\' && pos + 1 < content.size()) {
+                pos++;
+                switch (content[pos]) {
+                    case 'n': key += '\n'; break;
+                    case 't': key += '\t'; break;
+                    case '\\': key += '\\'; break;
+                    case '"': key += '"'; break;
+                    case '/': key += '/'; break;
+                    case 'u': {
+                        // Parse \uXXXX
+                        if (pos + 4 < content.size()) {
+                            int cp = std::stoi(content.substr(pos + 1, 4), nullptr, 16);
+                            pos += 4;
+                            if (cp < 0x80) {
+                                key += (char)cp;
+                            } else if (cp < 0x800) {
+                                key += (char)(0xC0 | (cp >> 6));
+                                key += (char)(0x80 | (cp & 0x3F));
+                            } else {
+                                key += (char)(0xE0 | (cp >> 12));
+                                key += (char)(0x80 | ((cp >> 6) & 0x3F));
+                                key += (char)(0x80 | (cp & 0x3F));
+                            }
+                        }
+                        break;
+                    }
+                    default: key += content[pos]; break;
+                }
+            } else {
+                key += content[pos];
+            }
+            pos++;
+        }
+        if (pos < content.size()) pos++; // skip closing quote
+
+        // Skip colon
+        while (pos < content.size() && content[pos] != ':') pos++;
+        if (pos < content.size()) pos++;
+
+        // Skip whitespace
+        while (pos < content.size() && (content[pos] == ' ' || content[pos] == '\n' ||
+               content[pos] == '\r' || content[pos] == '\t')) pos++;
+
+        // Parse integer value
+        if (pos < content.size() && (content[pos] == '-' || (content[pos] >= '0' && content[pos] <= '9'))) {
+            size_t end;
+            int val = std::stoi(content.substr(pos), &end);
+            pos += end;
+            vocab[key] = val;
+        }
+    }
+
+    // Also parse added_tokens: [{ "id": N, "content": "...", ... }, ...]
+    size_t at_start = content.find("\"added_tokens\"");
+    if (at_start != std::string::npos) {
+        at_start = content.find('[', at_start);
+        if (at_start != std::string::npos) {
+            pos = at_start + 1;
+            while (pos < content.size() && content[pos] != ']') {
+                size_t obj_start = content.find('{', pos);
+                if (obj_start == std::string::npos) break;
+                size_t obj_end = content.find('}', obj_start);
+                if (obj_end == std::string::npos) break;
+                std::string obj = content.substr(obj_start, obj_end - obj_start + 1);
+
+                // Extract "id" and "content"
+                size_t id_pos = obj.find("\"id\"");
+                size_t ct_pos = obj.find("\"content\"");
+                if (id_pos != std::string::npos && ct_pos != std::string::npos) {
+                    id_pos = obj.find(':', id_pos) + 1;
+                    while (id_pos < obj.size() && obj[id_pos] == ' ') id_pos++;
+                    int id = std::stoi(obj.substr(id_pos));
+
+                    ct_pos = obj.find(':', ct_pos) + 1;
+                    while (ct_pos < obj.size() && obj[ct_pos] == ' ') ct_pos++;
+                    if (ct_pos < obj.size() && obj[ct_pos] == '"') {
+                        ct_pos++;
+                        size_t ct_end = obj.find('"', ct_pos);
+                        if (ct_end != std::string::npos) {
+                            std::string token = obj.substr(ct_pos, ct_end - ct_pos);
+                            vocab[token] = id;
+                        }
+                    }
+                }
+                pos = obj_end + 1;
+            }
+        }
+    }
+
+    return vocab;
+}
+
+std::unique_ptr<Tokenizer> Tokenizer::from_hf_dir(const std::string& dir) {
+    auto tok = std::make_unique<Tokenizer>();
+
+    // Load vocab from vocab.json (simpler format: { "token": id, ... })
+    auto vocab_map = parse_vocab_from_tokenizer_json(dir + "/vocab.json");
+    GWEN_CHECK(!vocab_map.empty(), "Failed to parse vocab from vocab.json");
+
+    // Build id_to_token (find max id)
+    int max_id = 0;
+    for (const auto& [token, id] : vocab_map) {
+        if (id > max_id) max_id = id;
+    }
+    tok->id_to_token_.resize(max_id + 1);
+    tok->token_to_id_.reserve(vocab_map.size());
+    for (const auto& [token, id] : vocab_map) {
+        tok->id_to_token_[id] = token;
+        tok->token_to_id_[token] = id;
+    }
+
+    // Load BPE merges from merges.txt
+    std::ifstream mf(dir + "/merges.txt");
+    if (mf.is_open()) {
+        std::string line;
+        int rank = 0;
+        while (std::getline(mf, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            tok->merge_rank_[line] = rank++;
+        }
+    }
+
+    // Special tokens (Qwen3.5 defaults)
+    auto find_special = [&](const std::string& name, int default_id) -> int {
+        auto it = tok->token_to_id_.find(name);
+        return (it != tok->token_to_id_.end()) ? it->second : default_id;
+    };
+    tok->eos_id_ = find_special("<|endoftext|>", 248046);
+    tok->pad_id_ = find_special("<|endoftext|>", 248055);
+
+    fprintf(stderr, "Tokenizer: %d tokens, %d merges (from %s)\n",
+            (int)tok->id_to_token_.size(), (int)tok->merge_rank_.size(), dir.c_str());
+    // Debug: verify basic tokens
+    auto check = [&](const std::string& s) {
+        auto it = tok->token_to_id_.find(s);
+        fprintf(stderr, "  '%s' → %s\n", s.c_str(),
+                it != tok->token_to_id_.end() ? std::to_string(it->second).c_str() : "NOT FOUND");
+    };
+    check("A"); check("The"); check("!");
+    return tok;
+}
 
 std::unique_ptr<Tokenizer> Tokenizer::from_gguf(const GGUFFile& gguf) {
     auto tok = std::make_unique<Tokenizer>();
