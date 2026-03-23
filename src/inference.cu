@@ -335,6 +335,8 @@ kernel_deltanet_prep(
     const half* __restrict__ x_norm,
     const void* __restrict__ alpha_w,
     const void* __restrict__ beta_w,
+    const float* __restrict__ alpha_scales,
+    const float* __restrict__ beta_scales,
     const float* __restrict__ ssm_a,
     const float* __restrict__ dt_bias,
     float* __restrict__ decay_out,
@@ -385,16 +387,19 @@ kernel_deltanet_prep(
     q[tid] = __float2half(q_val * s_q_inv);
     k[tid] = __float2half(k_val * s_k_inv);
 
-    // Gate and beta dot products
-    const block_q8_0* ab = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* bb = static_cast<const block_q8_0*>(beta_w);
-    int bph = n_embed / 32;
+    // Gate and beta dot products (FP8 E4M3 with per-head scales)
+    const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
+    const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
+    float a_scale = alpha_scales[head];
+    float b_scale = beta_scales[head];
     float aa = 0.0f, ba = 0.0f;
     for (int i = tid; i < n_embed; i += 128) {
-        int blk = i / 32, elem = i % 32, idx = head * bph + blk;
+        __nv_fp8_e4m3 a_fp8, b_fp8;
+        *reinterpret_cast<uint8_t*>(&a_fp8) = alpha_fp8[head * n_embed + i];
+        *reinterpret_cast<uint8_t*>(&b_fp8) = beta_fp8[head * n_embed + i];
         float x_val = __half2float(x_norm[i]);
-        aa += (__half2float(ab[idx].d) * (float)ab[idx].qs[elem]) * x_val;
-        ba += (__half2float(bb[idx].d) * (float)bb[idx].qs[elem]) * x_val;
+        aa += (float(a_fp8) * a_scale) * x_val;
+        ba += (float(b_fp8) * b_scale) * x_val;
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -478,8 +483,10 @@ kernel_deltanet_fused(
     half* __restrict__ k_in,            // [n_heads * dk] K from conv1d
     const half* __restrict__ v_in,      // [n_heads * dk] V from conv1d
     const half* __restrict__ x_norm,    // [n_embed] pre-attention norm (for gate/beta)
-    const void* __restrict__ alpha_w,   // Q8_0 [n_heads * n_embed/32 blocks]
-    const void* __restrict__ beta_w,    // Q8_0 [n_heads * n_embed/32 blocks]
+    const void* __restrict__ alpha_w,   // FP8 E4M3 [n_heads, n_embed]
+    const void* __restrict__ beta_w,    // FP8 E4M3 [n_heads, n_embed]
+    const float* __restrict__ alpha_scales, // [n_heads] per-row scales
+    const float* __restrict__ beta_scales,  // [n_heads] per-row scales
     const float* __restrict__ ssm_a,    // [n_heads]
     const float* __restrict__ dt_bias,  // [n_heads]
     half* __restrict__ output,          // [n_heads * dk]
@@ -546,19 +553,20 @@ kernel_deltanet_fused(
     sh_k[tid] = k_val * s_k_inv;
 
     // ---- Phase 2: Compute gate and beta (still overlapped with S load) ----
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-    int blocks_per_head = n_embed / 32;
+    // FP8 E4M3: raw bytes [n_heads, n_embed] + per-row float scales [n_heads]
+    const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
+    const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
+    float alpha_scale = alpha_scales[head];
+    float beta_scale = beta_scales[head];
 
     float alpha_acc = 0.0f, beta_acc = 0.0f;
     for (int i = tid; i < n_embed; i += 128) {
-        int blk = i / 32, elem = i % 32;
-        int blk_idx = head * blocks_per_head + blk;
-        float ad = __half2float(alpha_blocks[blk_idx].d);
-        float bd = __half2float(beta_blocks[blk_idx].d);
+        __nv_fp8_e4m3 a_fp8, b_fp8;
+        *reinterpret_cast<uint8_t*>(&a_fp8) = alpha_fp8[head * n_embed + i];
+        *reinterpret_cast<uint8_t*>(&b_fp8) = beta_fp8[head * n_embed + i];
         float x_val = __half2float(x_norm[i]);
-        alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
-        beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+        alpha_acc += (float(a_fp8) * alpha_scale) * x_val;
+        beta_acc += (float(b_fp8) * beta_scale) * x_val;
     }
 
     #pragma unroll
@@ -643,8 +651,10 @@ kernel_deltanet_fused_2tok(
     const half* __restrict__ v_in_b,    // [n_heads * dk]
     const half* __restrict__ x_norm_b,  // [n_embed]
     // Shared weights
-    const void* __restrict__ alpha_w,   // Q8_0 [n_heads * n_embed/32 blocks]
-    const void* __restrict__ beta_w,    // Q8_0 [n_heads * n_embed/32 blocks]
+    const void* __restrict__ alpha_w,   // FP8 E4M3 [n_heads, n_embed]
+    const void* __restrict__ beta_w,    // FP8 E4M3 [n_heads, n_embed]
+    const float* __restrict__ alpha_scales, // [n_heads] per-row scales
+    const float* __restrict__ beta_scales,  // [n_heads] per-row scales
     const float* __restrict__ ssm_a,    // [n_heads]
     const float* __restrict__ dt_bias,  // [n_heads]
     // Outputs
@@ -668,9 +678,10 @@ kernel_deltanet_fused_2tok(
     __shared__ float s_q_inv, s_k_inv, s_decay, s_beta;
 
     float* S_head = S + head * dk * dk;
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-    int blocks_per_head = n_embed / 32;
+    const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
+    const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
+    float a_scale = alpha_scales[head];
+    float b_scale = beta_scales[head];
 
     // ================================================================
     // TOKEN A
@@ -716,13 +727,12 @@ kernel_deltanet_fused_2tok(
     {
         float alpha_acc = 0.0f, beta_acc = 0.0f;
         for (int i = tid; i < n_embed; i += 128) {
-            int blk = i / 32, elem = i % 32;
-            int blk_idx = head * blocks_per_head + blk;
-            float ad = __half2float(alpha_blocks[blk_idx].d);
-            float bd = __half2float(beta_blocks[blk_idx].d);
+            __nv_fp8_e4m3 af, bf;
+            *reinterpret_cast<uint8_t*>(&af) = alpha_fp8[head * n_embed + i];
+            *reinterpret_cast<uint8_t*>(&bf) = beta_fp8[head * n_embed + i];
             float x_val = __half2float(x_norm_a[i]);
-            alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
-            beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+            alpha_acc += (float(af) * a_scale) * x_val;
+            beta_acc += (float(bf) * b_scale) * x_val;
         }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -814,13 +824,12 @@ kernel_deltanet_fused_2tok(
     {
         float alpha_acc = 0.0f, beta_acc = 0.0f;
         for (int i = tid; i < n_embed; i += 128) {
-            int blk = i / 32, elem = i % 32;
-            int blk_idx = head * blocks_per_head + blk;
-            float ad = __half2float(alpha_blocks[blk_idx].d);
-            float bd = __half2float(beta_blocks[blk_idx].d);
+            __nv_fp8_e4m3 af, bf;
+            *reinterpret_cast<uint8_t*>(&af) = alpha_fp8[head * n_embed + i];
+            *reinterpret_cast<uint8_t*>(&bf) = beta_fp8[head * n_embed + i];
             float x_val = __half2float(x_norm_b[i]);
-            alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
-            beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+            alpha_acc += (float(af) * a_scale) * x_val;
+            beta_acc += (float(bf) * b_scale) * x_val;
         }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -879,8 +888,10 @@ kernel_deltanet_fused_2tok(
 __global__ void __launch_bounds__(32)
 kernel_compute_gate_beta(
     const half* __restrict__ x,          // [n_embed] input
-    const void* __restrict__ alpha_w,    // [n_embed, n_heads] Q8_0
-    const void* __restrict__ beta_w,     // [n_embed, n_heads] Q8_0
+    const void* __restrict__ alpha_w,    // FP8 E4M3 [n_heads, n_embed]
+    const void* __restrict__ beta_w,     // FP8 E4M3 [n_heads, n_embed]
+    const float* __restrict__ alpha_scales, // [n_heads]
+    const float* __restrict__ beta_scales,  // [n_heads]
     const float* __restrict__ ssm_a,     // [n_heads] A parameter (negative)
     const float* __restrict__ dt_bias,   // [n_heads]
     float* __restrict__ gate_out,        // [n_heads] gate = ssm_a * softplus(alpha_proj + dt_bias)
@@ -891,25 +902,21 @@ kernel_compute_gate_beta(
     if (head >= n_heads) return;
     int lane = threadIdx.x;
 
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-
-    int blocks_per_head = n_embed / 32;
+    const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
+    const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
+    float a_scale = alpha_scales[head];
+    float b_scale = beta_scales[head];
 
     float alpha_acc = 0.0f;
     float beta_acc = 0.0f;
 
-    for (int b = lane; b < blocks_per_head; b += 32) {
-        const auto& ab = alpha_blocks[head * blocks_per_head + b];
-        const auto& bb = beta_blocks[head * blocks_per_head + b];
-        float ad = __half2float(ab.d);
-        float bd = __half2float(bb.d);
-
-        for (int j = 0; j < 32; j++) {
-            float x_val = __half2float(x[b * 32 + j]);
-            alpha_acc += (ad * ab.qs[j]) * x_val;
-            beta_acc += (bd * bb.qs[j]) * x_val;
-        }
+    for (int i = lane; i < n_embed; i += 32) {
+        __nv_fp8_e4m3 af, bf;
+        *reinterpret_cast<uint8_t*>(&af) = alpha_fp8[head * n_embed + i];
+        *reinterpret_cast<uint8_t*>(&bf) = beta_fp8[head * n_embed + i];
+        float x_val = __half2float(x[i]);
+        alpha_acc += (float(af) * a_scale) * x_val;
+        beta_acc += (float(bf) * b_scale) * x_val;
     }
 
     // Warp reduction
@@ -980,8 +987,10 @@ kernel_batch_conv1d_silu(
 __global__ void __launch_bounds__(32)
 kernel_batch_compute_gate_beta(
     const half* __restrict__ x_batch,     // [N, n_embed]
-    const void* __restrict__ alpha_w,     // Q8_0 [n_heads, n_embed/32] blocks
-    const void* __restrict__ beta_w,      // Q8_0 [n_heads, n_embed/32] blocks
+    const void* __restrict__ alpha_w,     // FP8 E4M3 [n_heads, n_embed]
+    const void* __restrict__ beta_w,      // FP8 E4M3 [n_heads, n_embed]
+    const float* __restrict__ alpha_scales, // [n_heads] per-row scales
+    const float* __restrict__ beta_scales,  // [n_heads] per-row scales
     const float* __restrict__ ssm_a,      // [n_heads]
     const float* __restrict__ dt_bias,    // [n_heads]
     float* __restrict__ gate_out,         // [N, n_heads]
@@ -994,23 +1003,21 @@ kernel_batch_compute_gate_beta(
     int lane = threadIdx.x;
 
     const half* x = x_batch + (size_t)t * n_embed;
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-    int blocks_per_head = n_embed / 32;
+    const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
+    const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
+    float a_scale = alpha_scales[head];
+    float b_scale = beta_scales[head];
 
     float alpha_acc = 0.0f;
     float beta_acc = 0.0f;
 
-    for (int b = lane; b < blocks_per_head; b += 32) {
-        const auto& ab = alpha_blocks[head * blocks_per_head + b];
-        const auto& bb = beta_blocks[head * blocks_per_head + b];
-        float ad = __half2float(ab.d);
-        float bd = __half2float(bb.d);
-        for (int j2 = 0; j2 < 32; j2++) {
-            float x_val = __half2float(x[b * 32 + j2]);
-            alpha_acc += (ad * ab.qs[j2]) * x_val;
-            beta_acc += (bd * bb.qs[j2]) * x_val;
-        }
+    for (int i = lane; i < n_embed; i += 32) {
+        __nv_fp8_e4m3 a_fp8, b_fp8;
+        *reinterpret_cast<uint8_t*>(&a_fp8) = alpha_fp8[head * n_embed + i];
+        *reinterpret_cast<uint8_t*>(&b_fp8) = beta_fp8[head * n_embed + i];
+        float x_val = __half2float(x[i]);
+        alpha_acc += (float(a_fp8) * a_scale) * x_val;
+        beta_acc += (float(b_fp8) * b_scale) * x_val;
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -3081,10 +3088,10 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             half* v = qkv + 2 * cfg.ssm_inner_size;
 
             // Fused: L2-norm(Q,K) + gate/beta + S update
-            // TODO Phase 5: update DeltaNet to read FP8 alpha/beta directly
             kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
                 state.S, q, k, v, x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 attn_out, q_scale,
@@ -3288,6 +3295,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 qa, ka, va, x_norm,
                 qb, kb, vb, b2_x_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 attn_out, b2_attn_out, snap,
@@ -4103,6 +4111,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_heads, N), 32, 0, s>>>(
                 pf_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 prefill_dn_gate, prefill_dn_beta,
@@ -4445,6 +4454,7 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
             kernel_batch_compute_gate_beta<<<dim3(n_heads, N), 32, 0, s>>>(
                 pf_norm,
                 w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 prefill_dn_gate, prefill_dn_beta,
