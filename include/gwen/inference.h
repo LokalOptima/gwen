@@ -133,7 +133,11 @@ struct InferenceState {
     float* prefill_ffn_gate_f32 = nullptr; // [max_prefill, n_ff] F32 FFN gate
     float* prefill_ffn_up_f32 = nullptr;   // [max_prefill, n_ff] F32 FFN up
     float* prefill_ffn_out_f32 = nullptr;  // [max_prefill, n_ff] F32 FFN SwiGLU output
-    half* prefill_temp_w = nullptr;  // mmq scratch buffer (Q8_1 quantized activations + stream-K fixup)
+    // FP8 GEMM prefill scratch
+    uint8_t* fp8_act_buf = nullptr;       // [max_prefill * max_K] FP8 quantized activations
+    float* sfb_act_buf = nullptr;         // [ceil(max_prefill/128) * ceil(max_K/128)] scale factors
+    void* gemm_fp8_workspace = nullptr;   // CUTLASS workspace
+    size_t gemm_fp8_ws_size = 0;
     half* prefill_ffn_gate = nullptr; // [max_prefill, n_ff]
     half* prefill_ffn_up = nullptr;   // [max_prefill, n_ff]
     half* prefill_ffn_out = nullptr;  // [max_prefill, n_ff]

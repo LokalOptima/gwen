@@ -265,6 +265,35 @@ void gwen_deltanet_decode(float* S, const half* q, const half* k, const half* v,
                           int n_heads, int dk, int dv, cudaStream_t stream = 0);
 
 // ============================================================
+// FP8 GEMM (CUTLASS 3.x SM120 — prefill path)
+// ============================================================
+
+// FP8×FP8 GEMM with groupwise scaling (per-row weight, per-block activation)
+// W_fp8: [M, K] FP8 E4M3 RowMajor, W_sfa: [M * ceil(K/128)] F32 scales
+// X_fp8: [K, N] FP8 E4M3 ColMajor (pre-quantized), X_sfb: scale factors
+// Y: [M, N] FP16 ColMajor output
+void gwen_gemm_fp8(const void* W_fp8, const float* W_sfa,
+                    const void* X_fp8, const float* X_sfb,
+                    half* Y,
+                    int out_features, int in_features, int seq_len,
+                    void* workspace, size_t workspace_size,
+                    cudaStream_t stream = 0);
+
+// Quantize FP16 activations to FP8 E4M3 with per-block scaling
+// input: [N, K] FP16 row-major, output_fp8: [K, N] FP8 col-major (same memory)
+// output_sfb: [ceil(N/128) * ceil(K/128)] F32 scale factors
+void gwen_quantize_fp16_to_fp8(const half* input, void* output_fp8, float* output_sfb,
+                                 int K, int N, cudaStream_t stream = 0);
+
+// Replicate per-row scales to CUTLASS SFA format
+// row_scales: [M] F32, sfa: [M * n_k_blocks] F32
+void gwen_replicate_fp8_scales(const float* row_scales, float* sfa,
+                                 int M, int n_k_blocks, cudaStream_t stream = 0);
+
+// Query CUTLASS workspace size for FP8 GEMM
+size_t gwen_gemm_fp8_workspace_size(int max_M, int max_K, int max_N);
+
+// ============================================================
 // GEMM (for prefill — batch of tokens)
 // ============================================================
 
@@ -291,23 +320,6 @@ void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
                      int out_features, int in_features, int seq_len,
                      cudaStream_t stream = 0);
 
-// ============================================================
-// Fused quantized GEMM (no pre-dequant, no FP16 weight copy)
-// ============================================================
-
-// Fused quantized GEMM via llama.cpp's mmq kernel.
-// Reads Q4_K/Q5_K/Q6_K/Q8_0 weights directly — no pre-dequant, no FP16 copy.
-// scratch: temp buffer (see gwen_gemm_mmq_scratch_size for required size)
-void gwen_gemm_mmq(const void* W, GGMLType type, const half* X, half* Y, void* scratch,
-                     int out_features, int in_features, int seq_len,
-                     cudaStream_t stream = 0);
-
-// Compute scratch buffer size needed for gwen_gemm_mmq
-inline size_t gwen_gemm_mmq_scratch_size(int M, int K, int N) {
-    int K_padded = (K + 511) / 512 * 512;
-    return (size_t)(K_padded / 128) * N * 144         // Q8_1_mmq blocks
-         + 70 * 128 * 128 * sizeof(float);            // stream-K fixup (F32)
-}
 
 // ============================================================
 // Reduction: logsumexp + p_idk (for training server p_idk)

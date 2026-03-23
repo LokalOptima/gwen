@@ -1,4 +1,5 @@
 #include "gwen/model.h"
+#include "gwen/kernels.h"
 #include <fstream>
 #include <unordered_map>
 
@@ -558,6 +559,42 @@ void Model::upload_weights(CudaAllocator& allocator) {
             upload_weight(allocator, w.ffn_down);
         }
     }
+
+    // Precompute CUTLASS SFA scale arrays for FP8 weight tensors
+    // Replicates per-row scales across K-blocks: sfa[row * n_k_blocks + kb] = scale[row]
+    auto prepare_sfa = [&](WeightRef& w) {
+        if (w.type != GGMLType::FP8_E4M3 || !w.device_scales || w.shape.size() < 2) return;
+        int M = (int)w.shape[0];      // out_features (rows)
+        int K = (int)w.shape[1];      // in_features (cols)
+        int n_k_blocks = (K + 127) / 128;
+        w.sfa_n_k_blocks = n_k_blocks;
+        size_t sfa_bytes = (size_t)M * n_k_blocks * sizeof(float);
+        w.device_sfa = static_cast<float*>(allocator.alloc(sfa_bytes));
+        gwen_replicate_fp8_scales(w.device_scales, w.device_sfa, M, n_k_blocks);
+    };
+
+    for (auto& layer : layers) {
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            prepare_sfa(w.attn_q);
+            prepare_sfa(w.attn_k);
+            prepare_sfa(w.attn_v);
+            prepare_sfa(w.attn_output);
+            prepare_sfa(w.ffn_gate);
+            prepare_sfa(w.ffn_up);
+            prepare_sfa(w.ffn_down);
+        } else {
+            auto& w = layer.deltanet;
+            prepare_sfa(w.attn_qkv);
+            prepare_sfa(w.attn_gate);
+            prepare_sfa(w.ssm_out);
+            prepare_sfa(w.ffn_gate);
+            prepare_sfa(w.ffn_up);
+            prepare_sfa(w.ffn_down);
+        }
+    }
+    prepare_sfa(token_embd);
+    GWEN_CHECK_CUDA(cudaDeviceSynchronize());
 
     // Upload reduced LM head if loaded
     if (has_reduced_lm_head) {

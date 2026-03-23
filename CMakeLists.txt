@@ -27,7 +27,8 @@ set(LLAMA_CPP_PATH "$ENV{HOME}/git/llama.cpp" CACHE PATH "Path to llama.cpp sour
 # --- Library: gwen core ---
 file(GLOB GWEN_KERNEL_SOURCES src/kernels/*.cu)
 list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "fattn_mma\\.cu$")
-list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_mmq\\.cu$")
+list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_mmq\\.cu$")   # legacy Q4_K GEMM, no longer linked
+list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_fp8\\.cu$")   # separate lib with 120a arch
 
 set(GWEN_SOURCES
     ${GWEN_KERNEL_SOURCES}
@@ -55,18 +56,20 @@ if(EXISTS ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda/common.cuh)
         ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
     )
     set_target_properties(gwen_fattn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-    # MMQ fused Q4_K GEMM (same llama.cpp headers)
-    add_library(gwen_mmq STATIC src/kernels/gemm_mmq.cu)
-    target_include_directories(gwen_mmq PRIVATE
-        include
-        ${LLAMA_CPP_PATH}/ggml/include
-        ${LLAMA_CPP_PATH}/ggml/src
-        ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
-    )
-    set_target_properties(gwen_mmq PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    target_link_libraries(gwen_core gwen_fattn)
+    message(STATUS "llama.cpp found — MMA flash attention enabled")
 
-    target_link_libraries(gwen_core gwen_fattn gwen_mmq)
-    message(STATUS "llama.cpp found — MMA flash attention + MMQ GEMM enabled")
+    # --- FP8 GEMM (CUTLASS 3.x SM120 blockwise scaling) ---
+    # Requires 120a for block-scaled MMA instructions (SM120 "all features")
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_fp8.cu)
+        add_library(gwen_fp8_gemm STATIC src/kernels/gemm_fp8.cu)
+        target_include_directories(gwen_fp8_gemm PRIVATE include)
+        set_target_properties(gwen_fp8_gemm PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_ARCHITECTURES "120a")
+        target_link_libraries(gwen_core gwen_fp8_gemm)
+        message(STATUS "FP8 GEMM (CUTLASS 3.x SM120a) enabled")
+    endif()
 else()
     message(WARNING "llama.cpp not found at ${LLAMA_CPP_PATH} — MMA flash attention disabled")
 endif()

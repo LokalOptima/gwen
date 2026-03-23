@@ -20,6 +20,10 @@ struct WeightRef {
     float* device_scales = nullptr;       // GPU pointer for scales
     uint32_t n_scale_rows = 0;            // number of scale values
 
+    // CUTLASS SFA scale array (per-row scales replicated across K-blocks)
+    float* device_sfa = nullptr;          // [M * ceil(K/128)] for CUTLASS groupwise GEMM
+    int sfa_n_k_blocks = 0;              // ceil(K / 128)
+
     bool on_device() const { return device_data != nullptr; }
 };
 
