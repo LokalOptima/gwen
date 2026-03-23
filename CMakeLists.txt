@@ -111,10 +111,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/bench/micro_bench.cu)
     target_link_libraries(micro_bench gwen_core)
 endif()
 
-if(EXISTS ${CMAKE_SOURCE_DIR}/bench/bench_gemm_approaches.cu)
-    add_executable(bench_gemm_approaches bench/bench_gemm_approaches.cu)
-    target_link_libraries(bench_gemm_approaches gwen_core)
-endif()
+# bench_gemm_approaches: disabled (references removed gwen_gemm_mmq Q4_K path)
 
 # --- Kernel tests ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_kernels.cu)

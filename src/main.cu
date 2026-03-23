@@ -96,10 +96,18 @@ int main(int argc, char** argv) {
 
     (void)output_logits;
 
-    // Positional argument after flags = input text
+    // Positional arguments: [model_path] [input_text]
+    // If first positional arg looks like a model file (ends in .gguf or .gwfp8), treat it as model path
     std::string input_text;
-    if (optind < argc) {
-        input_text = argv[optind];
+    for (int i = optind; i < argc; i++) {
+        std::string arg = argv[i];
+        if (model_path.empty() && (arg.size() >= 5 && (arg.substr(arg.size() - 5) == ".gguf" ||
+            (arg.size() >= 6 && arg.substr(arg.size() - 6) == ".gwfp8")))) {
+            model_path = arg;
+        } else {
+            if (!input_text.empty()) input_text += " ";
+            input_text += arg;
+        }
     }
 
     // Apply defaults from ~/.cache/gwen/ (auto-download if needed)

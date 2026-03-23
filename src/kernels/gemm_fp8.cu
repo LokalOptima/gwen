@@ -130,6 +130,8 @@ static void run_gemm_fp8(
     auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, 1));
     auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(M, N, K, 1));
 
+    auto* D_ptr = reinterpret_cast<ElementD*>(reinterpret_cast<void*>(D));
+
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {M, N, K, 1},
@@ -141,8 +143,8 @@ static void run_gemm_fp8(
         },
         {
             {},  // epilogue.thread (alpha/beta)
-            nullptr, stride_D,    // C (unused, beta=0)
-            reinterpret_cast<ElementD*>(reinterpret_cast<void*>(D)), stride_D
+            D_ptr, stride_D,    // C — must be valid pointer for TMA descriptor (beta=0, not read)
+            D_ptr, stride_D
         }
     };
 
@@ -254,12 +256,14 @@ kernel_quantize_fp16_to_fp8(
     }
 
     // Write scale factor (one per block)
+    // CUTLASS expects column-major [N_blocks, K_blocks]: index = k_block * n_n_blocks + n_block
     if (tid == 0) {
-        scales[n_block * n_k_blocks + k_block] = scale;
+        int n_n_blocks = gridDim.x;
+        scales[k_block * n_n_blocks + n_block] = scale;
     }
 }
 
-// Replicate per-row scales to SFA format: sfa[row * n_k_blocks + kb] = scale[row]
+// Replicate per-row scales to SFA format (column-major [M, K_blocks]): sfa[kb * M + row] = scale[row]
 __global__ void __launch_bounds__(256)
 kernel_replicate_row_scales(
     const float* __restrict__ row_scales,   // [M]
@@ -270,19 +274,21 @@ kernel_replicate_row_scales(
     if (row >= M) return;
 
     float scale = row_scales[row];
+    // CUTLASS expects column-major [M, K_blocks]: index = kb * M + row
     for (int kb = threadIdx.x; kb < n_k_blocks; kb += blockDim.x) {
-        sfa[row * n_k_blocks + kb] = scale;
+        sfa[kb * M + row] = scale;
     }
 }
 
 
-// Transpose BF16 [M, N] RowMajor → FP16 [N, M] RowMajor (= ColumnMajor [M, N])
-// Grid: (ceil(N, 32), ceil(M, 32))  Block: (32, 8)  — tiled transpose
+// Transpose BF16 [M, N_stride] RowMajor → FP16 [N, M] RowMajor (= ColumnMajor [M, N])
+// Only first N_out columns are read/written (N_stride may be padded).
+// Grid: (ceil(N_out, 32), ceil(M, 32))  Block: (32, 8)  — tiled transpose
 __global__ void __launch_bounds__(256)
 kernel_transpose_bf16_to_fp16(
-    const __nv_bfloat16* __restrict__ src,  // [M, N] RowMajor
-    half* __restrict__ dst,                 // [N, M] RowMajor
-    int M, int N)
+    const __nv_bfloat16* __restrict__ src,  // [M, N_stride] RowMajor
+    half* __restrict__ dst,                 // [N_out, M] RowMajor
+    int M, int N_out, int N_stride)
 {
     __shared__ float tile[32][33];  // 33 to avoid bank conflicts
 
@@ -293,8 +299,8 @@ kernel_transpose_bf16_to_fp16(
     for (int i = threadIdx.y; i < 32; i += 8) {
         int row = by + i;
         int col = bx + threadIdx.x;
-        if (row < M && col < N) {
-            tile[i][threadIdx.x] = __bfloat162float(src[row * N + col]);
+        if (row < M && col < N_out) {
+            tile[i][threadIdx.x] = __bfloat162float(src[row * N_stride + col]);
         } else {
             tile[i][threadIdx.x] = 0.0f;
         }
@@ -305,7 +311,7 @@ kernel_transpose_bf16_to_fp16(
     for (int i = threadIdx.y; i < 32; i += 8) {
         int row = bx + i;         // was column, now row
         int col = by + threadIdx.x;  // was row, now column
-        if (row < N && col < M) {
+        if (row < N_out && col < M) {
             dst[row * M + col] = __float2half(tile[threadIdx.x][i]);
         }
     }
@@ -329,7 +335,7 @@ void gwen_gemm_fp8(
     int M = out_features, K = in_features, N = seq_len;
     int N_padded = (N + 127) / 128 * 128;
 
-    // Workspace layout: [CUTLASS workspace | BF16 temp output]
+    // Workspace layout: [BF16 temp output | CUTLASS workspace]
     // BF16 temp: M * N_padded * 2 bytes
     size_t bf16_temp_bytes = (size_t)M * N_padded * sizeof(__nv_bfloat16);
     size_t cutlass_ws_offset = bf16_temp_bytes;
@@ -358,7 +364,7 @@ void gwen_gemm_fp8(
     dim3 grid_t((N + 31) / 32, (M + 31) / 32);
     dim3 block_t(32, 8);
     kernel_transpose_bf16_to_fp16<<<grid_t, block_t, 0, stream>>>(
-        bf16_temp, Y, M, N);
+        bf16_temp, Y, M, N, N_padded);
 #else
     GWEN_CHECK(false, "FP8 GEMM requires SM120 support (CUDA 12.8+)");
 #endif
