@@ -8,142 +8,104 @@
 //
 // Effective value: fp4_val * e4m3_block_scale * float32_global_scale
 //
-// Kernel architecture: 256 threads/block, 1 block per output row
-// Inner loop: 128-bit vectorized weight loads → 32 FP4 elements per float4
-// FP4→FP16 via 16-entry constant-memory LUT
-// F32 accumulation throughout (bandwidth-bound, compute is free)
+// Architecture: 256 threads/block, 1 row per block, 8 FP4 elements per thread per iteration.
+// 8 elements = 4 packed bytes (uint32 load), 1 E4M3 scale (shared with adjacent 8 elements).
+// For K=2560: all 256 threads active. For K=9216: 4-5 iterations per thread.
 
 #include "gwen/common.h"
 #include <cuda_fp16.h>
 
 namespace gwen {
 
-// ============================================================
-// FP4 E2M1 value table (16 entries → FP16 bit patterns)
-// ============================================================
-// Encoding: [sign(1)][exp(2)][mantissa(1)]
-// 0000=+0.0  0001=+0.5  0010=+1.0  0011=+1.5
-// 0100=+2.0  0101=+3.0  0110=+4.0  0111=+6.0
-// 1000=-0.0  1001=-0.5  1010=-1.0  1011=-1.5
-// 1100=-2.0  1101=-3.0  1110=-4.0  1111=-6.0
-
+// FP4 E2M1 LUT: 16 entries as FP16 bit patterns
 static __device__ __constant__ uint16_t fp4_lut[16] = {
-    0x0000, // +0.0
-    0x3800, // +0.5
-    0x3C00, // +1.0
-    0x3E00, // +1.5
-    0x4000, // +2.0
-    0x4200, // +3.0
-    0x4400, // +4.0
-    0x4600, // +6.0
-    0x8000, // -0.0
-    0xB800, // -0.5
-    0xBC00, // -1.0
-    0xBE00, // -1.5
-    0xC000, // -2.0
-    0xC200, // -3.0
-    0xC400, // -4.0
-    0xC600, // -6.0
+    0x0000, 0x3800, 0x3C00, 0x3E00,  // +0.0, +0.5, +1.0, +1.5
+    0x4000, 0x4200, 0x4400, 0x4600,  // +2.0, +3.0, +4.0, +6.0
+    0x8000, 0xB800, 0xBC00, 0xBE00,  // -0.0, -0.5, -1.0, -1.5
+    0xC000, 0xC200, 0xC400, 0xC600,  // -2.0, -3.0, -4.0, -6.0
+};
+
+// Single E4M3 byte → float via PTX (pack with zero byte, convert pair, take low half)
+static __device__ __forceinline__ float e4m3_to_float_ptx(uint8_t val) {
+    uint16_t packed = val;  // zero-extends: low=val, high=0
+    uint32_t result;
+    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(result) : "h"(packed));
+    half2 h2 = reinterpret_cast<half2 const&>(result);
+    return __half2float(__low2half(h2));
+}
+
+// Paired E4M3 conversion (for 32-element iterations)
+static __device__ __forceinline__ half2 e4m3x2_to_half2(uint16_t packed) {
+    uint32_t result;
+    asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(result) : "h"(packed));
+    return reinterpret_cast<half2 const&>(result);
+}
+
+// Pre-computed FP4 LUT as floats (loaded into shared memory at block start)
+static __device__ __constant__ float fp4_lut_f32[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
 };
 
 // ============================================================
-// E4M3 FP8 → float conversion (for micro-scales)
+// Inner dot product: 8 FP4 elements per thread per iteration
 // ============================================================
-__device__ __forceinline__ float e4m3_to_float(uint8_t val) {
-    // E4M3: [sign(1)][exp(4)][mantissa(3)], bias=7, no inf/nan
-    uint32_t sign = (val >> 7) & 1;
-    uint32_t exp = (val >> 3) & 0xF;
-    uint32_t mant = val & 0x7;
-
-    float result;
-    if (exp == 0) {
-        // Subnormal: (-1)^s × 2^(-6) × (0.mantissa)
-        result = ldexpf((float)mant / 8.0f, -6);
-    } else {
-        // Normal: (-1)^s × 2^(exp-7) × (1.mantissa)
-        result = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
-    }
-    return sign ? -result : result;
-}
-
-// ============================================================
-// Inner dot product: FP4 weights × FP16 input, with block scales
-// ============================================================
-// Each thread processes 32 FP4 elements per iteration (16 bytes of packed data)
-// Block scales: 1 E4M3 scale per 16 FP4 elements → 2 scales per 32-element chunk
+// Shared memory float LUT eliminates per-element half→float conversion
+// and avoids constant memory serialization on divergent accesses.
 
 template <int BLOCK_DIM>
-__device__ float fp4_dot_partial(
-    const uint8_t* __restrict__ W_row,        // [in_features/2] packed FP4
-    const uint8_t* __restrict__ scales_row,   // [in_features/16] E4M3 scales
-    const half* __restrict__ x,               // [in_features] FP16
-    int in_features)
+__device__ __forceinline__ float fp4_dot_partial(
+    const uint8_t* __restrict__ W_row,
+    const uint8_t* __restrict__ scales_row,
+    const half* __restrict__ x,
+    int K,
+    const float* __restrict__ lut)  // shared memory LUT
 {
     int tid = threadIdx.x;
     float sumf = 0.0f;
 
-    // Each iteration: 32 FP4 elements = 16 bytes of weight data
-    // 2 micro-scale blocks of 16 elements each
-    for (int j = tid * 32; j < in_features; j += BLOCK_DIM * 32) {
-        // Load 16 bytes = 32 packed FP4 values via 128-bit vector load
-        float4 w128 = *reinterpret_cast<const float4*>(W_row + j / 2);
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&w128);
+    for (int j = tid * 8; j < K; j += BLOCK_DIM * 8) {
+        uint32_t w32 = *reinterpret_cast<const uint32_t*>(W_row + j / 2);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&w32);
 
-        // Load 2 block scales (each covers 16 elements)
-        int scale_idx = j / 16;
-        float s0 = e4m3_to_float(scales_row[scale_idx]);
-        float s1 = e4m3_to_float(scales_row[scale_idx + 1]);
+        float s = e4m3_to_float_ptx(scales_row[j / 16]);
 
-        // Process first 16 elements (8 bytes, scale s0)
-        for (int k = 0; k < 8; k++) {
+        const half2* xp = reinterpret_cast<const half2*>(x + j);
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
             uint8_t b = bytes[k];
-            float w_lo = __half2float(__ushort_as_half(fp4_lut[b & 0xF])) * s0;
-            float w_hi = __half2float(__ushort_as_half(fp4_lut[b >> 4])) * s0;
-            float x0 = __half2float(x[j + k * 2]);
-            float x1 = __half2float(x[j + k * 2 + 1]);
-            sumf = fmaf(w_lo, x0, sumf);
-            sumf = fmaf(w_hi, x1, sumf);
-        }
-
-        // Process next 16 elements (8 bytes, scale s1)
-        for (int k = 8; k < 16; k++) {
-            uint8_t b = bytes[k];
-            float w_lo = __half2float(__ushort_as_half(fp4_lut[b & 0xF])) * s1;
-            float w_hi = __half2float(__ushort_as_half(fp4_lut[b >> 4])) * s1;
-            float x0 = __half2float(x[j + k * 2]);
-            float x1 = __half2float(x[j + k * 2 + 1]);
-            sumf = fmaf(w_lo, x0, sumf);
-            sumf = fmaf(w_hi, x1, sumf);
+            float w_lo = lut[b & 0xF] * s;
+            float w_hi = lut[b >> 4] * s;
+            float2 xf = __half22float2(xp[k]);
+            sumf = fmaf(w_lo, xf.x, sumf);
+            sumf = fmaf(w_hi, xf.y, sumf);
         }
     }
     return sumf;
 }
 
-// ============================================================
-// Warp + cross-warp reduction
-// ============================================================
+// Reduction: warp shuffle + cross-warp shared memory
 template <int BLOCK_DIM>
-__device__ float reduce_sum(float val) {
-    constexpr int N_WARPS = BLOCK_DIM / 32;
-
-    // Intra-warp reduction
+__device__ __forceinline__ float reduce_sum(float sumf, int tid) {
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
 
-    // Cross-warp via shared memory
+    constexpr int N_WARPS = BLOCK_DIM / 32;
     __shared__ float warp_sums[N_WARPS];
-    int warp_id = threadIdx.x / 32;
-    int lane = threadIdx.x % 32;
-
-    if (lane == 0) warp_sums[warp_id] = val;
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    if (lane == 0) warp_sums[warp_id] = sumf;
     __syncthreads();
 
     if (warp_id == 0) {
-        val = (lane < N_WARPS) ? warp_sums[lane] : 0.0f;
+        sumf = (lane < N_WARPS) ? warp_sums[lane] : 0.0f;
+        #pragma unroll
         for (int offset = N_WARPS / 2; offset > 0; offset >>= 1)
-            val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+            sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
     }
-    return val;
+    return sumf;
 }
 
 // ============================================================
@@ -151,23 +113,28 @@ __device__ float reduce_sum(float val) {
 // ============================================================
 __global__ void __launch_bounds__(256)
 kernel_gemv_fp4(
-    const uint8_t* __restrict__ W,         // [M, K/2] packed FP4
-    const uint8_t* __restrict__ scales,    // [M, K/16] E4M3 micro-scales
-    float global_scale,                     // per-tensor scale
-    const half* __restrict__ x,            // [K] FP16 input
-    half* __restrict__ y,                  // [M] FP16 output
+    const uint8_t* __restrict__ W,
+    const uint8_t* __restrict__ scales,
+    float global_scale,
+    const half* __restrict__ x,
+    half* __restrict__ y,
     int M, int K)
 {
+    __shared__ float lut[16];
+    int tid = threadIdx.x;
+    if (tid < 16) lut[tid] = fp4_lut_f32[tid];
+    __syncthreads();
+
     int row = blockIdx.x;
     if (row >= M) return;
 
     const uint8_t* W_row = W + (size_t)row * (K / 2);
     const uint8_t* S_row = scales + (size_t)row * (K / 16);
 
-    float sumf = fp4_dot_partial<256>(W_row, S_row, x, K);
-    sumf = reduce_sum<256>(sumf);
+    float sumf = fp4_dot_partial<256>(W_row, S_row, x, K, lut);
+    sumf = reduce_sum<256>(sumf, tid);
 
-    if (threadIdx.x == 0)
+    if (tid == 0)
         y[row] = __float2half(sumf * global_scale);
 }
 
@@ -184,16 +151,21 @@ kernel_gemv_fp4_residual_f32(
     const float* __restrict__ residual_f32,
     int M, int K)
 {
+    __shared__ float lut[16];
+    int tid = threadIdx.x;
+    if (tid < 16) lut[tid] = fp4_lut_f32[tid];
+    __syncthreads();
+
     int row = blockIdx.x;
     if (row >= M) return;
 
     const uint8_t* W_row = W + (size_t)row * (K / 2);
     const uint8_t* S_row = scales + (size_t)row * (K / 16);
 
-    float sumf = fp4_dot_partial<256>(W_row, S_row, x, K);
-    sumf = reduce_sum<256>(sumf);
+    float sumf = fp4_dot_partial<256>(W_row, S_row, x, K, lut);
+    sumf = reduce_sum<256>(sumf, tid);
 
-    if (threadIdx.x == 0)
+    if (tid == 0)
         y_f32[row] = sumf * global_scale + residual_f32[row];
 }
 
@@ -209,72 +181,64 @@ kernel_gemv_fp4_batch2(
     half* __restrict__ y0, half* __restrict__ y1,
     int M, int K)
 {
+    __shared__ float lut[16];
+    int tid = threadIdx.x;
+    if (tid < 16) lut[tid] = fp4_lut_f32[tid];
+    __syncthreads();
+
     int row = blockIdx.x;
     if (row >= M) return;
-    int tid = threadIdx.x;
 
     const uint8_t* W_row = W + (size_t)row * (K / 2);
     const uint8_t* S_row = scales + (size_t)row * (K / 16);
 
     float sf0 = 0.0f, sf1 = 0.0f;
 
-    for (int j = tid * 32; j < K; j += 256 * 32) {
-        float4 w128 = *reinterpret_cast<const float4*>(W_row + j / 2);
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&w128);
+    for (int j = tid * 8; j < K; j += 256 * 8) {
+        uint32_t w32 = *reinterpret_cast<const uint32_t*>(W_row + j / 2);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&w32);
 
-        int scale_idx = j / 16;
-        float s0 = e4m3_to_float(S_row[scale_idx]);
-        float s1 = e4m3_to_float(S_row[scale_idx + 1]);
+        float s = e4m3_to_float_ptx(S_row[j / 16]);
 
-        // First 16 elements (scale s0)
-        for (int k = 0; k < 8; k++) {
+        const half2* xp0 = reinterpret_cast<const half2*>(x0 + j);
+        const half2* xp1 = reinterpret_cast<const half2*>(x1 + j);
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
             uint8_t b = bytes[k];
-            float w_lo = __half2float(__ushort_as_half(fp4_lut[b & 0xF])) * s0;
-            float w_hi = __half2float(__ushort_as_half(fp4_lut[b >> 4])) * s0;
-            int idx = j + k * 2;
-            sf0 = fmaf(w_lo, __half2float(x0[idx]), sf0);
-            sf0 = fmaf(w_hi, __half2float(x0[idx + 1]), sf0);
-            sf1 = fmaf(w_lo, __half2float(x1[idx]), sf1);
-            sf1 = fmaf(w_hi, __half2float(x1[idx + 1]), sf1);
-        }
-
-        // Next 16 elements (scale s1)
-        for (int k = 8; k < 16; k++) {
-            uint8_t b = bytes[k];
-            float w_lo = __half2float(__ushort_as_half(fp4_lut[b & 0xF])) * s1;
-            float w_hi = __half2float(__ushort_as_half(fp4_lut[b >> 4])) * s1;
-            int idx = j + k * 2;
-            sf0 = fmaf(w_lo, __half2float(x0[idx]), sf0);
-            sf0 = fmaf(w_hi, __half2float(x0[idx + 1]), sf0);
-            sf1 = fmaf(w_lo, __half2float(x1[idx]), sf1);
-            sf1 = fmaf(w_hi, __half2float(x1[idx + 1]), sf1);
+            float w_lo = lut[b & 0xF] * s;
+            float w_hi = lut[b >> 4] * s;
+            float2 xf0 = __half22float2(xp0[k]);
+            float2 xf1 = __half22float2(xp1[k]);
+            sf0 = fmaf(w_lo, xf0.x, sf0); sf0 = fmaf(w_hi, xf0.y, sf0);
+            sf1 = fmaf(w_lo, xf1.x, sf1); sf1 = fmaf(w_hi, xf1.y, sf1);
         }
     }
 
-    // Reduce both sums
-    constexpr int N_WARPS = 8;
-    __shared__ float warp_s0[N_WARPS], warp_s1[N_WARPS];
-    int warp_id = tid / 32, lane = tid % 32;
-
+    // Dual reduction
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sf0 += __shfl_xor_sync(0xFFFFFFFF, sf0, offset);
         sf1 += __shfl_xor_sync(0xFFFFFFFF, sf1, offset);
     }
-    if (lane == 0) { warp_s0[warp_id] = sf0; warp_s1[warp_id] = sf1; }
+
+    __shared__ float tmp[2][8];
+    int warp_id = tid / 32, lane = tid % 32;
+    if (lane == 0) { tmp[0][warp_id] = sf0; tmp[1][warp_id] = sf1; }
     __syncthreads();
 
     if (warp_id == 0) {
-        sf0 = (lane < N_WARPS) ? warp_s0[lane] : 0.0f;
-        sf1 = (lane < N_WARPS) ? warp_s1[lane] : 0.0f;
-        for (int offset = N_WARPS / 2; offset > 0; offset >>= 1) {
-            sf0 += __shfl_xor_sync(0xFFFFFFFF, sf0, offset);
-            sf1 += __shfl_xor_sync(0xFFFFFFFF, sf1, offset);
+        sf0 = (lane < 8) ? tmp[0][lane] : 0.0f;
+        sf1 = (lane < 8) ? tmp[1][lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            sf0 += __shfl_xor_sync(0xFF, sf0, offset);
+            sf1 += __shfl_xor_sync(0xFF, sf1, offset);
         }
-    }
-
-    if (tid == 0) {
-        y0[row] = __float2half(sf0 * global_scale);
-        y1[row] = __float2half(sf1 * global_scale);
+        if (lane == 0) {
+            y0[row] = __float2half(sf0 * global_scale);
+            y1[row] = __float2half(sf1 * global_scale);
+        }
     }
 }
 
@@ -291,69 +255,63 @@ kernel_gemv_fp4_batch2_residual_f32(
     const float* __restrict__ res0_f32, const float* __restrict__ res1_f32,
     int M, int K)
 {
+    __shared__ float lut[16];
+    int tid = threadIdx.x;
+    if (tid < 16) lut[tid] = fp4_lut_f32[tid];
+    __syncthreads();
+
     int row = blockIdx.x;
     if (row >= M) return;
-    int tid = threadIdx.x;
 
     const uint8_t* W_row = W + (size_t)row * (K / 2);
     const uint8_t* S_row = scales + (size_t)row * (K / 16);
 
     float sf0 = 0.0f, sf1 = 0.0f;
 
-    for (int j = tid * 32; j < K; j += 256 * 32) {
-        float4 w128 = *reinterpret_cast<const float4*>(W_row + j / 2);
-        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&w128);
+    for (int j = tid * 8; j < K; j += 256 * 8) {
+        uint32_t w32 = *reinterpret_cast<const uint32_t*>(W_row + j / 2);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&w32);
 
-        int scale_idx = j / 16;
-        float s0 = e4m3_to_float(S_row[scale_idx]);
-        float s1 = e4m3_to_float(S_row[scale_idx + 1]);
+        float s = e4m3_to_float_ptx(S_row[j / 16]);
 
-        for (int k = 0; k < 8; k++) {
+        const half2* xp0 = reinterpret_cast<const half2*>(x0 + j);
+        const half2* xp1 = reinterpret_cast<const half2*>(x1 + j);
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
             uint8_t b = bytes[k];
-            float w_lo = __half2float(__ushort_as_half(fp4_lut[b & 0xF])) * s0;
-            float w_hi = __half2float(__ushort_as_half(fp4_lut[b >> 4])) * s0;
-            int idx = j + k * 2;
-            sf0 = fmaf(w_lo, __half2float(x0[idx]), sf0);
-            sf0 = fmaf(w_hi, __half2float(x0[idx + 1]), sf0);
-            sf1 = fmaf(w_lo, __half2float(x1[idx]), sf1);
-            sf1 = fmaf(w_hi, __half2float(x1[idx + 1]), sf1);
-        }
-
-        for (int k = 8; k < 16; k++) {
-            uint8_t b = bytes[k];
-            float w_lo = __half2float(__ushort_as_half(fp4_lut[b & 0xF])) * s1;
-            float w_hi = __half2float(__ushort_as_half(fp4_lut[b >> 4])) * s1;
-            int idx = j + k * 2;
-            sf0 = fmaf(w_lo, __half2float(x0[idx]), sf0);
-            sf0 = fmaf(w_hi, __half2float(x0[idx + 1]), sf0);
-            sf1 = fmaf(w_lo, __half2float(x1[idx]), sf1);
-            sf1 = fmaf(w_hi, __half2float(x1[idx + 1]), sf1);
+            float w_lo = lut[b & 0xF] * s;
+            float w_hi = lut[b >> 4] * s;
+            float2 xf0 = __half22float2(xp0[k]);
+            float2 xf1 = __half22float2(xp1[k]);
+            sf0 = fmaf(w_lo, xf0.x, sf0); sf0 = fmaf(w_hi, xf0.y, sf0);
+            sf1 = fmaf(w_lo, xf1.x, sf1); sf1 = fmaf(w_hi, xf1.y, sf1);
         }
     }
 
-    constexpr int N_WARPS = 8;
-    __shared__ float warp_s0[N_WARPS], warp_s1[N_WARPS];
-    int warp_id = tid / 32, lane = tid % 32;
-
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sf0 += __shfl_xor_sync(0xFFFFFFFF, sf0, offset);
         sf1 += __shfl_xor_sync(0xFFFFFFFF, sf1, offset);
     }
-    if (lane == 0) { warp_s0[warp_id] = sf0; warp_s1[warp_id] = sf1; }
+
+    __shared__ float tmp[2][8];
+    int warp_id = tid / 32, lane = tid % 32;
+    if (lane == 0) { tmp[0][warp_id] = sf0; tmp[1][warp_id] = sf1; }
     __syncthreads();
 
     if (warp_id == 0) {
-        sf0 = (lane < N_WARPS) ? warp_s0[lane] : 0.0f;
-        sf1 = (lane < N_WARPS) ? warp_s1[lane] : 0.0f;
-        for (int offset = N_WARPS / 2; offset > 0; offset >>= 1) {
-            sf0 += __shfl_xor_sync(0xFFFFFFFF, sf0, offset);
-            sf1 += __shfl_xor_sync(0xFFFFFFFF, sf1, offset);
+        sf0 = (lane < 8) ? tmp[0][lane] : 0.0f;
+        sf1 = (lane < 8) ? tmp[1][lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            sf0 += __shfl_xor_sync(0xFF, sf0, offset);
+            sf1 += __shfl_xor_sync(0xFF, sf1, offset);
         }
-    }
-
-    if (tid == 0) {
-        y0_f32[row] = sf0 * global_scale + res0_f32[row];
-        y1_f32[row] = sf1 * global_scale + res1_f32[row];
+        if (lane == 0) {
+            y0_f32[row] = sf0 * global_scale + res0_f32[row];
+            y1_f32[row] = sf1 * global_scale + res1_f32[row];
+        }
     }
 }
 

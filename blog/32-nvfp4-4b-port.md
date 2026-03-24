@@ -117,7 +117,7 @@ The capital of France is Paris.
 The capital of France is **Paris**.
 ```
 
-All three agree. GWEN runs at ~42 tok/s decode without CUDA graph (conditional FP4/FP8 dispatch prevents capture). The 0.8B FP8 model shows no regression at 313 tok/s.
+All three agree. GWEN initially ran at ~12 tok/s decode (no CUDA graph). Subsequent optimization in [Post 33](33-fp4-gemv-optimization.md) brought this to 139 tok/s. The 0.8B FP8 model shows no regression at 313 tok/s.
 
 ## SGLang Status
 

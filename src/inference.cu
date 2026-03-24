@@ -3651,27 +3651,18 @@ int InferenceState::forward(Model& model, int token_id) {
     int params[2] = {token_id, pos};
     GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_id, params, 2 * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
-    // Check if FP4 model (has conditional branches that prevent graph capture)
-    bool is_fp4_model = (!model.layers.empty() && !model.layers[0].is_full_attention &&
-                          model.layers[0].deltanet.attn_qkv.type == GGMLType::FP4_E2M1);
-
-    if (is_fp4_model) {
-        // FP4 path: run directly (no CUDA graph — conditional dispatches)
+    // CUDA graph: captures the full forward pass on first call, replays thereafter.
+    // Host-side type dispatches (FP4/FP8/FP16) are invariant per model — safe to capture.
+    if (!graph_captured) {
+        cudaGraph_t graph;
+        GWEN_CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal));
         forward_body(model, compute_stream);
-    } else {
-        if (!graph_captured) {
-            // First call: capture the entire forward pass as a CUDA graph
-            cudaGraph_t graph;
-            GWEN_CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal));
-            forward_body(model, compute_stream);
-            GWEN_CHECK_CUDA(cudaStreamEndCapture(compute_stream, &graph));
-            GWEN_CHECK_CUDA(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
-            GWEN_CHECK_CUDA(cudaGraphDestroy(graph));
-            graph_captured = true;
-        }
-        // Replay the graph
-        GWEN_CHECK_CUDA(cudaGraphLaunch(graph_exec, compute_stream));
+        GWEN_CHECK_CUDA(cudaStreamEndCapture(compute_stream, &graph));
+        GWEN_CHECK_CUDA(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        GWEN_CHECK_CUDA(cudaGraphDestroy(graph));
+        graph_captured = true;
     }
+    GWEN_CHECK_CUDA(cudaGraphLaunch(graph_exec, compute_stream));
 
     // Sync and get result
     GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
