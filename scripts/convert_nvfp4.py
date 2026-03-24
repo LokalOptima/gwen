@@ -241,8 +241,9 @@ def main():
                             print(f"  F16: {gwen_name} {list(t.shape)}")
                         else:
                             t_f32 = t.float().contiguous()
-                            # Qwen3.5 norms use (1 + weight) scaling; add 1.0 to match GGUF convention
-                            if "norm" in k and "weight" in k:
+                            # Qwen3.5 RMSNorm uses (1 + weight) scaling; add 1.0 to match GGUF convention.
+                            # Exception: linear_attn.norm (Qwen3_5RMSNormGated) uses plain weight.
+                            if "norm" in k and "weight" in k and "linear_attn.norm" not in k:
                                 t_f32 = t_f32 + 1.0
                             tensors[gwen_name] = {
                                 "data": t_f32.numpy().tobytes(),
