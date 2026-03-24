@@ -15,7 +15,7 @@ static constexpr const char* RELEASE_BASE =
     "https://github.com/LokalOptima/gwen/releases/download/v1.0.0";
 
 // Default filenames
-static constexpr const char* DEFAULT_MODEL = "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf";
+static constexpr const char* DEFAULT_MODEL = "Qwen3.5-0.8B-Q4_K_M.gguf";
 static constexpr const char* DEFAULT_MTP   = "mtp_v6_sparse64.bin";
 
 inline std::string cache_dir() {

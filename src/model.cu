@@ -315,8 +315,8 @@ void Model::upload_weights(CudaAllocator& allocator) {
             upload_weight(allocator, w.ssm_conv1d);      // F32 conv weights
             upload_weight(allocator, w.ssm_a);           // F32 scalar
             upload_weight(allocator, w.ssm_dt_bias);     // F32 scalar
-            upload_weight(allocator, w.ssm_alpha);       // Q8_0 but small, keep as-is
-            upload_weight(allocator, w.ssm_beta);        // Q8_0 but small, keep as-is
+            upload_weight_with_fp16(allocator, w.ssm_alpha);  // dequant to FP16 (any quant type)
+            upload_weight_with_fp16(allocator, w.ssm_beta);   // dequant to FP16 (any quant type)
             upload_weight(allocator, w.ssm_norm);        // F32 norm
             upload_weight_with_fp16(allocator, w.ssm_out);
             upload_weight(allocator, w.post_attn_norm);  // F32 norm

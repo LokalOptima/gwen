@@ -477,8 +477,8 @@ kernel_deltanet_fused(
     half* __restrict__ k_in,            // [n_heads * dk] K from conv1d
     const half* __restrict__ v_in,      // [n_heads * dk] V from conv1d
     const half* __restrict__ x_norm,    // [n_embed] pre-attention norm (for gate/beta)
-    const void* __restrict__ alpha_w,   // Q8_0 [n_heads * n_embed/32 blocks]
-    const void* __restrict__ beta_w,    // Q8_0 [n_heads * n_embed/32 blocks]
+    const half* __restrict__ alpha_w,   // FP16 [n_heads, n_embed] pre-dequantized
+    const half* __restrict__ beta_w,    // FP16 [n_heads, n_embed] pre-dequantized
     const float* __restrict__ ssm_a,    // [n_heads]
     const float* __restrict__ dt_bias,  // [n_heads]
     half* __restrict__ output,          // [n_heads * dk]
@@ -545,19 +545,14 @@ kernel_deltanet_fused(
     sh_k[tid] = k_val * s_k_inv;
 
     // ---- Phase 2: Compute gate and beta (still overlapped with S load) ----
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-    int blocks_per_head = n_embed / 32;
+    const half* alpha_head = alpha_w + head * n_embed;
+    const half* beta_head = beta_w + head * n_embed;
 
     float alpha_acc = 0.0f, beta_acc = 0.0f;
     for (int i = tid; i < n_embed; i += 128) {
-        int blk = i / 32, elem = i % 32;
-        int blk_idx = head * blocks_per_head + blk;
-        float ad = __half2float(alpha_blocks[blk_idx].d);
-        float bd = __half2float(beta_blocks[blk_idx].d);
         float x_val = __half2float(x_norm[i]);
-        alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
-        beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+        alpha_acc += __half2float(alpha_head[i]) * x_val;
+        beta_acc += __half2float(beta_head[i]) * x_val;
     }
 
     #pragma unroll
@@ -642,8 +637,8 @@ kernel_deltanet_fused_2tok(
     const half* __restrict__ v_in_b,    // [n_heads * dk]
     const half* __restrict__ x_norm_b,  // [n_embed]
     // Shared weights
-    const void* __restrict__ alpha_w,   // Q8_0 [n_heads * n_embed/32 blocks]
-    const void* __restrict__ beta_w,    // Q8_0 [n_heads * n_embed/32 blocks]
+    const half* __restrict__ alpha_w,   // FP16 [n_heads, n_embed] pre-dequantized
+    const half* __restrict__ beta_w,    // FP16 [n_heads, n_embed] pre-dequantized
     const float* __restrict__ ssm_a,    // [n_heads]
     const float* __restrict__ dt_bias,  // [n_heads]
     // Outputs
@@ -667,9 +662,8 @@ kernel_deltanet_fused_2tok(
     __shared__ float s_q_inv, s_k_inv, s_decay, s_beta;
 
     float* S_head = S + head * dk * dk;
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-    int blocks_per_head = n_embed / 32;
+    const half* alpha_head = alpha_w + head * n_embed;
+    const half* beta_head = beta_w + head * n_embed;
 
     // ================================================================
     // TOKEN A
@@ -715,13 +709,9 @@ kernel_deltanet_fused_2tok(
     {
         float alpha_acc = 0.0f, beta_acc = 0.0f;
         for (int i = tid; i < n_embed; i += 128) {
-            int blk = i / 32, elem = i % 32;
-            int blk_idx = head * blocks_per_head + blk;
-            float ad = __half2float(alpha_blocks[blk_idx].d);
-            float bd = __half2float(beta_blocks[blk_idx].d);
             float x_val = __half2float(x_norm_a[i]);
-            alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
-            beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+            alpha_acc += __half2float(alpha_head[i]) * x_val;
+            beta_acc += __half2float(beta_head[i]) * x_val;
         }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -813,13 +803,9 @@ kernel_deltanet_fused_2tok(
     {
         float alpha_acc = 0.0f, beta_acc = 0.0f;
         for (int i = tid; i < n_embed; i += 128) {
-            int blk = i / 32, elem = i % 32;
-            int blk_idx = head * blocks_per_head + blk;
-            float ad = __half2float(alpha_blocks[blk_idx].d);
-            float bd = __half2float(beta_blocks[blk_idx].d);
             float x_val = __half2float(x_norm_b[i]);
-            alpha_acc += (ad * (float)alpha_blocks[blk_idx].qs[elem]) * x_val;
-            beta_acc += (bd * (float)beta_blocks[blk_idx].qs[elem]) * x_val;
+            alpha_acc += __half2float(alpha_head[i]) * x_val;
+            beta_acc += __half2float(beta_head[i]) * x_val;
         }
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
@@ -878,8 +864,8 @@ kernel_deltanet_fused_2tok(
 __global__ void __launch_bounds__(32)
 kernel_compute_gate_beta(
     const half* __restrict__ x,          // [n_embed] input
-    const void* __restrict__ alpha_w,    // [n_embed, n_heads] Q8_0
-    const void* __restrict__ beta_w,     // [n_embed, n_heads] Q8_0
+    const half* __restrict__ alpha_w,    // [n_heads, n_embed] FP16 pre-dequantized
+    const half* __restrict__ beta_w,     // [n_heads, n_embed] FP16 pre-dequantized
     const float* __restrict__ ssm_a,     // [n_heads] A parameter (negative)
     const float* __restrict__ dt_bias,   // [n_heads]
     float* __restrict__ gate_out,        // [n_heads] gate = ssm_a * softplus(alpha_proj + dt_bias)
@@ -890,25 +876,16 @@ kernel_compute_gate_beta(
     if (head >= n_heads) return;
     int lane = threadIdx.x;
 
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-
-    int blocks_per_head = n_embed / 32;
+    const half* alpha_head = alpha_w + head * n_embed;
+    const half* beta_head = beta_w + head * n_embed;
 
     float alpha_acc = 0.0f;
     float beta_acc = 0.0f;
 
-    for (int b = lane; b < blocks_per_head; b += 32) {
-        const auto& ab = alpha_blocks[head * blocks_per_head + b];
-        const auto& bb = beta_blocks[head * blocks_per_head + b];
-        float ad = __half2float(ab.d);
-        float bd = __half2float(bb.d);
-
-        for (int j = 0; j < 32; j++) {
-            float x_val = __half2float(x[b * 32 + j]);
-            alpha_acc += (ad * ab.qs[j]) * x_val;
-            beta_acc += (bd * bb.qs[j]) * x_val;
-        }
+    for (int i = lane; i < n_embed; i += 32) {
+        float x_val = __half2float(x[i]);
+        alpha_acc += __half2float(alpha_head[i]) * x_val;
+        beta_acc += __half2float(beta_head[i]) * x_val;
     }
 
     // Warp reduction
@@ -979,8 +956,8 @@ kernel_batch_conv1d_silu(
 __global__ void __launch_bounds__(32)
 kernel_batch_compute_gate_beta(
     const half* __restrict__ x_batch,     // [N, n_embed]
-    const void* __restrict__ alpha_w,     // Q8_0 [n_heads, n_embed/32] blocks
-    const void* __restrict__ beta_w,      // Q8_0 [n_heads, n_embed/32] blocks
+    const half* __restrict__ alpha_w,     // FP16 [n_heads, n_embed] pre-dequantized
+    const half* __restrict__ beta_w,      // FP16 [n_heads, n_embed] pre-dequantized
     const float* __restrict__ ssm_a,      // [n_heads]
     const float* __restrict__ dt_bias,    // [n_heads]
     float* __restrict__ gate_out,         // [N, n_heads]
@@ -993,23 +970,16 @@ kernel_batch_compute_gate_beta(
     int lane = threadIdx.x;
 
     const half* x = x_batch + (size_t)t * n_embed;
-    const block_q8_0* alpha_blocks = static_cast<const block_q8_0*>(alpha_w);
-    const block_q8_0* beta_blocks = static_cast<const block_q8_0*>(beta_w);
-    int blocks_per_head = n_embed / 32;
+    const half* alpha_head = alpha_w + head * n_embed;
+    const half* beta_head = beta_w + head * n_embed;
 
     float alpha_acc = 0.0f;
     float beta_acc = 0.0f;
 
-    for (int b = lane; b < blocks_per_head; b += 32) {
-        const auto& ab = alpha_blocks[head * blocks_per_head + b];
-        const auto& bb = beta_blocks[head * blocks_per_head + b];
-        float ad = __half2float(ab.d);
-        float bd = __half2float(bb.d);
-        for (int j2 = 0; j2 < 32; j2++) {
-            float x_val = __half2float(x[b * 32 + j2]);
-            alpha_acc += (ad * ab.qs[j2]) * x_val;
-            beta_acc += (bd * bb.qs[j2]) * x_val;
-        }
+    for (int i = lane; i < n_embed; i += 32) {
+        float x_val = __half2float(x[i]);
+        alpha_acc += __half2float(alpha_head[i]) * x_val;
+        beta_acc += __half2float(beta_head[i]) * x_val;
     }
 
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -3064,7 +3034,7 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             // Fused: L2-norm(Q,K) + gate/beta + S update
             kernel_deltanet_fused<<<cfg.ssm_n_heads, 128, 65536, s>>>(
                 state.S, q, k, v, x_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.fp16_data, w.ssm_beta.fp16_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 attn_out, q_scale,
@@ -3276,7 +3246,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 state.S,
                 qa, ka, va, x_norm,
                 qb, kb, vb, b2_x_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.fp16_data, w.ssm_beta.fp16_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 attn_out, b2_attn_out, snap,
@@ -4065,7 +4035,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             // Gate/beta computation
             kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_heads, N), 32, 0, s>>>(
                 pf_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.fp16_data, w.ssm_beta.fp16_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 prefill_dn_gate, prefill_dn_beta,
@@ -4408,7 +4378,7 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
         
             kernel_batch_compute_gate_beta<<<dim3(n_heads, N), 32, 0, s>>>(
                 pf_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                w.ssm_alpha.fp16_data, w.ssm_beta.fp16_data,
                 static_cast<const float*>(w.ssm_a.device_data),
                 static_cast<const float*>(w.ssm_dt_bias.device_data),
                 prefill_dn_gate, prefill_dn_beta,
