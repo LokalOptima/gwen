@@ -679,15 +679,14 @@ std::unique_ptr<Model> Model::load_fp4(const std::string& fp4_path) {
             w.type = GGMLType::FP4_E2M1;
             w.fp4_global_scale = ti.scale2;
             w.scales_fp4_bytes = ti.scales_size;
-            // host_scales field stores FP4 block scales pointer temporarily
-            // We'll use host_data for packed FP4, and a separate pointer for scales
-            // Store scales host pointer in host_scales (reinterpret as float* temporarily)
         } else if (ti.dtype == 1) {  // F32
             w.type = GGMLType::F32;
         } else if (ti.dtype == 2) {  // BF16
             w.type = GGMLType::BF16;
         } else if (ti.dtype == 3) {  // F16
             w.type = GGMLType::F16;
+        } else if (ti.dtype == 4) {  // FP8_E4M3 with per-row F32 scales
+            w.type = GGMLType::FP8_E4M3;
         }
         return w;
     };
@@ -771,10 +770,15 @@ std::unique_ptr<Model> Model::load_fp4(const std::string& fp4_path) {
     // Walk all weights and set their scales host pointers.
     auto set_scales = [&](WeightRef& w, const std::string& name) {
         auto it = fp4_scales.find(name);
-        if (it != fp4_scales.end() && w.type == GGMLType::FP4_E2M1) {
+        if (it == fp4_scales.end()) return;
+        if (w.type == GGMLType::FP4_E2M1) {
             // Store the host pointer to E4M3 scales in host_scales (recast)
             w.host_scales = reinterpret_cast<const float*>(it->second.host_ptr);
             w.n_scale_rows = it->second.size;  // abuse this field for byte count
+        } else if (w.type == GGMLType::FP8_E4M3) {
+            // Per-row F32 scales
+            w.host_scales = reinterpret_cast<const float*>(it->second.host_ptr);
+            w.n_scale_rows = it->second.size / sizeof(float);
         }
     };
 

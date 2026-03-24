@@ -35,6 +35,7 @@ DTYPE_FP4_E2M1 = 0   # packed FP4 (2 per byte) with E4M3 block scales
 DTYPE_F32 = 1
 DTYPE_BF16 = 2
 DTYPE_F16 = 3         # FP16 (for embeddings/non-quantized weights)
+DTYPE_FP8_E4M3 = 4    # FP8 E4M3 with per-row F32 scales
 
 # HF → GWEN tensor name mapping for Qwen3.5 DeltaNet layers
 DELTANET_MAP = {
@@ -226,19 +227,25 @@ def main():
                             skipped.append(k)
                             continue
 
-                        # Large 2D tensors (embeddings, MLP weights) → FP16 for GEMV
+                        # Large 2D tensors → FP8 E4M3 (lm_head/embeddings) or FP16
                         # Small tensors and conv1d (norms, biases, conv weights) → F32
                         if t.numel() > 4096 and t.dim() <= 2 and "conv" not in k:
-                            t_fp16 = t.half().contiguous()
+                            # Quantize to FP8 E4M3 with per-row F32 scales
+                            t_f32 = t.float()
+                            row_max = t_f32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+                            scales = (row_max / 448.0).squeeze(1)  # [out_features] F32
+                            t_fp8 = (t_f32 / scales.unsqueeze(1)).to(torch.float8_e4m3fn)
                             tensors[gwen_name] = {
-                                "data": t_fp16.numpy().tobytes(),
-                                "dtype": DTYPE_F16,
+                                "data": t_fp8.contiguous().view(torch.uint8).numpy().tobytes(),
+                                "dtype": DTYPE_FP8_E4M3,
                                 "shape": list(t.shape),
-                                "scales": None,
+                                "scales": scales.contiguous().numpy().tobytes(),
                                 "scale2": 0.0,
-                                "scales_shape": None,
+                                "scales_shape": [int(t.shape[0])],
                             }
-                            print(f"  F16: {gwen_name} {list(t.shape)}")
+                            print(f"  FP8: {gwen_name} {list(t.shape)} "
+                                  f"(was {t.dtype}, {t.nelement()*2/1024/1024:.1f}→"
+                                  f"{t_fp8.nelement()/1024/1024:.1f} MB)")
                         else:
                             t_f32 = t.float().contiguous()
                             # Qwen3.5 RMSNorm uses (1 + weight) scaling; add 1.0 to match GGUF convention.
