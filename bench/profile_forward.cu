@@ -242,33 +242,35 @@ int main(int argc, char** argv) {
     // DeltaNet recurrence (18 calls × this)
     {
         auto& dn = state.deltanet_states[0];
+        int q_width = cfg.ssm_n_k_heads * cfg.ssm_state_size;
         float ms = bench("DeltaNet recurrence:", 100, [&]() {
-            gwen_deltanet_decode(dn.S, state.qkv, state.qkv + cfg.ssm_inner_size,
-                                 state.qkv + 2 * cfg.ssm_inner_size,
+            gwen_deltanet_decode(dn.S, state.qkv, state.qkv + q_width,
+                                 state.qkv + 2 * q_width,
                                  state.d_alpha, state.d_beta, state.attn_out,
-                                 cfg.ssm_n_heads, cfg.ssm_state_size, cfg.ssm_state_size);
+                                 cfg.ssm_n_v_heads, cfg.ssm_state_size, cfg.ssm_state_size);
         });
-        printf("    × 18 layers = %.3f ms\n", ms * 18);
+        int n_dn = cfg.n_layers - cfg.n_layers / cfg.full_attn_interval;
+        printf("    × %d layers = %.3f ms\n", n_dn, ms * n_dn);
     }
 
     // SwiGLU
-    bench("SwiGLU (3584):", 1000, [&]() {
+    bench("SwiGLU:", 1000, [&]() {
         gwen_swiglu(state.ffn_gate, state.ffn_up, state.ffn_out, cfg.n_ff);
     });
 
     // Add inplace
-    bench("Add inplace (1024):", 1000, [&]() {
+    bench("Add inplace:", 1000, [&]() {
         gwen_add_inplace(state.x, state.residual, cfg.n_embed);
     });
 
     // SiLU inplace
-    bench("SiLU inplace (6144):", 1000, [&]() {
-        gwen_silu_inplace(state.qkv, cfg.ssm_inner_size * 3);
+    bench("SiLU inplace:", 1000, [&]() {
+        gwen_silu_inplace(state.qkv, cfg.ssm_qkv_dim());
     });
 
     // L2 normalize
-    bench("L2 normalize (16x128):", 1000, [&]() {
-        gwen_l2_normalize(state.qkv, state.qkv, cfg.ssm_n_heads, cfg.ssm_state_size);
+    bench("L2 normalize:", 1000, [&]() {
+        gwen_l2_normalize(state.qkv, state.qkv, cfg.ssm_n_v_heads, cfg.ssm_state_size);
     });
 
     // Theoretical

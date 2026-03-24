@@ -117,9 +117,41 @@ void gwen_gemv_fp8_batch2_residual_f32(const void* W, const float* scales,
 void gwen_rmsnorm_f32_input(const float* x_f32, const float* weight, half* y,
                               int dim, float eps, cudaStream_t stream = 0);
 
+// Batch2: F32-input RMSNorm for two tokens in one launch
+void gwen_rmsnorm_f32_input_batch2(const float* x0_f32, const float* x1_f32,
+                                    const float* weight,
+                                    half* y0, half* y1,
+                                    int dim, float eps, cudaStream_t stream = 0);
+
 // FP16→F32 / F32→FP16 conversion
 void gwen_fp16_to_f32(const half* x, float* y, int n, cudaStream_t stream = 0);
 void gwen_f32_to_fp16(const float* x, half* y, int n, cudaStream_t stream = 0);
+
+// ============================================================
+// FP4 E2M1 GEMV (NVFP4 bandwidth-optimized decode path)
+// ============================================================
+// W: [out_features, in_features/2] packed FP4 E2M1 bytes
+// scales: [out_features, in_features/16] E4M3 micro-scales
+// global_scale: per-tensor FP32 scale
+
+void gwen_gemv_fp4(const void* W, const void* scales, float global_scale,
+                    const half* x, half* y,
+                    int out_features, int in_features, cudaStream_t stream = 0);
+
+void gwen_gemv_fp4_residual_f32(const void* W, const void* scales, float global_scale,
+                                  const half* x, float* y_f32, const float* residual_f32,
+                                  int out_features, int in_features, cudaStream_t stream = 0);
+
+void gwen_gemv_fp4_batch2(const void* W, const void* scales, float global_scale,
+                            const half* x0, const half* x1,
+                            half* y0, half* y1,
+                            int out_features, int in_features, cudaStream_t stream = 0);
+
+void gwen_gemv_fp4_batch2_residual_f32(const void* W, const void* scales, float global_scale,
+                                         const half* x0, const half* x1,
+                                         float* y0_f32, float* y1_f32,
+                                         const float* res0_f32, const float* res1_f32,
+                                         int out_features, int in_features, cudaStream_t stream = 0);
 
 // FP8→FP16 bulk dequant with per-row scaling (for prefill GEMM via CUTLASS FP16 fallback)
 void gwen_dequant_fp8_to_fp16(const void* data, const float* scales, half* out,
@@ -175,6 +207,12 @@ void gwen_silu_inplace(half* x, int n, cudaStream_t stream = 0);
 
 // SwiGLU: y = SiLU(gate) * up (fused)
 void gwen_swiglu(const half* gate, const half* up, half* y, int n, cudaStream_t stream = 0);
+
+// Batch2 SwiGLU: process two tokens in one launch
+void gwen_swiglu_batch2(const half* gate0, const half* gate1,
+                         const half* up0, const half* up1,
+                         half* y0, half* y1,
+                         int n, cudaStream_t stream = 0);
 
 // Fused SwiGLU + Q8_1 quantize: computes SwiGLU and writes Q8_1 directly (skips FP16 intermediate)
 void gwen_swiglu_quantize_q8_1(const half* gate, const half* up, void* y_q8, int n, cudaStream_t stream = 0);

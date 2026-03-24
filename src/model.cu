@@ -412,10 +412,25 @@ std::unique_ptr<Model> Model::load_fp8(const std::string& fp8_path) {
     {
         auto& qkv = tensor_infos[name_to_idx.at("blk.0.attn_qkv.weight")];
         uint32_t qkv_out = qkv.shape[0];  // 6144 for 0.8B
-        // QKV = 3 * ssm_inner_size (for symmetric k/v heads)
-        cfg.ssm_inner_size = qkv_out / 3;
+        // QKV = 2*k_heads*dk + v_heads*dv. For symmetric (0.8B): 3*ssm_inner.
+        // For asymmetric (4B+): we need to figure out k vs v heads.
+        // Try symmetric first (qkv_out divisible by 3), else infer from ssm_inner_size.
         cfg.ssm_state_size = 128;  // always 128 for Qwen3.5
-        cfg.ssm_n_heads = cfg.ssm_inner_size / cfg.ssm_state_size;
+        if (qkv_out % 3 == 0) {
+            // Symmetric: k_heads == v_heads
+            cfg.ssm_inner_size = qkv_out / 3;
+            cfg.ssm_n_v_heads = cfg.ssm_inner_size / cfg.ssm_state_size;
+            cfg.ssm_n_k_heads = cfg.ssm_n_v_heads;
+        } else {
+            // Asymmetric: infer from gate tensor (gate_z output = ssm_inner_size = v_heads*dv)
+            auto& gate = tensor_infos[name_to_idx.at("blk.0.attn_gate.weight")];
+            cfg.ssm_inner_size = gate.shape[0];
+            cfg.ssm_n_v_heads = cfg.ssm_inner_size / cfg.ssm_state_size;
+            // k_heads*dk*2 + v_heads*dv = qkv_out → k_heads = (qkv_out - v_heads*dv) / (2*dk)
+            cfg.ssm_n_k_heads = (qkv_out - cfg.ssm_n_v_heads * cfg.ssm_state_size) /
+                                (2 * cfg.ssm_state_size);
+        }
+        cfg.ssm_n_heads = cfg.ssm_n_v_heads;
     }
     {
         auto& ffn = tensor_infos[name_to_idx.at("blk.0.ffn_gate.weight")];
@@ -439,8 +454,9 @@ std::unique_ptr<Model> Model::load_fp8(const std::string& fp8_path) {
         }
     }
 
-    fprintf(stderr, "GWFP8: %u layers, embed=%u, ff=%u, vocab=%u, heads=%u/%u, ssm_heads=%u\n",
-            cfg.n_layers, cfg.n_embed, cfg.n_ff, cfg.n_vocab, cfg.n_head, cfg.n_head_kv, cfg.ssm_n_heads);
+    fprintf(stderr, "GWFP8: %u layers, embed=%u, ff=%u, vocab=%u, heads=%u/%u, ssm_k=%u/v=%u\n",
+            cfg.n_layers, cfg.n_embed, cfg.n_ff, cfg.n_vocab, cfg.n_head, cfg.n_head_kv,
+            cfg.ssm_n_k_heads, cfg.ssm_n_v_heads);
 
     // Load global weights
     model->token_embd = get("token_embd.weight");
@@ -508,6 +524,311 @@ std::unique_ptr<Model> Model::load_fp8(const std::string& fp8_path) {
     return model;
 }
 
+// ============================================================
+// GWFP4 loader — FP4 E2M1 weights with E4M3 block scales + F32 global scale
+// ============================================================
+
+std::unique_ptr<Model> Model::load_fp4(const std::string& fp4_path) {
+    auto model = std::make_unique<Model>();
+
+    // Read entire file into memory
+    std::ifstream f(fp4_path, std::ios::binary | std::ios::ate);
+    GWEN_CHECK(f.is_open(), ("Failed to open: " + fp4_path).c_str());
+    size_t file_size = f.tellg();
+    f.seekg(0);
+    model->gwfp4_file_data_.resize(file_size);
+    f.read(reinterpret_cast<char*>(model->gwfp4_file_data_.data()), file_size);
+    f.close();
+
+    const uint8_t* base = model->gwfp4_file_data_.data();
+    size_t offset = 0;
+
+    auto read_u32 = [&]() -> uint32_t {
+        uint32_t v; memcpy(&v, base + offset, 4); offset += 4; return v;
+    };
+    auto read_u64 = [&]() -> uint64_t {
+        uint64_t v; memcpy(&v, base + offset, 8); offset += 8; return v;
+    };
+    auto read_f32 = [&]() -> float {
+        float v; memcpy(&v, base + offset, 4); offset += 4; return v;
+    };
+
+    // Parse header
+    GWEN_CHECK(memcmp(base, "GWF4", 4) == 0, "Invalid GWFP4 magic");
+    offset = 4;
+    uint32_t version = read_u32();
+    GWEN_CHECK(version == 1, "Unsupported GWFP4 version");
+    uint32_t n_tensors = read_u32();
+    uint32_t header_size = read_u32();
+    (void)header_size;
+
+    // Read embedded config JSON
+    uint32_t config_len = read_u32();
+    std::string config_json(reinterpret_cast<const char*>(base + offset), config_len);
+    offset += config_len;
+
+    // Parse config JSON (minimal parser — just extract known keys)
+    auto& cfg = model->config;
+    auto json_int = [&](const std::string& json, const std::string& key) -> uint32_t {
+        auto pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0;
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return 0;
+        return std::stoul(json.substr(pos + 1));
+    };
+    auto json_float = [&](const std::string& json, const std::string& key) -> float {
+        auto pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return 0.0f;
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return 0.0f;
+        return std::stof(json.substr(pos + 1));
+    };
+    auto json_bool = [&](const std::string& json, const std::string& key) -> bool {
+        auto pos = json.find("\"" + key + "\"");
+        if (pos == std::string::npos) return false;
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return false;
+        auto val = json.substr(pos + 1, 10);
+        return val.find("true") != std::string::npos;
+    };
+
+    cfg.n_embed = json_int(config_json, "hidden_size");
+    cfg.n_ff = json_int(config_json, "intermediate_size");
+    cfg.n_layers = json_int(config_json, "num_hidden_layers");
+    cfg.n_head = json_int(config_json, "num_attention_heads");
+    cfg.n_head_kv = json_int(config_json, "num_key_value_heads");
+    cfg.n_vocab = json_int(config_json, "vocab_size");
+    cfg.head_dim = json_int(config_json, "head_dim");
+    if (cfg.head_dim == 0) cfg.head_dim = 256;  // default for Qwen3.5
+    cfg.ssm_state_size = json_int(config_json, "linear_key_head_dim");
+    if (cfg.ssm_state_size == 0) cfg.ssm_state_size = 128;
+    cfg.ssm_n_k_heads = json_int(config_json, "linear_num_key_heads");
+    if (cfg.ssm_n_k_heads == 0) cfg.ssm_n_k_heads = 16;
+    cfg.ssm_n_v_heads = json_int(config_json, "linear_num_value_heads");
+    if (cfg.ssm_n_v_heads == 0) cfg.ssm_n_v_heads = cfg.ssm_n_k_heads;
+    cfg.ssm_inner_size = cfg.ssm_n_v_heads * cfg.ssm_state_size;
+    cfg.ssm_n_heads = cfg.ssm_n_v_heads;
+    cfg.ssm_conv_kernel = json_int(config_json, "linear_conv_kernel_dim");
+    if (cfg.ssm_conv_kernel == 0) cfg.ssm_conv_kernel = 4;
+    cfg.full_attn_interval = json_int(config_json, "full_attention_interval");
+    if (cfg.full_attn_interval == 0) cfg.full_attn_interval = 4;
+    cfg.rms_norm_eps = json_float(config_json, "rms_norm_eps");
+    if (cfg.rms_norm_eps == 0.0f) cfg.rms_norm_eps = 1e-6f;
+    cfg.rope_theta = json_float(config_json, "rope_theta");
+    if (cfg.rope_theta == 0.0f) cfg.rope_theta = 10000000.0f;
+    bool tie_embeddings = json_bool(config_json, "tie_word_embeddings");
+
+    fprintf(stderr, "GWFP4: %u layers, embed=%u, ff=%u, vocab=%u, heads=%u/%u, ssm_k=%u/v=%u\n",
+            cfg.n_layers, cfg.n_embed, cfg.n_ff, cfg.n_vocab, cfg.n_head, cfg.n_head_kv,
+            cfg.ssm_n_k_heads, cfg.ssm_n_v_heads);
+
+    // Parse tensor headers
+    struct FP4TensorInfo {
+        std::string name;
+        uint32_t dtype;          // 0=FP4_E2M1, 1=F32, 2=BF16
+        std::vector<uint64_t> shape;
+        bool has_scales;
+        float scale2;            // global scale
+        std::vector<uint64_t> scales_shape;
+        uint64_t data_offset, data_size;
+        uint64_t scales_offset, scales_size;
+    };
+    std::vector<FP4TensorInfo> tensor_infos;
+    tensor_infos.reserve(n_tensors);
+
+    for (uint32_t i = 0; i < n_tensors; i++) {
+        FP4TensorInfo ti;
+        uint32_t name_len = read_u32();
+        ti.name = std::string(reinterpret_cast<const char*>(base + offset), name_len);
+        offset += name_len;
+        ti.dtype = read_u32();
+        uint32_t ndims = read_u32();
+        ti.shape.resize(ndims);
+        for (uint32_t d = 0; d < ndims; d++)
+            ti.shape[d] = read_u64();
+        uint32_t has_scales = read_u32();
+        ti.has_scales = (has_scales != 0);
+        ti.scale2 = read_f32();
+        if (ti.has_scales) {
+            uint32_t s_ndims = read_u32();
+            ti.scales_shape.resize(s_ndims);
+            for (uint32_t d = 0; d < s_ndims; d++)
+                ti.scales_shape[d] = read_u64();
+        }
+        ti.data_offset = read_u64();
+        ti.data_size = read_u64();
+        ti.scales_offset = read_u64();
+        ti.scales_size = read_u64();
+        tensor_infos.push_back(std::move(ti));
+    }
+
+    // Build name → index map
+    std::unordered_map<std::string, size_t> name_to_idx;
+    for (size_t i = 0; i < tensor_infos.size(); i++)
+        name_to_idx[tensor_infos[i].name] = i;
+
+    auto make_weight = [&](const FP4TensorInfo& ti) -> WeightRef {
+        WeightRef w;
+        w.host_data = base + ti.data_offset;
+        w.size_bytes = ti.data_size;
+        w.shape = ti.shape;
+        w.n_elements = 1;
+        for (auto s : ti.shape) w.n_elements *= s;
+
+        if (ti.dtype == 0) {  // FP4_E2M1
+            w.type = GGMLType::FP4_E2M1;
+            w.fp4_global_scale = ti.scale2;
+            w.scales_fp4_bytes = ti.scales_size;
+            // host_scales field stores FP4 block scales pointer temporarily
+            // We'll use host_data for packed FP4, and a separate pointer for scales
+            // Store scales host pointer in host_scales (reinterpret as float* temporarily)
+        } else if (ti.dtype == 1) {  // F32
+            w.type = GGMLType::F32;
+        } else if (ti.dtype == 2) {  // BF16
+            w.type = GGMLType::BF16;
+        } else if (ti.dtype == 3) {  // F16
+            w.type = GGMLType::F16;
+        }
+        return w;
+    };
+
+    // Store per-tensor scales host pointers (FP4 E4M3 block scales)
+    // We need these to survive until upload — store offsets relative to file base
+    struct FP4ScaleInfo {
+        const uint8_t* host_ptr;
+        size_t size;
+    };
+    std::unordered_map<std::string, FP4ScaleInfo> fp4_scales;
+
+    auto get = [&](const std::string& name) -> WeightRef {
+        auto it = name_to_idx.find(name);
+        GWEN_CHECK(it != name_to_idx.end(), ("Missing tensor: " + name).c_str());
+        auto& ti = tensor_infos[it->second];
+        auto w = make_weight(ti);
+        if (ti.has_scales && ti.scales_size > 0) {
+            fp4_scales[name] = {base + ti.scales_offset, ti.scales_size};
+        }
+        return w;
+    };
+
+    auto try_get = [&](const std::string& name) -> WeightRef {
+        auto it = name_to_idx.find(name);
+        if (it == name_to_idx.end()) return {};
+        auto& ti = tensor_infos[it->second];
+        auto w = make_weight(ti);
+        if (ti.has_scales && ti.scales_size > 0) {
+            fp4_scales[name] = {base + ti.scales_offset, ti.scales_size};
+        }
+        return w;
+    };
+
+    // Load global weights
+    model->token_embd = get("token_embd.weight");
+    model->output_norm = get("output_norm.weight");
+
+    // Load per-layer weights
+    model->layers.resize(cfg.n_layers);
+    for (uint32_t i = 0; i < cfg.n_layers; i++) {
+        auto& layer = model->layers[i];
+        std::string prefix = "blk." + std::to_string(i) + ".";
+        layer.is_full_attention = cfg.is_full_attention_layer(i);
+
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            w.attn_norm      = get(prefix + "attn_norm.weight");
+            w.attn_q         = get(prefix + "attn_q.weight");
+            w.attn_k         = get(prefix + "attn_k.weight");
+            w.attn_v         = get(prefix + "attn_v.weight");
+            w.attn_q_norm    = get(prefix + "attn_q_norm.weight");
+            w.attn_k_norm    = get(prefix + "attn_k_norm.weight");
+            w.attn_output    = get(prefix + "attn_output.weight");
+            w.post_attn_norm = get(prefix + "post_attn_norm.weight");
+            w.ffn_gate       = get(prefix + "ffn_gate.weight");
+            w.ffn_up         = get(prefix + "ffn_up.weight");
+            w.ffn_down       = get(prefix + "ffn_down.weight");
+        } else {
+            auto& w = layer.deltanet;
+            w.attn_norm      = get(prefix + "attn_norm.weight");
+            w.attn_qkv       = get(prefix + "attn_qkv.weight");
+            w.attn_gate      = get(prefix + "attn_gate.weight");
+            w.ssm_conv1d     = get(prefix + "ssm_conv1d.weight");
+            w.ssm_a          = get(prefix + "ssm_a.weight");
+            w.ssm_dt_bias    = try_get(prefix + "ssm_dt_bias.weight");
+            w.ssm_alpha      = get(prefix + "ssm_alpha.weight");
+            w.ssm_beta       = get(prefix + "ssm_beta.weight");
+            w.ssm_norm       = get(prefix + "ssm_norm.weight");
+            w.ssm_out        = get(prefix + "ssm_out.weight");
+            w.post_attn_norm = get(prefix + "post_attn_norm.weight");
+            w.ffn_gate       = get(prefix + "ffn_gate.weight");
+            w.ffn_up         = get(prefix + "ffn_up.weight");
+            w.ffn_down       = get(prefix + "ffn_down.weight");
+        }
+    }
+
+    // Store FP4 scales info on the model for upload_weights to use
+    // We store this as a map attached to the model via a lambda capture in upload
+    // Actually, we need to set the host pointer for scales on each WeightRef.
+    // Walk all weights and set their scales host pointers.
+    auto set_scales = [&](WeightRef& w, const std::string& name) {
+        auto it = fp4_scales.find(name);
+        if (it != fp4_scales.end() && w.type == GGMLType::FP4_E2M1) {
+            // Store the host pointer to E4M3 scales in host_scales (recast)
+            w.host_scales = reinterpret_cast<const float*>(it->second.host_ptr);
+            w.n_scale_rows = it->second.size;  // abuse this field for byte count
+        }
+    };
+
+    // Set scales on all FP4 tensors
+    set_scales(model->token_embd, "token_embd.weight");
+    for (uint32_t i = 0; i < cfg.n_layers; i++) {
+        std::string prefix = "blk." + std::to_string(i) + ".";
+        auto& layer = model->layers[i];
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            set_scales(w.attn_q, prefix + "attn_q.weight");
+            set_scales(w.attn_k, prefix + "attn_k.weight");
+            set_scales(w.attn_v, prefix + "attn_v.weight");
+            set_scales(w.attn_output, prefix + "attn_output.weight");
+            set_scales(w.ffn_gate, prefix + "ffn_gate.weight");
+            set_scales(w.ffn_up, prefix + "ffn_up.weight");
+            set_scales(w.ffn_down, prefix + "ffn_down.weight");
+        } else {
+            auto& w = layer.deltanet;
+            set_scales(w.attn_qkv, prefix + "attn_qkv.weight");
+            set_scales(w.attn_gate, prefix + "attn_gate.weight");
+            set_scales(w.ssm_alpha, prefix + "ssm_alpha.weight");
+            set_scales(w.ssm_beta, prefix + "ssm_beta.weight");
+            set_scales(w.ssm_out, prefix + "ssm_out.weight");
+            set_scales(w.ffn_gate, prefix + "ffn_gate.weight");
+            set_scales(w.ffn_up, prefix + "ffn_up.weight");
+            set_scales(w.ffn_down, prefix + "ffn_down.weight");
+        }
+    }
+
+    // Count total weight bytes
+    size_t total = model->token_embd.size_bytes + model->output_norm.size_bytes;
+    for (auto& layer : model->layers) {
+        if (layer.is_full_attention) {
+            auto& w = layer.full_attn;
+            total += w.attn_norm.size_bytes + w.attn_q.size_bytes + w.attn_k.size_bytes +
+                     w.attn_v.size_bytes + w.attn_q_norm.size_bytes + w.attn_k_norm.size_bytes +
+                     w.attn_output.size_bytes + w.post_attn_norm.size_bytes +
+                     w.ffn_gate.size_bytes + w.ffn_up.size_bytes + w.ffn_down.size_bytes;
+        } else {
+            auto& w = layer.deltanet;
+            total += w.attn_norm.size_bytes + w.attn_qkv.size_bytes + w.attn_gate.size_bytes +
+                     w.ssm_conv1d.size_bytes + w.ssm_a.size_bytes + w.ssm_dt_bias.size_bytes +
+                     w.ssm_alpha.size_bytes + w.ssm_beta.size_bytes + w.ssm_norm.size_bytes +
+                     w.ssm_out.size_bytes + w.post_attn_norm.size_bytes +
+                     w.ffn_gate.size_bytes + w.ffn_up.size_bytes + w.ffn_down.size_bytes;
+        }
+    }
+    fprintf(stderr, "GWFP4: loaded %.1f MB of weights from %s\n", total / 1024.0 / 1024.0, fp4_path.c_str());
+    (void)tie_embeddings;
+
+    return model;
+}
+
 // Upload all weight tensors to GPU
 // Forward declarations for dequant kernels
 void gwen_dequant(const void* src, half* dst, int n, GGMLType type, cudaStream_t stream);
@@ -517,9 +838,15 @@ static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
         w.device_data = alloc.upload(w.host_data, w.size_bytes);
     }
     // Upload FP8 per-row scales if present
-    if (w.host_scales && w.n_scale_rows > 0 && !w.device_scales) {
+    if (w.type == GGMLType::FP8_E4M3 && w.host_scales && w.n_scale_rows > 0 && !w.device_scales) {
         w.device_scales = static_cast<float*>(
             alloc.upload(w.host_scales, w.n_scale_rows * sizeof(float)));
+    }
+    // Upload FP4 E4M3 block scales if present
+    // For FP4: host_scales points to raw E4M3 bytes, n_scale_rows stores byte count
+    if (w.type == GGMLType::FP4_E2M1 && w.host_scales && w.n_scale_rows > 0 && !w.device_scales_fp4) {
+        w.device_scales_fp4 = alloc.upload(w.host_scales, w.n_scale_rows);
+        w.scales_fp4_bytes = w.n_scale_rows;
     }
 }
 
@@ -630,7 +957,9 @@ void Model::upload_weights(CudaAllocator& allocator) {
 
 void Model::print_info() const {
     fprintf(stderr, "=== GWEN Model Info ===\n");
-    fprintf(stderr, "Model: %s\n", gguf ? gguf->path().c_str() : "(GWFP8)");
+    const char* fmt = gguf ? gguf->path().c_str() :
+                       (!gwfp4_file_data_.empty() ? "(GWFP4)" : "(GWFP8)");
+    fprintf(stderr, "Model: %s\n", fmt);
     fprintf(stderr, "Layers: %u (%u DeltaNet + %u FullAttn)\n",
            config.n_layers,
            config.n_layers - config.n_layers / config.full_attn_interval,
@@ -640,9 +969,10 @@ void Model::print_info() const {
     fprintf(stderr, "Vocab: %u\n", config.n_vocab);
     fprintf(stderr, "Full Attn: %u heads (%u KV), head_dim=%u\n",
            config.n_head, config.n_head_kv, config.head_dim);
-    fprintf(stderr, "DeltaNet: %u heads, state=%ux%u, inner=%u\n",
-           config.ssm_n_heads, config.ssm_state_size, config.ssm_state_size,
-           config.ssm_inner_size);
+    fprintf(stderr, "DeltaNet: K=%u V=%u heads, state=%ux%u, inner=%u, qkv=%u\n",
+           config.ssm_n_k_heads, config.ssm_n_v_heads,
+           config.ssm_state_size, config.ssm_state_size,
+           config.ssm_inner_size, config.ssm_qkv_dim());
     fprintf(stderr, "RoPE: theta=%.0f, dim=%u, sections=[%d,%d,%d,%d]\n",
            config.rope_theta, config.rope_dim,
            config.rope_sections[0], config.rope_sections[1],

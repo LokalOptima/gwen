@@ -165,6 +165,33 @@ void gwen_swiglu(const half* gate, const half* up, half* y, int n, cudaStream_t 
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 
+// Batch2 SwiGLU: process two tokens in one launch (blockIdx.y selects token)
+__global__ void __launch_bounds__(256)
+kernel_swiglu_batch2(
+    const half* __restrict__ gate0, const half* __restrict__ gate1,
+    const half* __restrict__ up0, const half* __restrict__ up1,
+    half* __restrict__ y0, half* __restrict__ y1, int n) {
+    const half* gate = (blockIdx.y == 0) ? gate0 : gate1;
+    const half* up = (blockIdx.y == 0) ? up0 : up1;
+    half* y = (blockIdx.y == 0) ? y0 : y1;
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx < n) {
+        float g = __half2float(gate[idx]);
+        float u = __half2float(up[idx]);
+        float sig = 1.0f / (1.0f + expf(-g));
+        y[idx] = __float2half(g * sig * u);
+    }
+}
+
+void gwen_swiglu_batch2(const half* gate0, const half* gate1,
+                         const half* up0, const half* up1,
+                         half* y0, half* y1,
+                         int n, cudaStream_t stream) {
+    dim3 grid((n + 255) / 256, 2);
+    kernel_swiglu_batch2<<<grid, 256, 0, stream>>>(gate0, gate1, up0, up1, y0, y1, n);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
 void gwen_swiglu_quantize_q8_1(const half* gate, const half* up, void* y_q8, int n, cudaStream_t stream) {
     int n_blocks = n / 32;
     int grid = (n_blocks + 7) / 8;  // 8 warps per thread block

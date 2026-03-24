@@ -285,6 +285,32 @@ kernel_rmsnorm_f32_input(
     }
 }
 
+// Batch2: F32-input RMSNorm for two tokens in one launch (2 blocks × 32 threads)
+__global__ void __launch_bounds__(32)
+kernel_rmsnorm_f32_input_batch2(
+    const float* __restrict__ x0_f32,
+    const float* __restrict__ x1_f32,
+    const float* __restrict__ weight,
+    half* __restrict__ y0,
+    half* __restrict__ y1,
+    int dim, float eps)
+{
+    const float* x = (blockIdx.x == 0) ? x0_f32 : x1_f32;
+    half* y = (blockIdx.x == 0) ? y0 : y1;
+    int lane = threadIdx.x;
+    float sum_sq = 0.0f;
+    for (int i = lane; i < dim; i += 32) {
+        float val = x[i];
+        sum_sq += val * val;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
+    float rms_inv = rsqrtf(sum_sq / dim + eps);
+    for (int i = lane; i < dim; i += 32) {
+        y[i] = __float2half(x[i] * rms_inv * weight[i]);
+    }
+}
+
 // FP16→F32 conversion (embedding → F32 residual init)
 __global__ void __launch_bounds__(256)
 kernel_fp16_to_f32(const half* __restrict__ x, float* __restrict__ y, int n) {
@@ -363,6 +389,15 @@ void gwen_gemv_fp8_batch2_residual_f32(const void* W, const float* scales,
 void gwen_rmsnorm_f32_input(const float* x_f32, const float* weight, half* y,
                               int dim, float eps, cudaStream_t stream) {
     kernel_rmsnorm_f32_input<<<1, 32, 0, stream>>>(x_f32, weight, y, dim, eps);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+void gwen_rmsnorm_f32_input_batch2(const float* x0_f32, const float* x1_f32,
+                                    const float* weight,
+                                    half* y0, half* y1,
+                                    int dim, float eps, cudaStream_t stream) {
+    kernel_rmsnorm_f32_input_batch2<<<2, 32, 0, stream>>>(
+        x0_f32, x1_f32, weight, y0, y1, dim, eps);
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 

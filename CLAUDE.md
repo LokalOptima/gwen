@@ -73,17 +73,37 @@ linear_value_head_dim = 128
 full_attention_interval = 4
 ```
 
-### Agent Discipline (see agent-guide/)
-- Before committing source changes: run test suite. Include results in commit message.
-- Before optimizing: profile first (see agent-guide/rules/profiling.md). Three failed attempts = go read instead.
-- Before session ends or context compacts: update HANDOFF.md (template: agent-guide/templates/handoff.md).
-- Commit format: `<type>: <summary>` with `Tests:` and `Perf:` lines (see agent-guide/rules/commits.md).
-- Training runs: must produce train_setup.json + train_log.csv (see agent-guide/rules/training.md).
-- Pre-commit hooks are active: run `agent-guide/hooks/install.sh` if hooks are missing.
-- New debugging/one-off scripts go in `scratch/` (gitignored), not `tests/` or `scripts/`.
-
 ### Dependencies
 - CUDA 13.1
 - CUTLASS 4.x (as git submodule in `third_party/cutlass`)
 - llama.cpp (for reference/comparison, installed system-wide or in `third_party/`)
 - Python 3 with `uv` for test/bench scripts (use `gguf` package for GGUF parsing)
+
+## Agent Discipline (cuda-port)
+
+### GPU Awareness
+- Before running GPU-intensive commands, check `nvidia-smi` for current utilization.
+- GPU locking: wrap GPU commands with `flock` on `/tmp/gpu.lock`:
+  - Shared (inference): `flock --shared /tmp/gpu.lock <command>`
+  - Exclusive (training, benchmarking): `flock --exclusive /tmp/gpu.lock <command>`
+
+### Performance Claims
+- Never claim speedups or metrics without actual benchmark results. If you haven't measured it, don't claim it.
+
+### Development Rules
+- Before committing source changes: run test suite. Include results in commit message.
+- Before optimizing: profile first (see agent-guide/rules/profiling.md). Three failed attempts = go read instead.
+- Before going below library-level (custom CUDA/PTX/SASS): need profiling evidence, confirmed library ceiling, and a known technique. See agent-guide/rules/low-level-optimization.md.
+- Before session ends or context compacts: update HANDOFF.md (template: agent-guide/templates/handoff.md).
+- Commit format: `<type>: <summary>` with `Tests:` and `Perf:` lines (see agent-guide/rules/commits.md).
+- Training runs: must produce train_setup.json + train_log.csv (see agent-guide/rules/training.md).
+- New debugging/one-off scripts go in `scratch/` (gitignored), not `tests/` or `scripts/`.
+
+### Detailed Rules
+- Testing: see agent-guide/rules/testing.md
+- Profiling: see agent-guide/rules/profiling.md
+- Buffer reuse: see agent-guide/rules/buffer-reuse.md
+- Commits: see agent-guide/rules/commits.md
+- Documentation: see agent-guide/rules/documentation.md
+- Training: see agent-guide/rules/training.md
+- Low-level optimization: see agent-guide/rules/low-level-optimization.md

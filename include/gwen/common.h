@@ -59,6 +59,7 @@ enum class GGMLType : uint32_t {
     F64    = 28,
     BF16   = 30,
     FP8_E4M3 = 31,  // GWEN-specific: 8-bit float (E4M3), 1 byte per element
+    FP4_E2M1 = 32,  // GWEN-specific: 4-bit float (E2M1), packed 2 per byte
 };
 
 const char* ggml_type_name(GGMLType type);
@@ -87,8 +88,10 @@ struct ModelConfig {
     float    rms_norm_eps    = 1e-6f;
     uint32_t ssm_conv_kernel = 4;
     uint32_t ssm_state_size  = 128;     // d_k = d_v for DeltaNet
-    uint32_t ssm_n_heads     = 16;      // DeltaNet heads
-    uint32_t ssm_inner_size  = 2048;    // DeltaNet hidden
+    uint32_t ssm_n_heads     = 16;      // DeltaNet V heads (legacy alias for ssm_n_v_heads)
+    uint32_t ssm_n_k_heads   = 16;      // DeltaNet K heads (linear_num_key_heads)
+    uint32_t ssm_n_v_heads   = 16;      // DeltaNet V heads (linear_num_value_heads)
+    uint32_t ssm_inner_size  = 2048;    // DeltaNet hidden (= n_v_heads * state_size)
     uint32_t full_attn_interval = 4;    // every 4th layer is full attention
     uint32_t eos_token_id    = 248046;
     uint32_t pad_token_id    = 248055;
@@ -96,6 +99,11 @@ struct ModelConfig {
 
     bool is_full_attention_layer(int layer_idx) const {
         return (layer_idx + 1) % full_attn_interval == 0;
+    }
+
+    // QKV projection output dimension: Q(k_heads*dk) + K(k_heads*dk) + V(v_heads*dv)
+    uint32_t ssm_qkv_dim() const {
+        return ssm_n_k_heads * ssm_state_size * 2 + ssm_n_v_heads * ssm_state_size;
     }
 };
 

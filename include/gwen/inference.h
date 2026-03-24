@@ -83,6 +83,8 @@ struct InferenceState {
     // --- Batch-2 scratch buffers (token B in 2-token verify) ---
     half* b2_buf_a = nullptr;       // [n_embed] token B hidden state
     half* b2_buf_b = nullptr;       // [n_embed] token B residual
+    float* b2_buf_a_f32 = nullptr;  // [n_embed] F32 residual buffer A for token B (FP8 path)
+    float* b2_buf_b_f32 = nullptr;  // [n_embed] F32 residual buffer B for token B (FP8 path)
     half* b2_x_norm = nullptr;      // [n_embed] token B after norm
     half* b2_qkv = nullptr;         // [3 * ssm_inner]
     half* b2_gate_z = nullptr;      // [ssm_inner]

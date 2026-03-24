@@ -97,12 +97,15 @@ int main(int argc, char** argv) {
     (void)output_logits;
 
     // Positional arguments: [model_path] [input_text]
-    // If first positional arg looks like a model file (ends in .gguf or .gwfp8), treat it as model path
+    // If first positional arg looks like a model file (ends in .gguf/.gwfp8/.gwfp4), treat it as model path
     std::string input_text;
+    auto ends_with = [](const std::string& s, const std::string& suffix) {
+        return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
+    };
     for (int i = optind; i < argc; i++) {
         std::string arg = argv[i];
-        if (model_path.empty() && (arg.size() >= 5 && (arg.substr(arg.size() - 5) == ".gguf" ||
-            (arg.size() >= 6 && arg.substr(arg.size() - 6) == ".gwfp8")))) {
+        if (model_path.empty() && (ends_with(arg, ".gguf") || ends_with(arg, ".gwfp8") ||
+                                    ends_with(arg, ".gwfp4"))) {
             model_path = arg;
         } else {
             if (!input_text.empty()) input_text += " ";
@@ -121,7 +124,9 @@ int main(int argc, char** argv) {
 
     // Load model — auto-detect format by extension
     std::unique_ptr<Model> model;
-    if (model_path.size() >= 6 && model_path.substr(model_path.size() - 6) == ".gwfp8") {
+    if (ends_with(model_path, ".gwfp4")) {
+        model = Model::load_fp4(model_path);
+    } else if (ends_with(model_path, ".gwfp8")) {
         model = Model::load_fp8(model_path);
     } else {
         model = Model::load(model_path);
@@ -138,8 +143,8 @@ int main(int argc, char** argv) {
     }
 
     // Build tokenizer concurrently with weight upload.
-    // For GWFP8: load tokenizer from the default GGUF (metadata only, no weight upload)
-    // TODO: embed tokenizer in GWFP8 format or load from HF tokenizer.json
+    // For GWFP8/GWFP4: load tokenizer from the default GGUF (metadata only, no weight upload)
+    // TODO: embed tokenizer in binary format or load from HF tokenizer.json
     std::unique_ptr<GGUFFile> tok_gguf;
     if (!model->gguf) {
         tok_gguf = GGUFFile::open(gwen::default_model_path());
@@ -368,9 +373,13 @@ int main(int argc, char** argv) {
     auto prompt_tokens = tokenizer->encode(prompt);
 
     // Allocate inference state
+    bool is_fp4 = ends_with(model_path, ".gwfp4");
     InferenceState state;
     state.allocate(model->config, allocator);
-    state.allocate_prefill(model->config, allocator, 4096);
+    if (!is_fp4) {
+        // FP8 prefill path — not yet supported for FP4 models
+        state.allocate_prefill(model->config, allocator, 4096);
+    }
     if (model->has_mtp) {
         state.allocate_mtp(model->config, allocator, 4096);
         state.allocate_batch2(model->config, allocator);

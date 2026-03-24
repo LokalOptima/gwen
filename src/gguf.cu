@@ -300,7 +300,12 @@ ModelConfig GGUFFile::build_config() const {
     cfg.ssm_conv_kernel = get_u32("qwen35.ssm.conv_kernel");
     cfg.ssm_state_size  = get_u32("qwen35.ssm.state_size");
     cfg.ssm_n_heads     = get_u32("qwen35.ssm.group_count");
+    cfg.ssm_n_k_heads   = cfg.ssm_n_heads;  // GGUF group_count = K heads
+    cfg.ssm_n_v_heads   = cfg.ssm_n_heads;  // Default: symmetric (0.8B). Overridden below for 4B+.
     cfg.ssm_inner_size  = get_u32("qwen35.ssm.inner_size");
+    // Derive n_v_heads: ssm_inner_size = n_v_heads * state_size
+    cfg.ssm_n_v_heads   = cfg.ssm_inner_size / cfg.ssm_state_size;
+    cfg.ssm_n_heads     = cfg.ssm_n_v_heads;  // legacy alias
     cfg.full_attn_interval = get_u32("qwen35.full_attention_interval");
     cfg.rope_dim        = get_u32("qwen35.rope.dimension_count", 64);
     cfg.context_length  = get_u32("qwen35.context_length", 262144);

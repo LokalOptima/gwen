@@ -24,6 +24,11 @@ struct WeightRef {
     float* device_sfa = nullptr;          // [M * ceil(K/128)] for CUTLASS groupwise GEMM
     int sfa_n_k_blocks = 0;              // ceil(K / 128)
 
+    // FP4 E2M1 block scaling (only used when type == FP4_E2M1)
+    void* device_scales_fp4 = nullptr;    // [M, K/16] E4M3 micro-scales on GPU
+    size_t scales_fp4_bytes = 0;          // size of scales data
+    float fp4_global_scale = 0.0f;        // per-tensor global scale (F32)
+
     bool on_device() const { return device_data != nullptr; }
 };
 
@@ -97,8 +102,9 @@ struct Model {
     ModelConfig config;
     std::unique_ptr<GGUFFile> gguf;
 
-    // GWFP8 mmap'd file data (kept alive while model is loaded)
+    // GWFP8/GWFP4 mmap'd file data (kept alive while model is loaded)
     std::vector<uint8_t> gwfp8_file_data_;  // file contents (mmap'd or loaded)
+    std::vector<uint8_t> gwfp4_file_data_;  // GWFP4 file contents
 
     // Global weights
     WeightRef token_embd;       // [n_embed, n_vocab] Q6_K
@@ -121,6 +127,9 @@ struct Model {
 
     // Load from GWFP8 file (FP8 E4M3 weights with per-row scales)
     static std::unique_ptr<Model> load_fp8(const std::string& fp8_path);
+
+    // Load from GWFP4 file (FP4 E2M1 weights with E4M3 block scales + global scale)
+    static std::unique_ptr<Model> load_fp4(const std::string& fp4_path);
 
     // Load MTP weights from binary file (GWMT format)
     void load_mtp(const std::string& mtp_path);

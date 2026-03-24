@@ -142,6 +142,30 @@ kernel_embed_lookup_fp8(const uint8_t* __restrict__ table,
     }
 }
 
+// FP16 embedding lookup (GWFP4 path — embeddings stored as FP16)
+__global__ void __launch_bounds__(256)
+kernel_embed_lookup_fp16(const half* __restrict__ table,
+                         const int* __restrict__ d_token_id,
+                         half* __restrict__ y, int dim) {
+    int token_id = *d_token_id;
+    const half* row = table + (size_t)token_id * dim;
+    for (int i = threadIdx.x; i < dim; i += 256) {
+        y[i] = row[i];
+    }
+}
+
+// F32 embedding lookup (GWFP4 path — embeddings stored as F32)
+__global__ void __launch_bounds__(256)
+kernel_embed_lookup_f32(const float* __restrict__ table,
+                        const int* __restrict__ d_token_id,
+                        half* __restrict__ y, int dim) {
+    int token_id = *d_token_id;
+    const float* row = table + (size_t)token_id * dim;
+    for (int i = threadIdx.x; i < dim; i += 256) {
+        y[i] = __float2half(row[i]);
+    }
+}
+
 void gwen_embed_lookup(const void* table, GGMLType table_type,
                        const int* d_token_id, half* y, int dim,
                        cudaStream_t stream, const float* scales) {
@@ -151,6 +175,12 @@ void gwen_embed_lookup(const void* table, GGMLType table_type,
         GWEN_CHECK(scales != nullptr, "FP8 embed lookup requires scales");
         kernel_embed_lookup_fp8<<<1, 256, 0, stream>>>(
             static_cast<const uint8_t*>(table), scales, d_token_id, y, dim);
+    } else if (table_type == GGMLType::F32) {
+        kernel_embed_lookup_f32<<<1, 256, 0, stream>>>(
+            static_cast<const float*>(table), d_token_id, y, dim);
+    } else if (table_type == GGMLType::F16) {
+        kernel_embed_lookup_fp16<<<1, 256, 0, stream>>>(
+            static_cast<const half*>(table), d_token_id, y, dim);
     } else {
         GWEN_CHECK(false, "Unsupported embedding type");
     }
