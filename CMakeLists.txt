@@ -21,8 +21,7 @@ endif()
 # Project includes
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# --- llama.cpp source path (for MMA flash attention kernel) ---
-set(LLAMA_CPP_PATH "$ENV{HOME}/git/llama.cpp" CACHE PATH "Path to llama.cpp source tree")
+# llama.cpp headers vendored in include/gwen/llama/ (no external dependency)
 
 # --- Library: gwen core ---
 file(GLOB GWEN_KERNEL_SOURCES src/kernels/*.cu)
@@ -47,46 +46,36 @@ if(GWEN_SOURCES)
     set_target_properties(gwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
-# --- MMA flash attention (compiled against llama.cpp headers) ---
-if(EXISTS ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda/common.cuh)
+# --- Vendored llama.cpp headers (SM_120 subset) ---
+set(LLAMA_VENDORED_INCLUDE ${CMAKE_SOURCE_DIR}/include/gwen/llama)
+
+# --- MMA flash attention (vendored llama.cpp kernel) ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/fattn_mma.cu)
     add_library(gwen_fattn STATIC src/kernels/fattn_mma.cu)
-    target_include_directories(gwen_fattn PRIVATE
-        include
-        ${LLAMA_CPP_PATH}/ggml/include
-        ${LLAMA_CPP_PATH}/ggml/src
-        ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
-    )
+    target_include_directories(gwen_fattn PRIVATE include ${LLAMA_VENDORED_INCLUDE})
     set_target_properties(gwen_fattn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     target_link_libraries(gwen_core gwen_fattn)
-    message(STATUS "llama.cpp found — MMA flash attention enabled")
+    message(STATUS "MMA flash attention enabled (vendored)")
+endif()
 
-    # --- MMQ fused K-quant GEMM (compiled against llama.cpp headers) ---
-    if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_mmq.cu)
-        add_library(gwen_mmq STATIC src/kernels/gemm_mmq.cu)
-        target_include_directories(gwen_mmq PRIVATE
-            include
-            ${LLAMA_CPP_PATH}/ggml/include
-            ${LLAMA_CPP_PATH}/ggml/src
-            ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
-        )
-        set_target_properties(gwen_mmq PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-        target_link_libraries(gwen_core gwen_mmq)
-        message(STATUS "MMQ fused K-quant GEMM enabled")
-    endif()
+# --- MMQ fused K-quant GEMM (vendored llama.cpp kernel) ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_mmq.cu)
+    add_library(gwen_mmq STATIC src/kernels/gemm_mmq.cu)
+    target_include_directories(gwen_mmq PRIVATE include ${LLAMA_VENDORED_INCLUDE})
+    set_target_properties(gwen_mmq PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    target_link_libraries(gwen_core gwen_mmq)
+    message(STATUS "MMQ fused K-quant GEMM enabled (vendored)")
+endif()
 
-    # --- FP8 GEMM (CUTLASS 3.x SM120 blockwise scaling) ---
-    # Requires 120a for block-scaled MMA instructions (SM120 "all features")
-    if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_fp8.cu)
-        add_library(gwen_fp8_gemm STATIC src/kernels/gemm_fp8.cu)
-        target_include_directories(gwen_fp8_gemm PRIVATE include)
-        set_target_properties(gwen_fp8_gemm PROPERTIES
-            CUDA_SEPARABLE_COMPILATION OFF
-            CUDA_ARCHITECTURES "120a")
-        target_link_libraries(gwen_core gwen_fp8_gemm)
-        message(STATUS "FP8 GEMM (CUTLASS 3.x SM120a) enabled")
-    endif()
-else()
-    message(WARNING "llama.cpp not found at ${LLAMA_CPP_PATH} — MMA flash attention disabled")
+# --- FP8 GEMM (CUTLASS 3.x SM120 blockwise scaling) ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_fp8.cu)
+    add_library(gwen_fp8_gemm STATIC src/kernels/gemm_fp8.cu)
+    target_include_directories(gwen_fp8_gemm PRIVATE include)
+    set_target_properties(gwen_fp8_gemm PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_ARCHITECTURES "120a")
+    target_link_libraries(gwen_core gwen_fp8_gemm)
+    message(STATUS "FP8 GEMM (CUTLASS 3.x SM120a) enabled")
 endif()
 
 # --- Main executable ---

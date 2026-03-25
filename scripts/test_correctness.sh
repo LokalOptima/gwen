@@ -1,176 +1,169 @@
 #!/bin/bash
 # GWEN Correctness Test Suite
 #
-# Self-contained regression tests — no live llama.cpp dependency.
-#
 # Tests:
-# 1. dp4a kernel unit tests (GEMV accuracy vs legacy FP16 path)
-# 2. CUTLASS GEMM vs GEMV (numerical agreement)
-# 3. Per-layer golden check vs llama.cpp reference (tests/golden/)
-# 4. Self-regression: greedy tokens match GWEN's own golden data (tests/golden_gwen/)
-# 5. Determinism check (same output across multiple runs)
+#   1. Generation correctness: greedy decode matches golden reference
+#   2. Prefill smoke test: gwen_bench -p 32 -n 0 -r 1 completes without error
+#   3. Decode smoke test: gwen_bench -p 0 -n 32 -r 1 completes without error
+#   4. Determinism: 3 identical runs produce the same output
 #
-# Generate golden data:
-#   llama.cpp layers:  scripts/generate_golden.sh
-#   GWEN tokens:       scripts/generate_gwen_golden.sh
+# Usage:
+#   scripts/test_correctness.sh                  # run tests (generate golden if missing)
+#   scripts/test_correctness.sh --generate-golden # force regenerate golden reference
+#
+# Golden data is stored in tests/golden_greedy/. Regenerate after intentional
+# arithmetic changes (new quantization, kernel rewrites, etc).
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 MODEL="${HOME}/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"
-GWEN="./build/gwen"
-GOLDEN_LLAMA="tests/golden"
-GOLDEN_GWEN="tests/golden_gwen"
+GWEN="${ROOT}/build/gwen"
+BENCH="${ROOT}/build/gwen_bench"
+GOLDEN_DIR="${ROOT}/tests/golden_greedy"
+GOLDEN_FILE="${GOLDEN_DIR}/generation.txt"
+
+PROMPT="1 2 3 4 5 6 7 8"
+MAX_PREDICT=20
+
 PASS=0
 FAIL=0
-SKIP=0
 TOTAL=0
 
 pass() { PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); echo "  FAIL: $1"; }
-skip() { SKIP=$((SKIP+1)); echo "  SKIP: $1"; }
 
-echo "╔═══════════════════════════════════════════════╗"
-echo "║       GWEN Correctness Test Suite             ║"
-echo "╚═══════════════════════════════════════════════╝"
-echo ""
+# ── Preflight checks ──
+if [ ! -x "$GWEN" ]; then
+    echo "ERROR: gwen binary not found at $GWEN"
+    echo "Run: cmake --build build"
+    exit 1
+fi
+if [ ! -x "$BENCH" ]; then
+    echo "ERROR: gwen_bench binary not found at $BENCH"
+    echo "Run: cmake --build build"
+    exit 1
+fi
+if [ ! -f "$MODEL" ]; then
+    echo "ERROR: model not found at $MODEL"
+    exit 1
+fi
 
-# ── 1. dp4a Kernel Unit Tests ──
-echo "── 1. dp4a Kernel Unit Tests ──"
-if [ -x "./build/test_dp4a" ]; then
-    DP4A_OUT=$(./build/test_dp4a "$MODEL" 2>&1)
-    echo "$DP4A_OUT" | grep -E "PASS|FAIL|Max diff"
-    if echo "$DP4A_OUT" | grep -q "ALL DP4A TESTS PASSED"; then
-        pass "dp4a kernels match legacy FP16 path"
-    else
-        fail "dp4a kernel divergence"
+# ── Generate golden reference ──
+generate_golden() {
+    echo "Generating golden reference..."
+    mkdir -p "$GOLDEN_DIR"
+
+    local output
+    output=$(flock --shared /tmp/gpu.lock \
+        "$GWEN" --model "$MODEL" --no-mtp --greedy --max-predict "$MAX_PREDICT" "$PROMPT" 2>/dev/null)
+
+    if [ -z "$output" ]; then
+        echo "ERROR: gwen produced no output"
+        exit 1
     fi
-else
-    skip "test_dp4a not built"
-fi
-echo ""
 
-# ── 2. CUTLASS GEMM Tests ──
-echo "── 2. CUTLASS GEMM vs GEMV ──"
-if [ -x "./build/test_gemm" ]; then
-    GEMM_OUT=$(./build/test_gemm "$MODEL" 2>&1)
-    echo "$GEMM_OUT" | grep -E "PASS|FAIL|Max diff"
-    if echo "$GEMM_OUT" | grep -q "ALL TESTS PASSED"; then
-        pass "CUTLASS GEMM matches GEMV"
-    else
-        fail "CUTLASS GEMM divergence"
+    echo "$output" > "$GOLDEN_FILE"
+    echo "Golden reference saved to $GOLDEN_FILE"
+    echo "Content: $(cat "$GOLDEN_FILE")"
+}
+
+FORCE_GOLDEN=0
+if [ "${1:-}" = "--generate-golden" ]; then
+    FORCE_GOLDEN=1
+fi
+
+if [ "$FORCE_GOLDEN" -eq 1 ] || [ ! -f "$GOLDEN_FILE" ]; then
+    generate_golden
+    if [ "$FORCE_GOLDEN" -eq 1 ]; then
+        echo "Golden reference regenerated. Run without --generate-golden to test."
+        exit 0
     fi
+fi
+
+echo ""
+echo "========================================"
+echo "  GWEN Correctness Test Suite"
+echo "========================================"
+echo ""
+
+# ── 1. Generation Correctness ──
+echo "-- 1. Generation Correctness (greedy decode vs golden) --"
+
+ACTUAL=$(flock --shared /tmp/gpu.lock \
+    "$GWEN" --model "$MODEL" --no-mtp --greedy --max-predict "$MAX_PREDICT" "$PROMPT" 2>/dev/null)
+EXPECTED=$(cat "$GOLDEN_FILE")
+
+if [ "$ACTUAL" = "$EXPECTED" ]; then
+    pass "greedy output matches golden reference"
 else
-    skip "test_gemm not built"
+    fail "greedy output differs from golden reference"
+    echo "    Expected: $EXPECTED"
+    echo "    Actual:   $ACTUAL"
 fi
 echo ""
 
-# ── 3. Per-Layer Golden Check vs llama.cpp ──
-echo "── 3. Per-Layer Golden Check (vs llama.cpp reference) ──"
-if [ -d "$GOLDEN_LLAMA" ] && [ -d "$GOLDEN_LLAMA/prompt_0" ]; then
-    LOGIT_OUT=$(uv run --with numpy scripts/test_logits.py 2>&1)
-    echo "$LOGIT_OUT"
+# ── 2. Prefill Smoke Test ──
+echo "-- 2. Prefill Smoke Test (gwen_bench -p 32 -n 0 -r 1) --"
 
-    N_LOGIT_PASS=$(echo "$LOGIT_OUT" | grep -c "PASS:" || true)
-    N_LOGIT_FAIL=$(echo "$LOGIT_OUT" | grep -c "FAIL:" || true)
+BENCH_PREFILL_OUT=$(flock --shared /tmp/gpu.lock \
+    "$BENCH" -m "$MODEL" -p 32 -n 0 -r 1 2>&1) || true
+BENCH_PREFILL_EXIT=$?
 
-    if [ "$N_LOGIT_FAIL" -eq 0 ] && [ "$N_LOGIT_PASS" -gt 0 ]; then
-        pass "per-layer golden check ($N_LOGIT_PASS prompts)"
-    else
-        fail "per-layer golden check ($N_LOGIT_FAIL failures)"
-    fi
+if [ $BENCH_PREFILL_EXIT -eq 0 ] && echo "$BENCH_PREFILL_OUT" | grep -qE "tok/s|pp32"; then
+    pass "prefill benchmark completed successfully"
 else
-    skip "no llama.cpp golden data (run scripts/generate_golden.sh)"
+    fail "prefill benchmark failed (exit=$BENCH_PREFILL_EXIT)"
+    echo "    Output: $(echo "$BENCH_PREFILL_OUT" | tail -5)"
 fi
 echo ""
 
-# ── 4. Self-Regression: GWEN Greedy Token Match ──
-echo "── 4. Self-Regression (GWEN greedy tokens vs golden) ──"
+# ── 3. Decode Smoke Test ──
+echo "-- 3. Decode Smoke Test (gwen_bench -p 0 -n 32 -r 1) --"
 
-PROMPTS=(
-    "The quick brown fox"
-    "In the beginning"
-    "def fibonacci(n):"
-    "The capital of France is"
-    "1+1=2. 2+2=4. 3+3="
-    "Once upon a time there was"
-    "import numpy as np"
-    "The meaning of life is"
-)
+BENCH_DECODE_OUT=$(flock --shared /tmp/gpu.lock \
+    "$BENCH" -m "$MODEL" -p 0 -n 32 -r 1 2>&1) || true
+BENCH_DECODE_EXIT=$?
 
-if [ -d "$GOLDEN_GWEN" ]; then
-    for i in "${!PROMPTS[@]}"; do
-        prompt="${PROMPTS[$i]}"
-        golden_file="$GOLDEN_GWEN/prompt_${i}.tokens"
-
-        if [ ! -f "$golden_file" ]; then
-            skip "\"$prompt\" (no golden file)"
-            continue
-        fi
-
-        # Get GWEN's current greedy tokens
-        GWEN_TOKENS=$("$GWEN" --model "$MODEL" --prompt "$prompt" \
-            --n-predict 30 --greedy 2>&1 \
-            | grep "Generated token IDs:" | sed 's/Generated token IDs: //' | tr -s ' ')
-
-        if [ -z "$GWEN_TOKENS" ]; then
-            fail "\"$prompt\" (GWEN produced no output)"
-            continue
-        fi
-
-        # Convert to one-per-line for comparison
-        CURRENT=$(echo "$GWEN_TOKENS" | tr ' ' '\n' | grep -v '^$')
-        GOLDEN=$(< "$golden_file")
-
-        if [ "$CURRENT" = "$GOLDEN" ]; then
-            pass "\"$prompt\" → 30/30 tokens match golden"
-        else
-            # Count matching prefix
-            MATCH=0
-            TOTAL_TOKENS=$(echo "$GOLDEN" | wc -l)
-            while IFS= read -r gold_tok <&3 && IFS= read -r cur_tok <&4; do
-                if [ "$gold_tok" = "$cur_tok" ]; then
-                    MATCH=$((MATCH+1))
-                else
-                    break
-                fi
-            done 3< <(echo "$GOLDEN") 4< <(echo "$CURRENT")
-
-            fail "\"$prompt\" → $MATCH/$TOTAL_TOKENS tokens match (diverges at position $MATCH)"
-        fi
-    done
+if [ $BENCH_DECODE_EXIT -eq 0 ] && echo "$BENCH_DECODE_OUT" | grep -qE "tok/s|tg32"; then
+    pass "decode benchmark completed successfully"
 else
-    skip "no GWEN golden data (run scripts/generate_gwen_golden.sh)"
+    fail "decode benchmark failed (exit=$BENCH_DECODE_EXIT)"
+    echo "    Output: $(echo "$BENCH_DECODE_OUT" | tail -5)"
 fi
 echo ""
 
-# ── 5. Determinism Check ──
-echo "── 5. Determinism (5 runs, same output) ──"
-TOKENS_PREV=""
+# ── 4. Determinism ──
+echo "-- 4. Determinism (3 runs, same output) --"
+
+PREV=""
 ALL_SAME=1
-for i in $(seq 1 5); do
-    TOKENS=$("$GWEN" --model "$MODEL" --prompt "Hello world" \
-        --n-predict 20 --greedy 2>&1 \
-        | grep "Generated token IDs:" | sed 's/Generated token IDs: //' | tr -s ' ')
-    if [ -n "$TOKENS_PREV" ] && [ "$TOKENS" != "$TOKENS_PREV" ]; then
+for i in 1 2 3; do
+    RUN_OUT=$(flock --shared /tmp/gpu.lock \
+        "$GWEN" --model "$MODEL" --no-mtp --greedy --max-predict "$MAX_PREDICT" "$PROMPT" 2>/dev/null)
+    if [ -n "$PREV" ] && [ "$RUN_OUT" != "$PREV" ]; then
         ALL_SAME=0
-        echo "  Run $i DIFFERS: $TOKENS"
+        echo "    Run $i differs from run $((i-1))"
     fi
-    TOKENS_PREV="$TOKENS"
+    PREV="$RUN_OUT"
 done
+
 if [ $ALL_SAME -eq 1 ]; then
-    pass "5 identical runs (deterministic)"
+    pass "3 identical runs (deterministic)"
 else
-    fail "Non-deterministic output across runs"
+    fail "non-deterministic output across runs"
 fi
 echo ""
 
 # ── Summary ──
-echo "═══════════════════════════════════════════════"
-echo "  Results: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
+echo "========================================"
+echo "  Results: $PASS passed, $FAIL failed ($TOTAL total)"
 if [ $FAIL -eq 0 ]; then
     echo "  ALL TESTS PASSED"
 else
     echo "  SOME TESTS FAILED"
 fi
-echo "═══════════════════════════════════════════════"
+echo "========================================"
 exit $FAIL

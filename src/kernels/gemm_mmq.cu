@@ -1,7 +1,7 @@
 // Fused quantized GEMM — ported from llama.cpp's mmq kernel.
-// Compiled against llama.cpp headers (same approach as fattn_mma.cu).
-// Supports Q4_K, Q5_K, Q6_K, Q8_0 weight types.
-// MIT License applies to the llama.cpp code.
+// Uses vendored llama.cpp headers (include/gwen/llama/).
+// Supports Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS weight types.
+// MIT License applies to the llama.cpp kernel code.
 
 extern "C" [[noreturn]] void ggml_abort(const char*, int, const char*, ...);
 

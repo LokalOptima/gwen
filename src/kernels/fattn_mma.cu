@@ -1,6 +1,6 @@
 // MMA-based flash attention for GWEN.
-// Compiled against llama.cpp's fattn-mma-f16 kernel headers directly.
-// MIT License applies to the llama.cpp code.
+// Uses vendored llama.cpp headers (include/gwen/llama/).
+// MIT License applies to the llama.cpp kernel code.
 
 // Stub for ggml_abort (referenced by common.cuh error paths, never actually called)
 extern "C" [[noreturn]] void ggml_abort(const char*, int, const char*, ...) { __builtin_trap(); }
