@@ -15,20 +15,6 @@ struct WeightRef {
     size_t size_bytes = 0;
     std::vector<uint64_t> shape;
 
-    // FP8 per-row scaling (only used when type == FP8_E4M3)
-    const float* host_scales = nullptr;   // mmap'd scale array (one float per row)
-    float* device_scales = nullptr;       // GPU pointer for scales
-    uint32_t n_scale_rows = 0;            // number of scale values
-
-    // CUTLASS SFA scale array (per-row scales replicated across K-blocks)
-    float* device_sfa = nullptr;          // [M * ceil(K/128)] for CUTLASS groupwise GEMM
-    int sfa_n_k_blocks = 0;              // ceil(K / 128)
-
-    // FP4 E2M1 block scaling (only used when type == FP4_E2M1)
-    void* device_scales_fp4 = nullptr;    // [M, K/16] E4M3 micro-scales on GPU
-    size_t scales_fp4_bytes = 0;          // size of scales data
-    float fp4_global_scale = 0.0f;        // per-tensor global scale (F32)
-
     bool on_device() const { return device_data != nullptr; }
 };
 
@@ -102,11 +88,7 @@ struct Model {
     ModelConfig config;
     std::unique_ptr<GGUFFile> gguf;
 
-    // GWFP8/GWFP4 mmap'd file data (kept alive while model is loaded)
-    std::vector<uint8_t> gwfp8_file_data_;  // file contents (mmap'd or loaded)
-    std::vector<uint8_t> gwfp4_file_data_;  // GWFP4 file contents
-
-    // Host-side storage for load-time format conversions (e.g. IQ4_XS → Q4_K)
+    // Host-side storage for load-time format conversions (e.g. IQ4_XS → FP16)
     std::vector<std::vector<uint8_t>> converted_buffers_;
 
     // Global weights
@@ -128,12 +110,6 @@ struct Model {
 
     // Load from GGUF file
     static std::unique_ptr<Model> load(const std::string& gguf_path);
-
-    // Load from GWFP8 file (FP8 E4M3 weights with per-row scales)
-    static std::unique_ptr<Model> load_fp8(const std::string& fp8_path);
-
-    // Load from GWFP4 file (FP4 E2M1 weights with E4M3 block scales + global scale)
-    static std::unique_ptr<Model> load_fp4(const std::string& fp4_path);
 
     // Load MTP weights from binary file (GWMT format)
     void load_mtp(const std::string& mtp_path);

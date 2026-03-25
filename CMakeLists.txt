@@ -21,19 +21,15 @@ endif()
 # Project includes
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# llama.cpp headers vendored in include/gwen/llama/ (no external dependency)
-
 # --- Library: gwen core ---
 file(GLOB GWEN_KERNEL_SOURCES src/kernels/*.cu)
 list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "fattn_mma\\.cu$")
-list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_mmq\\.cu$")   # legacy Q4_K GEMM, no longer linked
-list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_fp8\\.cu$")   # separate lib with 120a arch
+list(FILTER GWEN_KERNEL_SOURCES EXCLUDE REGEX "gemm_mmq\\.cu$")   # compiled separately with vendored headers
 
 set(GWEN_SOURCES
     ${GWEN_KERNEL_SOURCES}
     src/gguf.cu
     src/model.cu
-    src/memory.cu
     src/inference.cu
     src/tokenizer.cu
 )
@@ -46,36 +42,20 @@ if(GWEN_SOURCES)
     set_target_properties(gwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
-# --- Vendored llama.cpp headers (SM_120 subset) ---
-set(LLAMA_VENDORED_INCLUDE ${CMAKE_SOURCE_DIR}/include/gwen/llama)
-
-# --- MMA flash attention (vendored llama.cpp kernel) ---
+# --- MMA flash attention (vendored from llama.cpp) ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/fattn_mma.cu)
     add_library(gwen_fattn STATIC src/kernels/fattn_mma.cu)
-    target_include_directories(gwen_fattn PRIVATE include ${LLAMA_VENDORED_INCLUDE})
+    target_include_directories(gwen_fattn PRIVATE include)
     set_target_properties(gwen_fattn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     target_link_libraries(gwen_core gwen_fattn)
-    message(STATUS "MMA flash attention enabled (vendored)")
 endif()
 
-# --- MMQ fused K-quant GEMM (vendored llama.cpp kernel) ---
+# --- MMQ fused K-quant GEMM (vendored from llama.cpp) ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_mmq.cu)
     add_library(gwen_mmq STATIC src/kernels/gemm_mmq.cu)
-    target_include_directories(gwen_mmq PRIVATE include ${LLAMA_VENDORED_INCLUDE})
+    target_include_directories(gwen_mmq PRIVATE include)
     set_target_properties(gwen_mmq PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     target_link_libraries(gwen_core gwen_mmq)
-    message(STATUS "MMQ fused K-quant GEMM enabled (vendored)")
-endif()
-
-# --- FP8 GEMM (CUTLASS 3.x SM120 blockwise scaling) ---
-if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_fp8.cu)
-    add_library(gwen_fp8_gemm STATIC src/kernels/gemm_fp8.cu)
-    target_include_directories(gwen_fp8_gemm PRIVATE include)
-    set_target_properties(gwen_fp8_gemm PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_ARCHITECTURES "120a")
-    target_link_libraries(gwen_core gwen_fp8_gemm)
-    message(STATUS "FP8 GEMM (CUTLASS 3.x SM120a) enabled")
 endif()
 
 # --- Main executable ---
@@ -97,25 +77,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/src/server.cpp)
         ${CMAKE_SOURCE_DIR}/third_party/cpp-httplib)
 endif()
 
-# --- Dev Server executable (MTP v3 training) ---
-if(EXISTS ${CMAKE_SOURCE_DIR}/src/dev_server.cpp)
-    find_package(CUDAToolkit REQUIRED)
-    find_package(Threads REQUIRED)
-    add_executable(gwen_dev_server src/dev_server.cpp
-        ${CMAKE_SOURCE_DIR}/third_party/cpp-httplib/httplib.cpp)
-    target_link_libraries(gwen_dev_server gwen_core CUDA::cudart Threads::Threads)
-    target_include_directories(gwen_dev_server PRIVATE
-        ${CUDAToolkit_INCLUDE_DIRS}
-        ${CMAKE_SOURCE_DIR}/third_party/cpp-httplib)
-endif()
-
 # --- Micro-benchmarks ---
-if(EXISTS ${CMAKE_SOURCE_DIR}/bench/micro_bench.cu)
-    add_executable(micro_bench bench/micro_bench.cu)
-    target_link_libraries(micro_bench gwen_core)
-endif()
-
-# bench_gemm_approaches: disabled (references removed gwen_gemm_mmq Q4_K path)
 
 # --- Kernel tests ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_kernels.cu)
@@ -123,20 +85,6 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_kernels.cu)
     target_link_libraries(test_kernels gwen_core)
 endif()
 
-if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_layers.cu)
-    add_executable(test_layers tests/test_layers.cu)
-    target_link_libraries(test_layers gwen_core)
-endif()
-
-if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_gemm.cu)
-    add_executable(test_gemm tests/test_gemm.cu)
-    target_link_libraries(test_gemm gwen_core)
-endif()
-
-if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_dp4a.cu)
-    add_executable(test_dp4a tests/test_dp4a.cu)
-    target_link_libraries(test_dp4a gwen_core)
-endif()
 
 # --- Benchmark (llama-bench replica) ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/bench/gwen_bench.cu)

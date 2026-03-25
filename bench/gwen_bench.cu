@@ -209,17 +209,7 @@ int main(int argc, char** argv) {
     // ---- Load model ----
     fprintf(stderr, "gwen-bench: loading %s\n", model_path.c_str());
 
-    std::unique_ptr<Model> model;
-    bool is_gguf = ends_with(model_path, ".gguf");
-    bool is_fp4 = ends_with(model_path, ".gwfp4");
-
-    if (is_fp4) {
-        model = Model::load_fp4(model_path);
-    } else if (ends_with(model_path, ".gwfp8")) {
-        model = Model::load_fp8(model_path);
-    } else {
-        model = Model::load(model_path);
-    }
+    std::unique_ptr<Model> model = Model::load(model_path);
 
     CudaAllocator allocator;
     model->upload_weights(allocator);
@@ -235,9 +225,8 @@ int main(int argc, char** argv) {
     int max_seq = std::max(n_prompt + n_gen, 4096);
     InferenceState state;
     state.allocate(model->config, allocator, max_seq);
-    if (n_prompt > 0 && !is_fp4) {
-        state.allocate_prefill(model->config, allocator, max_seq,
-                               /*f32_path=*/!is_gguf, /*gguf_mode=*/is_gguf);
+    if (n_prompt > 0) {
+        state.allocate_prefill(model->config, allocator, max_seq);
     }
 
     fprintf(stderr, "gwen-bench: VRAM %.0f MB | tests: %s | reps: %d\n",

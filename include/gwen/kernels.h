@@ -85,80 +85,6 @@ void gwen_gemv_dp4a_residual_batch2(const void* W,
                                      GGMLType type, cudaStream_t stream = 0);
 
 // ============================================================
-// FP8 E4M3 GEMV (primary decode path for GWFP8 weights)
-// ============================================================
-// W: [out_features, in_features] FP8 E4M3, scales: [out_features] F32 per-row
-
-// y_fp16 = W * x * scale (no residual, FP16 output)
-void gwen_gemv_fp8(const void* W, const float* scales, const half* x, half* y,
-                    int out_features, int in_features, cudaStream_t stream = 0);
-
-// y_f32 = W * x * scale + residual_f32 (F32 residual stream)
-void gwen_gemv_fp8_residual_f32(const void* W, const float* scales, const half* x,
-                                  float* y_f32, const float* residual_f32,
-                                  int out_features, int in_features, cudaStream_t stream = 0);
-
-// Batch2: read weights once, 2 dot products → FP16 output
-void gwen_gemv_fp8_batch2(const void* W, const float* scales,
-                            const half* x0, const half* x1,
-                            half* y0, half* y1,
-                            int out_features, int in_features, cudaStream_t stream = 0);
-
-// Batch2 with F32 residual
-void gwen_gemv_fp8_batch2_residual_f32(const void* W, const float* scales,
-                                         const half* x0, const half* x1,
-                                         float* y0_f32, float* y1_f32,
-                                         const float* res0_f32, const float* res1_f32,
-                                         int out_features, int in_features, cudaStream_t stream = 0);
-
-// ============================================================
-// F32-input RMSNorm (reads F32 residual stream, writes FP16)
-// ============================================================
-void gwen_rmsnorm_f32_input(const float* x_f32, const float* weight, half* y,
-                              int dim, float eps, cudaStream_t stream = 0);
-
-// Batch2: F32-input RMSNorm for two tokens in one launch
-void gwen_rmsnorm_f32_input_batch2(const float* x0_f32, const float* x1_f32,
-                                    const float* weight,
-                                    half* y0, half* y1,
-                                    int dim, float eps, cudaStream_t stream = 0);
-
-// FP16→F32 / F32→FP16 conversion
-void gwen_fp16_to_f32(const half* x, float* y, int n, cudaStream_t stream = 0);
-void gwen_fp16_to_f32_add(const half* x, float* y, const float* residual, int n, cudaStream_t stream = 0);
-void gwen_f32_to_fp16(const float* x, half* y, int n, cudaStream_t stream = 0);
-
-// ============================================================
-// FP4 E2M1 GEMV (NVFP4 bandwidth-optimized decode path)
-// ============================================================
-// W: [out_features, in_features/2] packed FP4 E2M1 bytes
-// scales: [out_features, in_features/16] E4M3 micro-scales
-// global_scale: per-tensor FP32 scale
-
-void gwen_gemv_fp4(const void* W, const void* scales, float global_scale,
-                    const half* x, half* y,
-                    int out_features, int in_features, cudaStream_t stream = 0);
-
-void gwen_gemv_fp4_residual_f32(const void* W, const void* scales, float global_scale,
-                                  const half* x, float* y_f32, const float* residual_f32,
-                                  int out_features, int in_features, cudaStream_t stream = 0);
-
-void gwen_gemv_fp4_batch2(const void* W, const void* scales, float global_scale,
-                            const half* x0, const half* x1,
-                            half* y0, half* y1,
-                            int out_features, int in_features, cudaStream_t stream = 0);
-
-void gwen_gemv_fp4_batch2_residual_f32(const void* W, const void* scales, float global_scale,
-                                         const half* x0, const half* x1,
-                                         float* y0_f32, float* y1_f32,
-                                         const float* res0_f32, const float* res1_f32,
-                                         int out_features, int in_features, cudaStream_t stream = 0);
-
-// FP8→FP16 bulk dequant with per-row scaling (for prefill GEMM via CUTLASS FP16 fallback)
-void gwen_dequant_fp8_to_fp16(const void* data, const float* scales, half* out,
-                                int rows, int cols, cudaStream_t stream = 0);
-
-// ============================================================
 // FP16 GEMV (for MTP weights stored as FP16)
 // ============================================================
 
@@ -298,35 +224,6 @@ void gwen_deltanet_decode(float* S, const half* q, const half* k, const half* v,
                           int n_heads, int dk, int dv, cudaStream_t stream = 0);
 
 // ============================================================
-// FP8 GEMM (CUTLASS 3.x SM120 — prefill path)
-// ============================================================
-
-// FP8×FP8 GEMM with groupwise scaling (per-row weight, per-block activation)
-// W_fp8: [M, K] FP8 E4M3 RowMajor, W_sfa: [M * ceil(K/128)] F32 scales
-// X_fp8: [K, N] FP8 E4M3 ColMajor (pre-quantized), X_sfb: scale factors
-// Y: [M, N] FP16 ColMajor output
-void gwen_gemm_fp8(const void* W_fp8, const float* W_sfa,
-                    const void* X_fp8, const float* X_sfb,
-                    half* Y,
-                    int out_features, int in_features, int seq_len,
-                    void* workspace, size_t workspace_size,
-                    cudaStream_t stream = 0);
-
-// Quantize FP16 activations to FP8 E4M3 with per-block scaling
-// input: [N, K] FP16 row-major, output_fp8: [K, N] FP8 col-major (same memory)
-// output_sfb: [ceil(N/128) * ceil(K/128)] F32 scale factors
-void gwen_quantize_fp16_to_fp8(const half* input, void* output_fp8, float* output_sfb,
-                                 int K, int N, cudaStream_t stream = 0);
-
-// Replicate per-row scales to CUTLASS SFA format
-// row_scales: [M] F32, sfa: [M * n_k_blocks] F32
-void gwen_replicate_fp8_scales(const float* row_scales, float* sfa,
-                                 int M, int n_k_blocks, cudaStream_t stream = 0);
-
-// Query CUTLASS workspace size for FP8 GEMM
-size_t gwen_gemm_fp8_workspace_size(int max_M, int max_K, int max_N);
-
-// ============================================================
 // GEMM (for prefill — batch of tokens)
 // ============================================================
 
@@ -354,45 +251,6 @@ size_t gwen_gemm_mmq_scratch_size(int max_K, int max_N);
 // dim: embedding dimension (must be multiple of 256)
 void gwen_dequant_rows_q6k(const void* table, const int* row_ids, half* dst,
                             int K, int dim, cudaStream_t stream = 0);
-
-// ============================================================
-// FP16 GEMM (no dequant — weights already in FP16)
-// ============================================================
-
-// y[seq_len, out] = x[seq_len, in] * W^T[in, out]
-// W_fp16: [out_features, in_features] FP16 (already dequantized)
-void gwen_gemm_fp16(const half* W_fp16, const half* x, half* y,
-                     int out_features, int in_features, int seq_len,
-                     cudaStream_t stream = 0);
-
-
-// ============================================================
-// Reduction: logsumexp + p_idk (for training server p_idk)
-// ============================================================
-
-// Row-wise logsumexp: x[n_rows, n_cols] FP16 → log_Z[n_rows] F32
-// One block (256 threads) per row. Used for 248K vocab logits.
-void gwen_logsumexp_rows(const half* x, float* log_Z,
-                          int n_rows, int n_cols, cudaStream_t stream = 0);
-
-// Compute p_idk from restricted logits + log_Z (partition function)
-// restricted_logits[n_rows, K] FP16, log_Z[n_rows] F32 → p_idk[n_rows] F32
-// p_idk = clamp(1 - sum(exp(restricted_logits - log_Z)), 0, 1)
-void gwen_p_idk_from_logits(const half* restricted_logits, const float* log_Z,
-                              float* p_idk, int n_rows, int K, cudaStream_t stream = 0);
-
-// ============================================================
-// Top-k selection (for sparse distillation)
-// ============================================================
-
-// Select top-k values and indices from each row.
-// logits: [n_rows, K] FP16 input
-// topk_indices: [n_rows, k] uint16 output (column indices)
-// topk_values: [n_rows, k] FP16 output (corresponding values)
-// Uses bitonic sort in shared memory (K * 4 bytes shared mem).
-void gwen_topk(const half* logits, uint16_t* topk_indices, half* topk_values,
-               int n_rows, int K, int k, cudaStream_t stream = 0);
-
 
 // ============================================================
 // MMA Flash Attention (ported from llama.cpp fattn-mma-f16)

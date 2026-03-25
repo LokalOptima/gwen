@@ -5,9 +5,9 @@
 
 extern "C" [[noreturn]] void ggml_abort(const char*, int, const char*, ...);
 
-#include "common.cuh"
-#include "mmq.cuh"
-#include "quantize.cuh"  // for CUDA_QUANTIZE_BLOCK_SIZE_MMQ
+#include "gwen/llama_common.cuh"
+#include "gwen/llama_mmq.cuh"
+#include "gwen/llama_quantize.cuh"  // for CUDA_QUANTIZE_BLOCK_SIZE_MMQ
 
 #include "gwen/kernels.h"
 
@@ -146,23 +146,13 @@ static __device__ __forceinline__ void mmq_write_back_fp16(
     constexpr int granularity = mmq_get_granularity_device(mmq_x);
     constexpr int nwarps = mmq_get_nwarps_device();
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-    constexpr int tileC_IJ = mmq_get_granularity_device(0);
-    typedef tile<tileC_IJ, tileC_IJ, int, DATA_LAYOUT_J_MAJOR> tile_C;
-    constexpr int rows_per_warp = granularity;
-#else
     typedef tile<16, 8, int> tile_C;
     constexpr int rows_per_warp = 2 * granularity;
-#endif
 
     constexpr int ntx = rows_per_warp / tile_C::I;
     const int i0 = (threadIdx.y / ntx) * (ntx * tile_C::I);
 
-#if defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     static_assert(nwarps * tile_C::I == mmq_y, "nwarps*tile_C::I != mmq_y");
-#else
-    GGML_UNUSED(nwarps);
-#endif
 
 #pragma unroll
     for (int j0 = 0; j0 < mmq_x; j0 += ntx * tile_C::J) {
@@ -199,17 +189,9 @@ static __device__ __forceinline__ void gwen_process_tile(
     int * tile_y_sh = data_mul_mat_q + mmq_x;
     int * tile_x    = tile_y_sh + GGML_PAD(mmq_x * MMQ_TILE_Y_K, nwarps * warp_size);
 
-#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr vec_dot_mmq_t vec_dot = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_mma;
-#else
-    constexpr vec_dot_mmq_t vec_dot = mmq_type_traits<mmq_x, mmq_y, need_check, type>::vec_dot_dp4a;
-#endif
 
-#if defined(BLACKWELL_MMA_AVAILABLE)
-    constexpr int ne_block = (type == GGML_TYPE_MXFP4) ? 8 * QK_MXFP4 : 4 * QK8_1;
-#else
     constexpr int ne_block = 4 * QK8_1;
-#endif
 
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;

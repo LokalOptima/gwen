@@ -5,8 +5,8 @@
 // Stub for ggml_abort (referenced by common.cuh error paths, never actually called)
 extern "C" [[noreturn]] void ggml_abort(const char*, int, const char*, ...) { __builtin_trap(); }
 
-#include "common.cuh"
-#include "fattn-mma-f16.cuh"
+#include "gwen/llama_common.cuh"
+#include "gwen/llama_fattn_mma_f16.cuh"
 
 #include "gwen/kernels.h"
 

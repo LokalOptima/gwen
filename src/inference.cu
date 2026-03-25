@@ -2,7 +2,7 @@
 #include "gwen/kernels.h"
 #include "gwen/ggml_quants.h"
 
-#include <cuda_fp8.h>
+#include <cuda_fp8.h>  // __nv_fp8_e4m3 used in DeltaNet fused kernel FP8 paths (legacy, never called for K-quant)
 #include <cublas_v2.h>
 #include <cfloat>
 #include <cstdio>
@@ -624,10 +624,7 @@ kernel_deltanet_fused_2tok(
     __shared__ float s_q_inv, s_k_inv, s_decay, s_beta;
 
     float* S_head = S + head * dk * dk;
-    const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
-    const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
-    float a_scale = alpha_scales[head];
-    float b_scale = beta_scales[head];
+    const bool precomputed = (alpha_w == nullptr);
 
     // ================================================================
     // TOKEN A
@@ -670,7 +667,17 @@ kernel_deltanet_fused_2tok(
     }
 
     // Phase 2: Gate and beta for token A
-    {
+    if (precomputed) {
+        // Pre-computed path: decay_a at alpha_scales[head], beta_a at beta_scales[head]
+        if (tid == 0) {
+            s_decay = alpha_scales[head];
+            s_beta = beta_scales[head];
+        }
+    } else {
+        const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
+        const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
+        float a_scale = alpha_scales[head];
+        float b_scale = beta_scales[head];
         float alpha_acc = 0.0f, beta_acc = 0.0f;
         for (int i = tid; i < n_embed; i += 128) {
             __nv_fp8_e4m3 af, bf;
@@ -767,7 +774,17 @@ kernel_deltanet_fused_2tok(
     }
 
     // Phase 2: Gate and beta for token B
-    {
+    if (precomputed) {
+        // Pre-computed path: decay_b at alpha_scales[n_v_heads + head], beta_b at beta_scales[n_v_heads + head]
+        if (tid == 0) {
+            s_decay = alpha_scales[n_v_heads + head];
+            s_beta = beta_scales[n_v_heads + head];
+        }
+    } else {
+        const uint8_t* alpha_fp8 = static_cast<const uint8_t*>(alpha_w);
+        const uint8_t* beta_fp8 = static_cast<const uint8_t*>(beta_w);
+        float a_scale = alpha_scales[head];
+        float b_scale = beta_scales[head];
         float alpha_acc = 0.0f, beta_acc = 0.0f;
         for (int i = tid; i < n_embed; i += 128) {
             __nv_fp8_e4m3 af, bf;
@@ -2546,10 +2563,6 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     x = buf_a;
     residual = buf_b;
 
-    // F32 residual accumulators for FP8 decode path
-    buf_a_f32 = static_cast<float*>(a(cfg.n_embed * sizeof(float)));
-    buf_b_f32 = static_cast<float*>(a(cfg.n_embed * sizeof(float)));
-
     // DeltaNet scratch — Q/K/V alias into qkv (no separate allocation)
     int qkv_dim = cfg.ssm_qkv_dim();  // 2*k_heads*dk + v_heads*dv
     qkv      = static_cast<half*>(a(qkv_dim * sizeof(half)));
@@ -2574,12 +2587,10 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     logits_f = static_cast<float*>(a(cfg.n_vocab * sizeof(float)));
 
     // DeltaNet scratch (alpha/beta are per V-head)
-    d_alpha = static_cast<float*>(a(cfg.ssm_n_v_heads * sizeof(float)));
-    d_beta  = static_cast<float*>(a(cfg.ssm_n_v_heads * sizeof(float)));
+    // 2x n_v_heads: first n_vh for token A (or single token), second n_vh for token B in 2tok mode
+    d_alpha = static_cast<float*>(a(2 * cfg.ssm_n_v_heads * sizeof(float)));
+    d_beta  = static_cast<float*>(a(2 * cfg.ssm_n_v_heads * sizeof(float)));
 
-    // K-quant GEMV scratch — FP16 intermediate for residual_f32 dispatch
-    int max_gemv_out = std::max(cfg.n_ff, std::max(cfg.n_embed, cfg.ssm_inner_size));
-    gemv_scratch = static_cast<half*>(a(max_gemv_out * sizeof(half)));
 
     // dp4a Q8_1 scratch buffers — sized for the largest input vector
     // Largest: n_ff=3584 (FFN down input), n_embed=1024 (most projections)
@@ -2658,7 +2669,7 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
 }
 
 void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
-                                      int max_tokens, bool f32_path, bool gguf_mode) {
+                                      int max_tokens) {
     auto a = [&](size_t bytes) -> void* { return alloc.alloc(bytes); };
     max_prefill = max_tokens;
 
@@ -2666,21 +2677,6 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     prefill_x     = static_cast<half*>(a(max_tokens * cfg.n_embed * sizeof(half)));
     prefill_out   = static_cast<half*>(a(max_tokens * cfg.n_embed * sizeof(half)));
     prefill_norm  = static_cast<half*>(a(max_tokens * cfg.n_embed * sizeof(half)));
-
-    // F32 buffers for verified reference path (GWEN_GEMM_DECODE=1 / extract_hidden)
-    // Only needed for single-sequence forward_prefill, not for batch extraction.
-    if (f32_path) {
-        prefill_x_f32   = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
-        prefill_out_f32 = static_cast<float*>(a(max_tokens * cfg.n_embed * sizeof(float)));
-
-        size_t qkv_dim_total = cfg.ssm_qkv_dim();
-        prefill_proj_qkv_f32  = static_cast<float*>(a(max_tokens * qkv_dim_total * sizeof(float)));
-        prefill_proj_gate_f32 = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
-        prefill_dn_out_f32    = static_cast<float*>(a(max_tokens * cfg.ssm_inner_size * sizeof(float)));
-        prefill_ffn_gate_f32  = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
-        prefill_ffn_up_f32    = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
-        prefill_ffn_out_f32   = static_cast<float*>(a(max_tokens * cfg.n_ff * sizeof(float)));
-    }
 
     // Batch FFN buffers: [max_tokens, n_ff]
     // Cannot alias ffn_up/ffn_out with proj_qkv: full attention layers use ffn_up for V
@@ -2699,35 +2695,16 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     prefill_dn_beta = static_cast<float*>(a(max_tokens * cfg.ssm_n_v_heads * sizeof(float)));
     d_prefill_tokens = static_cast<int*>(a(max_tokens * sizeof(int)));
 
-    if (gguf_mode) {
-        // MMQ (K-quant) GEMM prefill scratch
-        use_mmq_prefill = true;
-        int max_K = (int)std::max({cfg.n_embed, cfg.n_ff, (uint32_t)cfg.ssm_inner_size,
-                                    cfg.ssm_qkv_dim()});
-        mmq_scratch_size = gwen_gemm_mmq_scratch_size(max_K, max_tokens);
-        mmq_scratch = a(mmq_scratch_size);
-        // cuBLAS handle for F16 GEMM (IQ4_XS→F16 converted weights)
-        cublasCreate(reinterpret_cast<cublasHandle_t*>(&cublas_handle));
-        // Flash attention needs an F32 scratch buffer (reuse prefill_proj_qkv_f32 name)
-        size_t fa_scratch = (size_t)max_tokens * cfg.n_head * cfg.head_dim * sizeof(float);
-        prefill_proj_qkv_f32 = static_cast<float*>(a(fa_scratch));
-    } else {
-        // FP8 GEMM prefill scratch
-        int max_K = (int)std::max({cfg.n_embed, cfg.n_ff, (uint32_t)cfg.ssm_inner_size});
-        int max_M = (int)std::max({
-            cfg.ssm_qkv_dim(),
-            (uint32_t)(cfg.n_head * cfg.head_dim * 2),
-            cfg.n_ff
-        });
-        fp8_act_buf = static_cast<uint8_t*>(a((size_t)max_tokens * max_K));
-        int n_n_blocks = (max_tokens + 127) / 128;
-        int n_k_blocks = (max_K + 127) / 128;
-        sfb_act_buf = static_cast<float*>(a((size_t)n_n_blocks * n_k_blocks * sizeof(float)));
-        gemm_fp8_ws_size = gwen_gemm_fp8_workspace_size(max_M, max_K, max_tokens);
-        if (gemm_fp8_ws_size > 0) {
-            gemm_fp8_workspace = a(gemm_fp8_ws_size);
-        }
-    }
+    // MMQ (K-quant) GEMM prefill scratch
+    int max_K = (int)std::max({cfg.n_embed, cfg.n_ff, (uint32_t)cfg.ssm_inner_size,
+                                cfg.ssm_qkv_dim()});
+    mmq_scratch_size = gwen_gemm_mmq_scratch_size(max_K, max_tokens);
+    mmq_scratch = a(mmq_scratch_size);
+    // cuBLAS handle for F16 GEMM (IQ4_XS→F16 converted weights)
+    cublasCreate(reinterpret_cast<cublasHandle_t*>(&cublas_handle));
+    // Flash attention F32 scratch buffer
+    size_t fa_scratch_size = (size_t)max_tokens * cfg.n_head * cfg.head_dim * sizeof(float);
+    prefill_fa_scratch = static_cast<float*>(a(fa_scratch_size));
 }
 
 // ============================================================
@@ -2735,9 +2712,9 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
 // ============================================================
 
 void InferenceState::allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
-                                             int max_total_tokens, int max_seqs, bool f32_path) {
+                                             int max_total_tokens, int max_seqs) {
     // Allocate prefill buffers for max_total_tokens
-    allocate_prefill(cfg, alloc, max_total_tokens, f32_path);
+    allocate_prefill(cfg, alloc, max_total_tokens);
     max_batch_seqs = max_seqs;
 
     auto a = [&](size_t bytes) -> void* { return alloc.alloc(bytes); };
@@ -2870,8 +2847,6 @@ void InferenceState::allocate_batch2(const ModelConfig& cfg, CudaAllocator& allo
 
     b2_buf_a     = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
     b2_buf_b     = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
-    b2_buf_a_f32 = static_cast<float*>(a(cfg.n_embed * sizeof(float)));
-    b2_buf_b_f32 = static_cast<float*>(a(cfg.n_embed * sizeof(float)));
     b2_x_norm    = static_cast<half*>(a(cfg.n_embed * sizeof(half)));
 
     int qkv_dim = cfg.ssm_qkv_dim();
@@ -2982,25 +2957,17 @@ void InferenceState::reset_state() {
     mtp_pos = 0;
 }
 
-// Forward declaration for kernel used in extract_hidden (defined before forward_prefill)
-__global__ void kernel_f32_to_half(const float* __restrict__ in, half* __restrict__ out, int total);
-
 // ============================================================
 // Extract hidden states for all tokens (prefill layers only)
 // ============================================================
 
 void InferenceState::extract_hidden(Model& model, const std::vector<int>& tokens, void* output_host) {
-    GWEN_CHECK(prefill_x_f32 != nullptr, "extract_hidden requires F32 prefill buffers (not available in batch-only mode)");
     reset_state();
     forward_prefill(model, tokens);
-    // After forward_prefill, prefill_x_f32 holds [N, n_embed] hidden states (F32)
-    // Convert to FP16 for output
-    int N = (int)tokens.size();
-    int total = N * model.config.n_embed;
-    int blocks = (total + 255) / 256;
-    kernel_f32_to_half<<<blocks, 256, 0, compute_stream>>>(prefill_x_f32, prefill_x, total);
+    // After forward_prefill, prefill_x holds [N, n_embed] hidden states (FP16)
     GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
-    size_t bytes = (size_t)total * sizeof(half);
+    int N = (int)tokens.size();
+    size_t bytes = (size_t)N * model.config.n_embed * sizeof(half);
     GWEN_CHECK_CUDA(cudaMemcpy(output_host, prefill_x, bytes, cudaMemcpyDeviceToHost));
 }
 
@@ -3029,47 +2996,33 @@ static inline bool is_dp4a_type(GGMLType t) {
            t == GGMLType::IQ4_XS;
 }
 
-// GEMV dispatch: FP8, FP4, F16, and K-quant (Q4_K/Q5_K/Q6_K/Q8_0)
+// GEMV dispatch: F16 and K-quant (Q4_K/Q5_K/Q6_K/Q8_0/IQ4_XS)
 // When x_q8 is provided and weight is K-quant, uses dp4a (INT8 dot product) path.
 static inline void gemv_dispatch(const WeightRef& w, const half* x, half* y,
                                   int out_features, int in_features, cudaStream_t s,
                                   const void* x_q8 = nullptr) {
-    if (w.type == GGMLType::FP4_E2M1) {
-        gwen_gemv_fp4(w.device_data, w.device_scales_fp4, w.fp4_global_scale,
-                      x, y, out_features, in_features, s);
-    } else if (w.type == GGMLType::F16) {
+    if (w.type == GGMLType::F16) {
         gwen_gemv_fp16(static_cast<const half*>(w.device_data), x, y,
                         out_features, in_features, s);
-    } else if (is_kquant_type(w.type)) {
-        if (x_q8 && is_dp4a_type(w.type)) {
-            gwen_gemv_dp4a(w.device_data, x_q8, y, out_features, in_features, w.type, s);
-        } else {
-            gwen_gemv(w.device_data, x, y, out_features, in_features, w.type, s);
-        }
+    } else if (x_q8 && is_dp4a_type(w.type)) {
+        gwen_gemv_dp4a(w.device_data, x_q8, y, out_features, in_features, w.type, s);
     } else {
-        // FP8 (default for GWFP8 models)
-        gwen_gemv_fp8(w.device_data, w.device_scales, x, y, out_features, in_features, s);
+        gwen_gemv(w.device_data, x, y, out_features, in_features, w.type, s);
     }
 }
 
-// GEMV + F32 residual: y_f32 = W*x + res_f32
-// K-quant path: GEMV → FP16 scratch, then fused FP16→F32+add
-static inline void gemv_dispatch_residual_f32(const WeightRef& w, const half* x,
-                                               float* y_f32, const float* res_f32,
-                                               int out_features, int in_features,
-                                               cudaStream_t s, half* scratch = nullptr,
-                                               const void* x_q8 = nullptr) {
-    if (w.type == GGMLType::FP4_E2M1) {
-        gwen_gemv_fp4_residual_f32(w.device_data, w.device_scales_fp4, w.fp4_global_scale,
-                                    x, y_f32, res_f32, out_features, in_features, s);
-    } else if (is_kquant_type(w.type) || w.type == GGMLType::F16) {
-        // Two-step: GEMV to FP16 scratch, then FP16→F32 + residual add
-        GWEN_CHECK(scratch != nullptr, "K-quant residual dispatch requires scratch buffer");
-        gemv_dispatch(w, x, scratch, out_features, in_features, s, x_q8);
-        gwen_fp16_to_f32_add(scratch, y_f32, res_f32, out_features, s);
+// GEMV + FP16 residual: y = W*x + residual (all FP16)
+// dp4a path uses fused residual kernel; fallback does GEMV then add_inplace.
+static inline void gemv_dispatch_residual(const WeightRef& w, const half* x,
+                                           half* y, const half* residual,
+                                           int out_features, int in_features,
+                                           cudaStream_t s, const void* x_q8 = nullptr) {
+    if (x_q8 && is_dp4a_type(w.type)) {
+        gwen_gemv_dp4a_residual(w.device_data, x_q8, y, residual,
+                                 out_features, in_features, w.type, s);
     } else {
-        gwen_gemv_fp8_residual_f32(w.device_data, w.device_scales, x, y_f32, res_f32,
-                                    out_features, in_features, s);
+        gemv_dispatch(w, x, y, out_features, in_features, s, x_q8);
+        gwen_add_inplace(y, residual, out_features, s);
     }
 }
 
@@ -3079,49 +3032,31 @@ static inline void gemv_dispatch_batch2(const WeightRef& w,
                                          half* y0, half* y1,
                                          int out_features, int in_features, cudaStream_t s,
                                          const void* x_q8_0 = nullptr, const void* x_q8_1 = nullptr) {
-    if (w.type == GGMLType::FP4_E2M1) {
-        gwen_gemv_fp4_batch2(w.device_data, w.device_scales_fp4, w.fp4_global_scale,
-                              x0, x1, y0, y1, out_features, in_features, s);
-    } else if (is_dp4a_type(w.type) && x_q8_0 && x_q8_1) {
+    if (is_dp4a_type(w.type) && x_q8_0 && x_q8_1) {
         gwen_gemv_dp4a_batch2(w.device_data, x_q8_0, x_q8_1, y0, y1,
                                out_features, in_features, w.type, s);
-    } else if (is_kquant_type(w.type) || w.type == GGMLType::F16) {
+    } else {
         // Fallback: two sequential GEMVs (F16 weights, Q8_0, or K-quant without Q8_1 input)
         gemv_dispatch(w, x0, y0, out_features, in_features, s, x_q8_0);
         gemv_dispatch(w, x1, y1, out_features, in_features, s, x_q8_1);
-    } else {
-        gwen_gemv_fp8_batch2(w.device_data, w.device_scales, x0, x1, y0, y1,
-                              out_features, in_features, s);
     }
 }
 
-// Batch-2 GEMV + F32 residual
-static inline void gemv_dispatch_batch2_residual_f32(const WeightRef& w,
-                                                      const half* x0, const half* x1,
-                                                      float* y0, float* y1,
-                                                      const float* r0, const float* r1,
-                                                      int out_features, int in_features,
-                                                      cudaStream_t s, half* scratch = nullptr,
-                                                      const void* x_q8_0 = nullptr, const void* x_q8_1 = nullptr) {
-    if (w.type == GGMLType::FP4_E2M1) {
-        gwen_gemv_fp4_batch2_residual_f32(w.device_data, w.device_scales_fp4, w.fp4_global_scale,
-                                           x0, x1, y0, y1, r0, r1, out_features, in_features, s);
-    } else if (is_dp4a_type(w.type) && x_q8_0 && x_q8_1) {
-        // dp4a batch2: GEMV to scratch, then FP16→F32+add
-        GWEN_CHECK(scratch != nullptr, "dp4a batch2 residual dispatch requires scratch buffer");
-        half* scratch_b = scratch + out_features;
-        gwen_gemv_dp4a_batch2(w.device_data, x_q8_0, x_q8_1, scratch, scratch_b,
-                               out_features, in_features, w.type, s);
-        gwen_fp16_to_f32_add(scratch, y0, r0, out_features, s);
-        gwen_fp16_to_f32_add(scratch_b, y1, r1, out_features, s);
-    } else if (is_kquant_type(w.type) || w.type == GGMLType::F16) {
-        // Fallback: two sequential residual dispatches
-        GWEN_CHECK(scratch != nullptr, "K-quant batch2 residual dispatch requires scratch buffer");
-        gemv_dispatch_residual_f32(w, x0, y0, r0, out_features, in_features, s, scratch, x_q8_0);
-        gemv_dispatch_residual_f32(w, x1, y1, r1, out_features, in_features, s, scratch, x_q8_1);
+// Batch-2 GEMV + FP16 residual: y0 = W*x0 + r0, y1 = W*x1 + r1
+static inline void gemv_dispatch_batch2_residual(const WeightRef& w,
+                                                   const half* x0, const half* x1,
+                                                   half* y0, half* y1,
+                                                   const half* r0, const half* r1,
+                                                   int out_features, int in_features,
+                                                   cudaStream_t s,
+                                                   const void* x_q8_0 = nullptr, const void* x_q8_1 = nullptr) {
+    if (is_dp4a_type(w.type) && x_q8_0 && x_q8_1) {
+        gwen_gemv_dp4a_residual_batch2(w.device_data, x_q8_0, x_q8_1, y0, y1, r0, r1,
+                                        out_features, in_features, w.type, s);
     } else {
-        gwen_gemv_fp8_batch2_residual_f32(w.device_data, w.device_scales, x0, x1, y0, y1,
-                                           r0, r1, out_features, in_features, s);
+        // Fallback: two sequential residual dispatches
+        gemv_dispatch_residual(w, x0, y0, r0, out_features, in_features, s, x_q8_0);
+        gemv_dispatch_residual(w, x1, y1, r1, out_features, in_features, s, x_q8_1);
     }
 }
 
@@ -3132,17 +3067,17 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
     // Detect K-quant model: use dp4a path with Q8_1-quantized inputs
     const bool use_dp4a = is_dp4a_type(model.layers[0].deltanet.attn_qkv.type);
 
-    // 1. Embedding lookup → buf_a → F32 residual
-    // For FP4 models: token_embd is F32, no scales needed
+    // 1. Embedding lookup → buf_a (FP16 residual)
     gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
-                      d_token_id, buf_a, cfg.n_embed, s, model.token_embd.device_scales);
-    gwen_fp16_to_f32(buf_a, buf_a_f32, cfg.n_embed, s);
+                      d_token_id, buf_a, cfg.n_embed, s, nullptr);
 
 #ifdef GWEN_DEBUG
     {   // Debug: check embedding output for NaN
         GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
-        float dbg[4]; GWEN_CHECK_CUDA(cudaMemcpy(dbg, buf_a_f32, 16, cudaMemcpyDeviceToHost));
-        GWEN_LOG("[DBG embed] %.6f %.6f %.6f %.6f\n", dbg[0], dbg[1], dbg[2], dbg[3]);
+        half h4[4]; float f4[4];
+        GWEN_CHECK_CUDA(cudaMemcpy(h4, buf_a, 8, cudaMemcpyDeviceToHost));
+        for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+        GWEN_LOG("[DBG embed] %.6f %.6f %.6f %.6f\n", f4[0], f4[1], f4[2], f4[3]);
     }
 #endif
 
@@ -3160,9 +3095,9 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
 
-            // RMSNorm: F32 input → FP16 x_norm
-            gwen_rmsnorm_f32_input(buf_a_f32, static_cast<const float*>(w.attn_norm.device_data),
-                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            // RMSNorm: FP16 input → FP16 x_norm
+            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize x_norm to Q8_1 for dp4a GEMV path
             if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
             // QKV + gate projections
@@ -3210,8 +3145,8 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             half* v = qkv + 2 * q_width;
 
             // Fused: L2-norm(Q,K) + gate/beta + S update
-            if (w.ssm_alpha.type != GGMLType::FP8_E4M3) {
-                // Non-FP8 path (FP4, F16, K-quant): compute alpha/beta projections via GEMV, convert to decay/beta
+            {
+                // Compute alpha/beta projections via GEMV, convert to decay/beta
                 // Use attn_out as scratch for half-precision projections (avoid aliasing with d_alpha/d_beta)
                 half* alpha_h = attn_out;  // [n_v_heads] half scratch
                 half* beta_h = attn_out + cfg.ssm_n_v_heads;  // [n_v_heads] half scratch
@@ -3232,16 +3167,6 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                     nullptr, nullptr,  // pre-computed: skip internal dot products
                     d_alpha, d_beta,   // pre-computed decay and beta
                     nullptr, nullptr,  // not used in pre-computed mode
-                    attn_out, q_scale,
-                    cfg.ssm_n_v_heads, cfg.ssm_n_k_heads, cfg.ssm_state_size, cfg.n_embed);
-            } else {
-                // FP8 path: compute gate/beta inline in fused kernel
-                kernel_deltanet_fused<<<cfg.ssm_n_v_heads, 128, 65536, s>>>(
-                    state.S, q, k, v, x_norm,
-                    w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                    w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
-                    static_cast<const float*>(w.ssm_a.device_data),
-                    static_cast<const float*>(w.ssm_dt_bias.device_data),
                     attn_out, q_scale,
                     cfg.ssm_n_v_heads, cfg.ssm_n_k_heads, cfg.ssm_state_size, cfg.n_embed);
             }
@@ -3273,23 +3198,24 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
 #endif
             // Quantize gated_out to Q8_1 for ssm_out dp4a path
             if (use_dp4a) gwen_quantize_q8_1(gated_out, x_q8_a, cfg.ssm_inner_size, s);
-            // Output projection with F32 residual
-            gemv_dispatch_residual_f32(w.ssm_out, gated_out, buf_b_f32, buf_a_f32,
-                          w.ssm_out.shape[0], w.ssm_out.shape[1], s, gemv_scratch,
+            // Output projection with FP16 residual: buf_b = ssm_out(gated_out) + buf_a
+            gemv_dispatch_residual(w.ssm_out, gated_out, buf_b, buf_a,
+                          w.ssm_out.shape[0], w.ssm_out.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
 
 #ifdef GWEN_DEBUG
             if (layer_idx == 0) {
                 GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
-                float f4[4];
-                GWEN_CHECK_CUDA(cudaMemcpy(f4, buf_b_f32, 16, cudaMemcpyDeviceToHost));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, buf_b, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
                 GWEN_LOG("[DBG L%u ssm_out_res] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
             }
 #endif
 
-            // FFN: RMSNorm F32→FP16, GEMV gate/up, SwiGLU, GEMV down
-            gwen_rmsnorm_f32_input(buf_b_f32, static_cast<const float*>(w.post_attn_norm.device_data),
-                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            // FFN: RMSNorm FP16→FP16, GEMV gate/up, SwiGLU, GEMV down
+            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize x_norm for FFN gate/up dp4a
             if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
 
@@ -3335,16 +3261,17 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             }
 #endif
 
-            gemv_dispatch_residual_f32(w.ffn_down, ffn_out, buf_a_f32, buf_b_f32,
-                          w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch,
+            // FFN down + FP16 residual: buf_a = ffn_down(ffn_out) + buf_b
+            gemv_dispatch_residual(w.ffn_down, ffn_out, buf_a, buf_b,
+                          w.ffn_down.shape[0], w.ffn_down.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
 
         } else {
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            gwen_rmsnorm_f32_input(buf_a_f32, static_cast<const float*>(w.attn_norm.device_data),
-                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize x_norm for Q/K/V dp4a
             if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
             gemv_dispatch(w.attn_q, x_norm, qkv, w.attn_q.shape[0], w.attn_q.shape[1], s,
@@ -3387,14 +3314,14 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
 
             // Quantize gated_out for attn_output dp4a
             if (use_dp4a) gwen_quantize_q8_1(gated_out, x_q8_a, cfg.n_head * cfg.head_dim, s);
-            // Output projection with F32 residual
-            gemv_dispatch_residual_f32(w.attn_output, gated_out, buf_b_f32, buf_a_f32,
-                          w.attn_output.shape[0], w.attn_output.shape[1], s, gemv_scratch,
+            // Output projection with FP16 residual: buf_b = attn_output(gated_out) + buf_a
+            gemv_dispatch_residual(w.attn_output, gated_out, buf_b, buf_a,
+                          w.attn_output.shape[0], w.attn_output.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
 
             // FFN
-            gwen_rmsnorm_f32_input(buf_b_f32, static_cast<const float*>(w.post_attn_norm.device_data),
-                                   x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize x_norm for FFN dp4a
             if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
             gemv_dispatch(w.ffn_gate, x_norm, ffn_gate, w.ffn_gate.shape[0], w.ffn_gate.shape[1], s,
@@ -3404,8 +3331,9 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
             // Quantize ffn_out for ffn_down dp4a
             if (use_dp4a) gwen_quantize_q8_1(ffn_out, x_q8_a, cfg.n_ff, s);
-            gemv_dispatch_residual_f32(w.ffn_down, ffn_out, buf_a_f32, buf_b_f32,
-                          w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch,
+            // FFN down + FP16 residual: buf_a = ffn_down(ffn_out) + buf_b
+            gemv_dispatch_residual(w.ffn_down, ffn_out, buf_a, buf_b,
+                          w.ffn_down.shape[0], w.ffn_down.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
 
         }
@@ -3413,22 +3341,25 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
 #ifdef GWEN_DEBUG
         {
             GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
-            float dbg[4]; GWEN_CHECK_CUDA(cudaMemcpy(dbg, buf_a_f32, 16, cudaMemcpyDeviceToHost));
-            bool has_nan = (dbg[0] != dbg[0] || dbg[1] != dbg[1] || dbg[2] != dbg[2] || dbg[3] != dbg[3]);
+            half h4[4]; float f4[4];
+            GWEN_CHECK_CUDA(cudaMemcpy(h4, buf_a, 8, cudaMemcpyDeviceToHost));
+            for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+            bool has_nan = (f4[0] != f4[0] || f4[1] != f4[1] || f4[2] != f4[2] || f4[3] != f4[3]);
             if (layer_idx == 0 || layer_idx == cfg.n_layers - 1 || has_nan)
-                GWEN_LOG("[DBG L%u] %.6f %.6f %.6f %.6f%s\n", layer_idx, dbg[0], dbg[1], dbg[2], dbg[3], has_nan ? " NAN!" : "");
+                GWEN_LOG("[DBG L%u] %.6f %.6f %.6f %.6f%s\n", layer_idx, f4[0], f4[1], f4[2], f4[3], has_nan ? " NAN!" : "");
         }
 #endif
     }
 
     // 3. Save hidden state for MTP (before LM head destroys it)
     if (mtp_hidden) {
-        gwen_f32_to_fp16(buf_a_f32, mtp_hidden, cfg.n_embed, s);
+        GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, buf_a, cfg.n_embed * sizeof(half),
+                                         cudaMemcpyDeviceToDevice, s));
     }
 
     // 4. LM Head + argmax
-    gwen_rmsnorm_f32_input(buf_a_f32, static_cast<const float*>(model.output_norm.device_data),
-                           x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+    gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
+                      x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
     // Quantize x_norm for LM head dp4a
     if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
 
@@ -3489,13 +3420,11 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
     int* d_token_b = d_token_id + 2;
     int* d_pos_b   = d_token_id + 3;
 
-    // 1. Embedding lookup for both tokens → FP16 + F32 residual
+    // 1. Embedding lookup for both tokens → FP16 residual
     gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
-                      d_token_id, buf_a, cfg.n_embed, s, model.token_embd.device_scales);
-    gwen_fp16_to_f32(buf_a, buf_a_f32, cfg.n_embed, s);
+                      d_token_id, buf_a, cfg.n_embed, s, nullptr);
     gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
-                      d_token_b, b2_buf_a, cfg.n_embed, s, model.token_embd.device_scales);
-    gwen_fp16_to_f32(b2_buf_a, b2_buf_a_f32, cfg.n_embed, s);
+                      d_token_b, b2_buf_a, cfg.n_embed, s, nullptr);
 
     int dn_state_idx = 0;
     int kv_cache_idx = 0;
@@ -3509,11 +3438,11 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             int dn_idx = dn_state_idx++;
             auto& state = deltanet_states[dn_idx];
 
-            // --- Batch2 RMSNorm: F32 input → FP16 output ---
-            gwen_rmsnorm_f32_input_batch2(buf_a_f32, b2_buf_a_f32,
-                                   static_cast<const float*>(w.attn_norm.device_data),
-                                   x_norm, b2_x_norm,
-                                   cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm: FP16 input → FP16 output ---
+            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_f32w(b2_buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              b2_x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize both x_norm vectors for dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(x_norm, b2_x_norm, x_q8_a, b2_x_q8_a, cfg.n_embed, s);
 
@@ -3555,6 +3484,41 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             // --- Join: wait for conv1d B before fused 2-token deltanet ---
             GWEN_CHECK_CUDA(cudaStreamWaitEvent(s, ev_overlap_done));
 
+            // --- Pre-compute alpha/beta for both tokens ---
+            {
+                int n_vh = cfg.ssm_n_v_heads;
+                // Use attn_out as scratch for half-precision projections
+                half* alpha_h_a = attn_out;
+                half* beta_h_a = attn_out + n_vh;
+                half* alpha_h_b = attn_out + 2 * n_vh;
+                half* beta_h_b = attn_out + 3 * n_vh;
+                // Token A projections
+                gemv_dispatch(w.ssm_alpha, x_norm, alpha_h_a,
+                              w.ssm_alpha.shape[0], w.ssm_alpha.shape[1], s,
+                              use_dp4a ? x_q8_a : nullptr);
+                gemv_dispatch(w.ssm_beta, x_norm, beta_h_a,
+                              w.ssm_beta.shape[0], w.ssm_beta.shape[1], s,
+                              use_dp4a ? x_q8_a : nullptr);
+                // Token B projections
+                gemv_dispatch(w.ssm_alpha, b2_x_norm, alpha_h_b,
+                              w.ssm_alpha.shape[0], w.ssm_alpha.shape[1], s,
+                              use_dp4a ? b2_x_q8_a : nullptr);
+                gemv_dispatch(w.ssm_beta, b2_x_norm, beta_h_b,
+                              w.ssm_beta.shape[0], w.ssm_beta.shape[1], s,
+                              use_dp4a ? b2_x_q8_a : nullptr);
+                // Convert to decay/beta: d_alpha[0..n_vh) = token A, d_alpha[n_vh..2*n_vh) = token B
+                kernel_alpha_beta_to_decay<<<(n_vh+31)/32, 32, 0, s>>>(
+                    alpha_h_a, beta_h_a,
+                    static_cast<const float*>(w.ssm_a.device_data),
+                    static_cast<const float*>(w.ssm_dt_bias.device_data),
+                    d_alpha, d_beta, n_vh);
+                kernel_alpha_beta_to_decay<<<(n_vh+31)/32, 32, 0, s>>>(
+                    alpha_h_b, beta_h_b,
+                    static_cast<const float*>(w.ssm_a.device_data),
+                    static_cast<const float*>(w.ssm_dt_bias.device_data),
+                    d_alpha + n_vh, d_beta + n_vh, n_vh);
+            }
+
             // --- Fused 2-token DeltaNet: A + snapshot + B in one kernel launch ---
             // S stays in shared memory across both tokens. Snapshot is written
             // between A and B, overlapped with B's Phase 1-2 (L2-norm + gate/beta).
@@ -3568,10 +3532,9 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                 state.S,
                 qa, ka, va, x_norm,
                 qb, kb, vb, b2_x_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
-                static_cast<const float*>(w.ssm_a.device_data),
-                static_cast<const float*>(w.ssm_dt_bias.device_data),
+                nullptr, nullptr,    // pre-computed: skip internal dot products
+                d_alpha, d_beta,     // pre-computed decay and beta (A at [0..n_vh), B at [n_vh..2*n_vh))
+                nullptr, nullptr,    // not used in pre-computed mode
                 attn_out, b2_attn_out, snap,
                 q_scale, cfg.ssm_n_v_heads, cfg.ssm_n_k_heads, cfg.ssm_state_size, cfg.n_embed);
             }
@@ -3589,17 +3552,17 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
 
             // Quantize gated_out for ssm_out dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(gated_out, b2_gated_out, x_q8_a, b2_x_q8_a, cfg.ssm_inner_size, s);
-            // --- Batch2 GEMV: ssm_out with F32 residual ---
-            gemv_dispatch_batch2_residual_f32(w.ssm_out, gated_out, b2_gated_out,
-                      buf_b_f32, b2_buf_b_f32, buf_a_f32, b2_buf_a_f32,
-                      w.ssm_out.shape[0], w.ssm_out.shape[1], s, gemv_scratch,
+            // --- Batch2 GEMV: ssm_out with FP16 residual ---
+            gemv_dispatch_batch2_residual(w.ssm_out, gated_out, b2_gated_out,
+                      buf_b, b2_buf_b, buf_a, b2_buf_a,
+                      w.ssm_out.shape[0], w.ssm_out.shape[1], s,
                       use_dp4a ? x_q8_a : nullptr, use_dp4a ? b2_x_q8_a : nullptr);
 
-            // --- Batch2 RMSNorm F32→FP16 (FFN input) ---
-            gwen_rmsnorm_f32_input_batch2(buf_b_f32, b2_buf_b_f32,
-                                   static_cast<const float*>(w.post_attn_norm.device_data),
-                                   x_norm, b2_x_norm,
-                                   cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm FP16→FP16 (FFN input) ---
+            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_f32w(b2_buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              b2_x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize x_norm for FFN dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(x_norm, b2_x_norm, x_q8_a, b2_x_q8_a, cfg.n_embed, s);
 
@@ -3617,21 +3580,21 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             // Quantize ffn_out for ffn_down dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(ffn_out, b2_ffn_out, x_q8_a, b2_x_q8_a, cfg.n_ff, s);
 
-            // --- Batch2 GEMV: FFN down with F32 residual ---
-            gemv_dispatch_batch2_residual_f32(w.ffn_down, ffn_out, b2_ffn_out,
-                      buf_a_f32, b2_buf_a_f32, buf_b_f32, b2_buf_b_f32,
-                      w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch,
+            // --- Batch2 GEMV: FFN down with FP16 residual ---
+            gemv_dispatch_batch2_residual(w.ffn_down, ffn_out, b2_ffn_out,
+                      buf_a, b2_buf_a, buf_b, b2_buf_b,
+                      w.ffn_down.shape[0], w.ffn_down.shape[1], s,
                       use_dp4a ? x_q8_a : nullptr, use_dp4a ? b2_x_q8_a : nullptr);
 
         } else {
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            // --- Batch2 RMSNorm F32→FP16 ---
-            gwen_rmsnorm_f32_input_batch2(buf_a_f32, b2_buf_a_f32,
-                                   static_cast<const float*>(w.attn_norm.device_data),
-                                   x_norm, b2_x_norm,
-                                   cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm FP16→FP16 ---
+            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_f32w(b2_buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                              b2_x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize both x_norm for Q/K/V dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(x_norm, b2_x_norm, x_q8_a, b2_x_q8_a, cfg.n_embed, s);
 
@@ -3710,17 +3673,17 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
 
             // Quantize gated_out for attn_output dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(gated_out, b2_gated_out, x_q8_a, b2_x_q8_a, cfg.n_head * cfg.head_dim, s);
-            // --- Batch2 output proj with F32 residual ---
-            gemv_dispatch_batch2_residual_f32(w.attn_output, gated_out, b2_gated_out,
-                      buf_b_f32, b2_buf_b_f32, buf_a_f32, b2_buf_a_f32,
-                      w.attn_output.shape[0], w.attn_output.shape[1], s, gemv_scratch,
+            // --- Batch2 output proj with FP16 residual ---
+            gemv_dispatch_batch2_residual(w.attn_output, gated_out, b2_gated_out,
+                      buf_b, b2_buf_b, buf_a, b2_buf_a,
+                      w.attn_output.shape[0], w.attn_output.shape[1], s,
                       use_dp4a ? x_q8_a : nullptr, use_dp4a ? b2_x_q8_a : nullptr);
 
-            // --- Batch2 RMSNorm F32→FP16 for FFN ---
-            gwen_rmsnorm_f32_input_batch2(buf_b_f32, b2_buf_b_f32,
-                                   static_cast<const float*>(w.post_attn_norm.device_data),
-                                   x_norm, b2_x_norm,
-                                   cfg.n_embed, cfg.rms_norm_eps, s);
+            // --- Batch2 RMSNorm FP16→FP16 for FFN ---
+            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            gwen_rmsnorm_f32w(b2_buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                              b2_x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // Quantize x_norm for FFN dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(x_norm, b2_x_norm, x_q8_a, b2_x_q8_a, cfg.n_embed, s);
 
@@ -3735,28 +3698,30 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                       ffn_out, b2_ffn_out, cfg.n_ff, s);
             // Quantize ffn_out for ffn_down dp4a
             if (use_dp4a) gwen_quantize_q8_1_batch2(ffn_out, b2_ffn_out, x_q8_a, b2_x_q8_a, cfg.n_ff, s);
-            gemv_dispatch_batch2_residual_f32(w.ffn_down, ffn_out, b2_ffn_out,
-                      buf_a_f32, b2_buf_a_f32, buf_b_f32, b2_buf_b_f32,
-                      w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch,
+            gemv_dispatch_batch2_residual(w.ffn_down, ffn_out, b2_ffn_out,
+                      buf_a, b2_buf_a, buf_b, b2_buf_b,
+                      w.ffn_down.shape[0], w.ffn_down.shape[1], s,
                       use_dp4a ? x_q8_a : nullptr, use_dp4a ? b2_x_q8_a : nullptr);
         }
     }
 
-    // 3. Save hidden states for MTP (F32 → FP16 conversion)
+    // 3. Save hidden states for MTP (already FP16)
     // mtp_hidden  ← token B's hidden (used on accept path)
     // mtp_hidden_b ← token A's hidden (swapped in on reject path)
     if (mtp_hidden) {
-        gwen_f32_to_fp16(b2_buf_a_f32, mtp_hidden, cfg.n_embed, s);
+        GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden, b2_buf_a, cfg.n_embed * sizeof(half),
+                                         cudaMemcpyDeviceToDevice, s));
     }
     if (mtp_hidden_b) {
-        gwen_f32_to_fp16(buf_a_f32, mtp_hidden_b, cfg.n_embed, s);
+        GWEN_CHECK_CUDA(cudaMemcpyAsync(mtp_hidden_b, buf_a, cfg.n_embed * sizeof(half),
+                                         cudaMemcpyDeviceToDevice, s));
     }
 
     // 4. LM head for both tokens — batch2 GEMV
-    gwen_rmsnorm_f32_input_batch2(buf_a_f32, b2_buf_a_f32,
-                      static_cast<const float*>(model.output_norm.device_data),
-                      x_norm, b2_x_norm,
-                      cfg.n_embed, cfg.rms_norm_eps, s);
+    gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
+                      x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+    gwen_rmsnorm_f32w(b2_buf_a, static_cast<const float*>(model.output_norm.device_data),
+                      b2_x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
     // Quantize x_norm for LM head dp4a
     if (use_dp4a) gwen_quantize_q8_1_batch2(x_norm, b2_x_norm, x_q8_a, b2_x_q8_a, cfg.n_embed, s);
     gemv_dispatch_batch2(lm_head_weight(model), x_norm, b2_x_norm, logits_h, b2_logits_h,
@@ -3814,7 +3779,7 @@ int InferenceState::forward(Model& model, int token_id) {
     GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
 #else
     // CUDA graph: captures the full forward pass on first call, replays thereafter.
-    // Host-side type dispatches (FP4/FP8/FP16/K-quant) are invariant per model — safe to capture.
+    // Host-side type dispatches (F16/K-quant) are invariant per model — safe to capture.
     if (!graph_captured) {
         cudaGraph_t graph;
         GWEN_CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal));
@@ -4380,53 +4345,34 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     int* d_token_ids = d_prefill_tokens;
     GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
-    // GEMM helper: routes to MMQ (K-quant), cuBLAS (F16), or CUTLASS (FP8)
-    const half* last_quant_ptr = nullptr;
-    int last_quant_K = 0;
-
+    // GEMM helper: routes to MMQ (K-quant) or cuBLAS (F16)
     auto do_gemm = [&](const WeightRef& w, const half* X, half* Y) {
         int M = (int)w.shape[0];
         int K = (int)w.shape[1];
-        if (use_mmq_prefill) {
-            if (is_kquant_type(w.type)) {
-                gwen_gemm_mmq(w.device_data, w.type, X, Y, mmq_scratch, M, K, N, s);
-            } else if (w.type == GGMLType::F16) {
-                // cuBLAS FP16 GEMM for IQ4_XS→F16 converted weights
-                // Y[M,N] = W[M,K] @ X[K,N] where X is [N,K] row-major (= [K,N] col-major)
-                cublasHandle_t handle = reinterpret_cast<cublasHandle_t>(cublas_handle);
-                cublasSetStream(handle, s);
-                __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
-                cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                            M, N, K,
-                            &alpha_h,
-                            static_cast<const __half*>(w.device_data), K,  // W^T: [K,M] → [M,K] after transpose
-                            X, K,                                           // X: [K,N] col-major
-                            &beta_h,
-                            Y, M);                                          // Y: [M,N] col-major
-            } else {
-                GWEN_CHECK(false, "Unsupported weight type for prefill GEMM");
-            }
+        if (is_kquant_type(w.type)) {
+            gwen_gemm_mmq(w.device_data, w.type, X, Y, mmq_scratch, M, K, N, s);
+        } else if (w.type == GGMLType::F16) {
+            // cuBLAS FP16 GEMM for IQ4_XS→F16 converted weights
+            // Y[M,N] = W[M,K] @ X[K,N] where X is [N,K] row-major (= [K,N] col-major)
+            cublasHandle_t handle = reinterpret_cast<cublasHandle_t>(cublas_handle);
+            cublasSetStream(handle, s);
+            __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
+            cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        M, N, K,
+                        &alpha_h,
+                        static_cast<const __half*>(w.device_data), K,  // W^T: [K,M] → [M,K] after transpose
+                        X, K,                                           // X: [K,N] col-major
+                        &beta_h,
+                        Y, M);                                          // Y: [M,N] col-major
         } else {
-            // FP8 path
-            if (X != last_quant_ptr || K != last_quant_K) {
-                gwen_quantize_fp16_to_fp8(X, fp8_act_buf, sfb_act_buf, K, N, s);
-                last_quant_ptr = X;
-                last_quant_K = K;
-            }
-            gwen_gemm_fp8(w.device_data, w.device_sfa, fp8_act_buf, sfb_act_buf,
-                           Y, M, K, N, gemm_fp8_workspace, gemm_fp8_ws_size, s);
+            GWEN_CHECK(false, "Unsupported weight type for prefill GEMM");
         }
     };
 
     // 1. Batch embedding lookup → FP16 residual [N, n_embed]
     {
         dim3 grid(1, N);
-        if (model.token_embd.type == GGMLType::FP8_E4M3) {
-            kernel_embed_lookup_batch_fp8<<<grid, 256, 0, s>>>(
-                static_cast<const uint8_t*>(model.token_embd.device_data),
-                model.token_embd.device_scales,
-                d_token_ids, prefill_x, cfg.n_embed, N);
-        } else if (model.token_embd.type == GGMLType::Q4_K) {
+        if (model.token_embd.type == GGMLType::Q4_K) {
             kernel_embed_lookup_batch_q4k<<<grid, 256, 0, s>>>(
                 model.token_embd.device_data,
                 d_token_ids, prefill_x, cfg.n_embed, N);
@@ -4461,7 +4407,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
             // QKV and gate GEMMs → FP16 output
             int qkv_dim = cfg.ssm_qkv_dim();  // 6144
-            last_quant_ptr = nullptr;  // force re-quant (new pf_norm)
             do_gemm(w.attn_qkv, pf_norm, prefill_proj_qkv);
             do_gemm(w.attn_gate, pf_norm, prefill_proj_gate);
 
@@ -4474,19 +4419,8 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     1, N, qkv_dim, cfg.ssm_conv_kernel);
             }
 
-            // Gate/beta computation
-            if (w.ssm_alpha.type == GGMLType::FP8_E4M3) {
-                // FP8: inline dot product in batch kernel
-                kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_v_heads, N), 32, 0, s>>>(
-                    pf_norm,
-                    w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                    w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
-                    static_cast<const float*>(w.ssm_a.device_data),
-                    static_cast<const float*>(w.ssm_dt_bias.device_data),
-                    prefill_dn_gate, prefill_dn_beta,
-                    N, cfg.n_embed, cfg.ssm_n_v_heads);
-            } else {
-                // K-quant/F16: batch GEMM for alpha/beta projections, then convert
+            // Gate/beta computation: batch GEMM for alpha/beta projections, then convert
+            {
                 int n_vh = cfg.ssm_n_v_heads;
                 half* alpha_batch = prefill_ffn_out;  // reuse as scratch (n_vh << n_ff)
                 half* beta_batch = alpha_batch + (size_t)N * n_vh;
@@ -4532,7 +4466,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 prefill_proj_gate,
                 N, cfg.ssm_n_v_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
             // Output projection GEMM → pf_b (FP16)
-            last_quant_ptr = nullptr;  // force re-quant (proj_gate changed)
             do_gemm(w.ssm_out, prefill_proj_gate, pf_b);
 
             // FP16 residual add: pf_b += pf_a
@@ -4548,7 +4481,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
             // FFN GEMMs (FP16)
-            last_quant_ptr = nullptr;  // force re-quant (new pf_norm)
             do_gemm(w.ffn_gate, pf_norm, prefill_ffn_gate);
             do_gemm(w.ffn_up, pf_norm, prefill_ffn_up);
 
@@ -4559,7 +4491,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            last_quant_ptr = nullptr;  // force re-quant (ffn_out)
             do_gemm(w.ffn_down, prefill_ffn_out, pf_a);
 
             // FP16 residual add: pf_a += pf_b
@@ -4585,7 +4516,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             int q_proj_dim = w.attn_q.shape[1];  // 4096
 
             // Q, K, V projections (FP16 — per-token attention ops are FP16)
-            last_quant_ptr = nullptr;  // force re-quant (new pf_norm)
             do_gemm(w.attn_q, pf_norm, prefill_proj_qkv);
             do_gemm(w.attn_k, pf_norm, prefill_ffn_gate);
             do_gemm(w.attn_v, pf_norm, prefill_ffn_up);
@@ -4639,7 +4569,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     prefill_ffn_gate,    // K [N, n_kv_heads * head_dim] FP16
                     prefill_ffn_up,      // V [N, n_kv_heads * head_dim] FP16
                     prefill_proj_qkv,    // output [N, n_head * head_dim] FP16
-                    prefill_proj_qkv_f32,// F32 scratch (reuse DeltaNet QKV buffer)
+                    prefill_fa_scratch,// F32 scratch (reuse DeltaNet QKV buffer)
                     N, cfg.n_head, cfg.n_head_kv, cfg.head_dim, scale, s);
             }
 
@@ -4653,7 +4583,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             }
 
             // Out projection GEMM → pf_b (FP16)
-            last_quant_ptr = nullptr;  // force re-quant (proj_gate changed)
             do_gemm(w.attn_output, prefill_proj_gate, pf_b);
 
             // FP16 residual add: pf_b += pf_a
@@ -4669,7 +4598,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                 pf_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
             // FFN GEMMs (FP16)
-            last_quant_ptr = nullptr;  // force re-quant (new pf_norm)
             do_gemm(w.ffn_gate, pf_norm, prefill_ffn_gate);
             do_gemm(w.ffn_up, pf_norm, prefill_ffn_up);
 
@@ -4680,7 +4608,6 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            last_quant_ptr = nullptr;  // force re-quant (ffn_out)
             do_gemm(w.ffn_down, prefill_ffn_out, pf_a);
 
             // FP16 residual add: pf_a += pf_b
@@ -4758,29 +4685,40 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
                                      N * sizeof(int), cudaMemcpyHostToDevice, s));
 
 
-    // 1. Batch embedding lookup → prefill_x [B*L, 1024]
-
+    // 1. Batch embedding lookup → prefill_x [B*L, n_embed]
     {
         dim3 grid(1, N);
-        kernel_embed_lookup_batch_fp8<<<grid, 256, 0, s>>>(
-            static_cast<const uint8_t*>(model.token_embd.device_data),
-            model.token_embd.device_scales,
-            d_prefill_tokens, prefill_x, cfg.n_embed, N);
+        if (model.token_embd.type == GGMLType::Q4_K) {
+            kernel_embed_lookup_batch_q4k<<<grid, 256, 0, s>>>(
+                model.token_embd.device_data,
+                d_prefill_tokens, prefill_x, cfg.n_embed, N);
+        } else {
+            kernel_embed_lookup_batch_q6k<<<grid, 256, 0, s>>>(
+                model.token_embd.device_data,
+                d_prefill_tokens, prefill_x, cfg.n_embed, N);
+        }
     }
 
-    // FP8 GEMM dispatch (same pattern as forward_prefill)
-    const half* ehb_last_quant_ptr = nullptr;
-    int ehb_last_quant_K = 0;
+    // GEMM dispatch: routes to MMQ (K-quant) or cuBLAS (F16)
     auto do_gemm = [&](const WeightRef& w, const half* X, half* Y) {
         int M = (int)w.shape[0];
         int K = (int)w.shape[1];
-        if (X != ehb_last_quant_ptr || K != ehb_last_quant_K) {
-            gwen_quantize_fp16_to_fp8(X, fp8_act_buf, sfb_act_buf, K, N, s);
-            ehb_last_quant_ptr = X;
-            ehb_last_quant_K = K;
+        if (is_kquant_type(w.type)) {
+            gwen_gemm_mmq(w.device_data, w.type, X, Y, mmq_scratch, M, K, N, s);
+        } else if (w.type == GGMLType::F16) {
+            cublasHandle_t handle = reinterpret_cast<cublasHandle_t>(cublas_handle);
+            cublasSetStream(handle, s);
+            __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
+            cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        M, N, K,
+                        &alpha_h,
+                        static_cast<const __half*>(w.device_data), K,
+                        X, K,
+                        &beta_h,
+                        Y, M);
+        } else {
+            GWEN_CHECK(false, "Unsupported weight type for batch GEMM");
         }
-        gwen_gemm_fp8(w.device_data, w.device_sfa, fp8_act_buf, sfb_act_buf,
-                       Y, M, K, N, gemm_fp8_workspace, gemm_fp8_ws_size, s);
     };
 
     half* pf_a = prefill_x;
@@ -4807,7 +4745,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
             // Batch GEMM projections on all B*L tokens (ONE weight read each)
             int qkv_dim = cfg.ssm_qkv_dim();  // 6144
         
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.attn_qkv, pf_norm, prefill_proj_qkv);
             do_gemm(w.attn_gate, pf_norm, prefill_proj_gate);
 
@@ -4832,16 +4769,18 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
                     B, L, qkv_dim, cfg.ssm_conv_kernel);
             }
 
-            // Batch gate/beta for all B*L tokens
-        
-            kernel_batch_compute_gate_beta<<<dim3(n_heads, N), 32, 0, s>>>(
-                pf_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
-                static_cast<const float*>(w.ssm_a.device_data),
-                static_cast<const float*>(w.ssm_dt_bias.device_data),
-                prefill_dn_gate, prefill_dn_beta,
-                N, cfg.n_embed, n_heads);
+            // Batch gate/beta for all B*L tokens: GEMM for alpha/beta projections, then convert
+            {
+                half* alpha_batch = prefill_ffn_out;  // reuse as scratch (n_heads << n_ff)
+                half* beta_batch = alpha_batch + (size_t)N * n_heads;
+                do_gemm(w.ssm_alpha, pf_norm, alpha_batch);
+                do_gemm(w.ssm_beta, pf_norm, beta_batch);
+                kernel_batch_alpha_beta_to_gate<<<dim3((n_heads+31)/32, N), 32, 0, s>>>(
+                    alpha_batch, beta_batch,
+                    static_cast<const float*>(w.ssm_a.device_data),
+                    static_cast<const float*>(w.ssm_dt_bias.device_data),
+                    prefill_dn_gate, prefill_dn_beta, N, n_heads);
+            }
 
             // DeltaNet kernel: chunkwise (default) or old sequential (GWEN_USE_SEQ_DN=1)
             {
@@ -4891,7 +4830,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch output projection GEMM → pf_b
         
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.ssm_out, prefill_proj_gate, pf_b);
 
             // Batch residual add: pf_b += pf_a
@@ -4909,7 +4847,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch FFN GEMMs
         
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.ffn_gate, pf_norm, prefill_ffn_gate);
             do_gemm(w.ffn_up, pf_norm, prefill_ffn_up);
 
@@ -4920,7 +4857,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
                     prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.ffn_down, prefill_ffn_out, pf_a);
 
         
@@ -4946,7 +4882,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch Q, K, V projections via GEMM (ONE weight read each)
         
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.attn_q, pf_norm, prefill_proj_qkv);
             do_gemm(w.attn_k, pf_norm, prefill_ffn_gate);
             do_gemm(w.attn_v, pf_norm, prefill_ffn_up);
@@ -5009,7 +4944,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch output projection GEMM → pf_b
         
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.attn_output, prefill_proj_gate, pf_b);
 
             // Batch residual add: pf_b += pf_a
@@ -5027,7 +4961,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
 
             // Batch FFN GEMMs
         
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.ffn_gate, pf_norm, prefill_ffn_gate);
             do_gemm(w.ffn_up, pf_norm, prefill_ffn_up);
 
@@ -5038,7 +4971,6 @@ void InferenceState::extract_hidden_batch(Model& model, const int32_t* all_token
                     prefill_ffn_gate, prefill_ffn_up, prefill_ffn_out, N, cfg.n_ff);
             }
 
-            ehb_last_quant_ptr = nullptr;
             do_gemm(w.ffn_down, prefill_ffn_out, pf_a);
 
         
@@ -5071,7 +5003,7 @@ void InferenceState::predict_from_hidden(Model& model, half* hidden_gpu, int N, 
         hidden_gpu, static_cast<const float*>(model.output_norm.device_data),
         prefill_norm, N, cfg.n_embed, cfg.rms_norm_eps);
 
-    // 2. Per-token: FP8 GEMV + argmax
+    // 2. Per-token: GEMV + argmax
     // Reuses single-token scratch buffers (logits_h, logits_f, argmax_*)
     for (int t = 0; t < N; t++) {
         half* norm_t = prefill_norm + (size_t)t * cfg.n_embed;
@@ -5228,7 +5160,7 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
 
     // 1. Embed the input token → buf_b
     gwen_embed_lookup(model.token_embd.device_data, model.token_embd.type,
-                      d_mtp_token, buf_b, cfg.n_embed, s, model.token_embd.device_scales);
+                      d_mtp_token, buf_b, cfg.n_embed, s, nullptr);
 
     // 2. RMSNorm both streams → mtp_concat = [norm_embed, norm_hidden]
     half* norm_embed = mtp_concat;              // [0 .. n_embed)
@@ -5382,7 +5314,7 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
             kernel_remap_token<<<1, 1, 0, s>>>(rl.d_token_ids, d_argmax_token);
         }
     } else {
-        // Full LM head — FP8 GEMV
+        // Full LM head
         gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(mtp_w.output_norm.device_data),
                           x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
         gemv_dispatch(lm_head_weight(model), x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);

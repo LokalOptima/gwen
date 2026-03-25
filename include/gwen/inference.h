@@ -35,10 +35,6 @@ struct InferenceState {
     half* buf_a = nullptr;      // backing storage (one of x/residual points here)
     half* buf_b = nullptr;      // backing storage (the other of x/residual points here)
 
-    // F32 residual accumulators (FP8 path — avoids FP16 precision loss over 24 layers)
-    float* buf_a_f32 = nullptr; // [n_embed] F32 residual buffer A
-    float* buf_b_f32 = nullptr; // [n_embed] F32 residual buffer B
-
     // DeltaNet scratch
     half* qkv = nullptr;        // [3 * ssm_inner] = [6144] — Q/K/V aliased into this
     half* gate_z = nullptr;     // [ssm_inner] = [2048]
@@ -86,8 +82,6 @@ struct InferenceState {
     // --- Batch-2 scratch buffers (token B in 2-token verify) ---
     half* b2_buf_a = nullptr;       // [n_embed] token B hidden state
     half* b2_buf_b = nullptr;       // [n_embed] token B residual
-    float* b2_buf_a_f32 = nullptr;  // [n_embed] F32 residual buffer A for token B (FP8 path)
-    float* b2_buf_b_f32 = nullptr;  // [n_embed] F32 residual buffer B for token B (FP8 path)
     half* b2_x_norm = nullptr;      // [n_embed] token B after norm
     half* b2_qkv = nullptr;         // [3 * ssm_inner]
     half* b2_gate_z = nullptr;      // [ssm_inner]
@@ -128,38 +122,24 @@ struct InferenceState {
 
     // Prefill scratch buffers
     half* prefill_x = nullptr;       // [max_prefill, n_embed] input embeddings (FP16, for extract_hidden)
-    half* prefill_out = nullptr;     // [max_prefill, n_embed] layer output (FP16, unused in F32 path)
-    half* prefill_norm = nullptr;    // [max_prefill, n_embed] after norm (FP16, GEMM I/O)
-    float* prefill_x_f32 = nullptr;       // [max_prefill, n_embed] F32 residual accumulator A
-    float* prefill_out_f32 = nullptr;     // [max_prefill, n_embed] F32 residual accumulator B
-    float* prefill_proj_qkv_f32 = nullptr; // [max_prefill, ssm_inner*3] F32 QKV projection
-    float* prefill_proj_gate_f32 = nullptr; // [max_prefill, ssm_inner] F32 gate/output projection
-    float* prefill_dn_out_f32 = nullptr;  // [max_prefill, ssm_inner] F32 DeltaNet output temp
-    float* prefill_ffn_gate_f32 = nullptr; // [max_prefill, n_ff] F32 FFN gate
-    float* prefill_ffn_up_f32 = nullptr;   // [max_prefill, n_ff] F32 FFN up
-    float* prefill_ffn_out_f32 = nullptr;  // [max_prefill, n_ff] F32 FFN SwiGLU output
-    // FP8 GEMM prefill scratch
-    uint8_t* fp8_act_buf = nullptr;       // [max_prefill * max_K] FP8 quantized activations
-    float* sfb_act_buf = nullptr;         // [ceil(max_prefill/128) * ceil(max_K/128)] scale factors
-    void* gemm_fp8_workspace = nullptr;   // CUTLASS workspace
-    size_t gemm_fp8_ws_size = 0;
+    half* prefill_out = nullptr;     // [max_prefill, n_embed] layer output
+    half* prefill_norm = nullptr;    // [max_prefill, n_embed] after norm (GEMM I/O)
     // MMQ (K-quant) GEMM prefill scratch
     void* mmq_scratch = nullptr;          // Q8_1 activations + stream-K fixup
     size_t mmq_scratch_size = 0;
-    bool use_mmq_prefill = false;         // true for GGUF K-quant models
     void* cublas_handle = nullptr;        // cuBLAS handle for F16 GEMM (IQ4_XS→F16 weights)
     half* prefill_ffn_gate = nullptr; // [max_prefill, n_ff]
     half* prefill_ffn_up = nullptr;   // [max_prefill, n_ff]
     half* prefill_ffn_out = nullptr;  // [max_prefill, n_ff]
     half* prefill_proj_qkv = nullptr; // [max_prefill, ssm_inner*3] batch projection output
     half* prefill_proj_gate = nullptr; // [max_prefill, ssm_inner] batch gate/output proj
+    float* prefill_fa_scratch = nullptr; // [max_prefill, n_head * head_dim] F32 scratch for flash attention
     float* prefill_dn_gate = nullptr; // [max_prefill, ssm_n_heads] DeltaNet gate values
     float* prefill_dn_beta = nullptr; // [max_prefill, ssm_n_heads] DeltaNet beta values
     int* d_prefill_tokens = nullptr;  // [max_prefill] pre-allocated device token IDs
     int max_prefill = 0;
 
-    void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens,
-                          bool f32_path = true, bool gguf_mode = false);
+    void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens);
 
     // --- Batch prefill state (for extract_hidden_batch) ---
     // B independent DeltaNet states and conv states, contiguous for batch kernels
@@ -177,16 +157,12 @@ struct InferenceState {
     half* chunk_v_new = nullptr;       // [max_tokens, ssm_inner] corrected values after state propagation
     int chunk_NT_max = 0;              // max number of chunks per sequence
 
-    void allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_total_tokens, int max_seqs, bool f32_path = false);
+    void allocate_batch_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_total_tokens, int max_seqs);
 
     // Batch extract: process B independent sequences of length L, output all hidden states
     // all_tokens: [B * L] flat array of token IDs (host)
     // output_host: [B * L * n_embed] FP16 hidden states (host)
     void extract_hidden_batch(Model& model, const int32_t* all_tokens, int B, int L, void* output_host);
-
-    // Dev server: restricted embed for teacher logit computation
-    half* restricted_embed_fp16 = nullptr;  // [K, n_embed] FP16 on GPU (persistent)
-    int restricted_vocab_K = 0;             // number of restricted vocab entries
 
     // Compute main model predictions from hidden states on GPU (after extract_hidden_batch).
     // Applies output_norm + lm_head (embed_tokens GEMV) + argmax per token.
