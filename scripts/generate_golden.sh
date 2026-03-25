@@ -4,7 +4,7 @@
 # Output: tests/golden/<prompt_idx>/ — per-layer hidden states + logits
 set -euo pipefail
 
-MODEL="Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
+MODEL="${HOME}/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"
 GOLDEN_DIR="tests/golden"
 LLAMA_DUMP="./tests/llama_dump_layers"
 LLAMA_GOLDEN="./tests/llama_golden"

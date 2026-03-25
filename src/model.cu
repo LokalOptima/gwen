@@ -107,32 +107,7 @@ static std::vector<uint8_t> convert_iq4xs_to_fp16(const GGUFTensor& t) {
 static WeightRef weight_from_tensor_convert(const GGUFFile& gguf, const std::string& name,
                                              std::vector<std::vector<uint8_t>>& converted_buffers) {
     const auto& t = gguf.get_tensor(name);
-    if (t.type == GGMLType::IQ4_XS) {
-        converted_buffers.push_back(convert_iq4xs_to_fp16(t));
-        auto& buf = converted_buffers.back();
-        WeightRef w;
-        w.host_data = buf.data();
-        w.type = GGMLType::F16;
-        w.n_elements = t.n_elements;
-        w.size_bytes = buf.size();
-        w.shape = t.shape;
-        // Swap GGML [cols, rows] → GWEN [rows, cols] for 2D weight matrices
-        if (w.shape.size() == 2) {
-            std::swap(w.shape[0], w.shape[1]);
-        }
-        // Sanity check: verify first few converted values
-        const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(buf.data());
-        bool has_nan = false;
-        for (int i = 0; i < 8; i++) {
-            uint16_t h = fp16_data[i];
-            uint32_t exp = (h >> 10) & 0x1F;
-            if (exp == 31) has_nan = true;
-        }
-        fprintf(stderr, "  Converted %s: IQ4_XS → F16 (%.1f MB → %.1f MB)%s\n",
-                name.c_str(), t.size_bytes / 1024.0 / 1024.0, buf.size() / 1024.0 / 1024.0,
-                has_nan ? " WARNING: NaN in first 8 values!" : "");
-        return w;
-    }
+    // IQ4_XS: use native format with dp4a GEMV kernel (no F16 conversion)
     return weight_from_tensor(t);
 }
 

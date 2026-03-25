@@ -149,6 +149,13 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_dp4a.cu)
     target_link_libraries(test_dp4a gwen_core)
 endif()
 
+# --- Benchmark (llama-bench replica) ---
+if(EXISTS ${CMAKE_SOURCE_DIR}/bench/gwen_bench.cu)
+    add_executable(gwen_bench bench/gwen_bench.cu)
+    target_link_libraries(gwen_bench gwen_core)
+    set_target_properties(gwen_bench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
 # --- Profiler ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/bench/profile_forward.cu)
     add_executable(profile_forward bench/profile_forward.cu)

@@ -123,6 +123,18 @@ void gwen_rmsnorm_f32_input_batch2(const float* x0_f32, const float* x1_f32,
                                     half* y0, half* y1,
                                     int dim, float eps, cudaStream_t stream = 0);
 
+// Fused F32-input RMSNorm + Q8_1 quantize (+ optional FP16 copy)
+// Reads F32 residual, applies RMSNorm with F32 weights, outputs Q8_1 directly.
+// y_fp16 may be nullptr to skip FP16 output (when all downstream GEMVs use dp4a).
+void gwen_rmsnorm_f32_input_quantize_q8_1(const float* x_f32, const float* weight,
+                                            void* y_q8, half* y_fp16,
+                                            int dim, float eps, cudaStream_t stream = 0);
+
+void gwen_rmsnorm_f32_input_quantize_q8_1_batch2(
+        const float* x0_f32, const float* x1_f32, const float* weight,
+        void* y_q8_0, void* y_q8_1, half* y_fp16_0, half* y_fp16_1,
+        int dim, float eps, cudaStream_t stream = 0);
+
 // FP16→F32 / F32→FP16 conversion
 void gwen_fp16_to_f32(const half* x, float* y, int n, cudaStream_t stream = 0);
 void gwen_fp16_to_f32_add(const half* x, float* y, const float* residual, int n, cudaStream_t stream = 0);

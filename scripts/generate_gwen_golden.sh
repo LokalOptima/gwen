@@ -4,7 +4,7 @@
 # Output: tests/golden_gwen/prompt_N.tokens (one token ID per line)
 set -euo pipefail
 
-MODEL="Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
+MODEL="${HOME}/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"
 GWEN="./build/gwen"
 GOLDEN_DIR="tests/golden_gwen"
 

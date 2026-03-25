@@ -52,6 +52,16 @@ struct block_q8_1 {
 };
 static_assert(sizeof(block_q8_1) == 36, "block_q8_1 size mismatch");
 
+// IQ4_XS: 256 values per block, 136 bytes
+// Non-linear 4-bit quantization with importance matrix scaling
+struct block_iq4_xs {
+    half d;                 // super-block scale
+    uint16_t scales_h;     // high 2 bits of 8 sub-block scales
+    uint8_t scales_l[4];   // low 4 bits of 8 sub-block scales (packed 2 per byte)
+    uint8_t qs[128];       // 4-bit indices into kvalues_iq4nl lookup table
+};
+static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs size mismatch");
+
 } // namespace gwen
 
 #pragma pack(pop)

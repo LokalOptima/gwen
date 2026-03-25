@@ -40,7 +40,7 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 }
 
 int main(int argc, char** argv) {
-    const char* model_path = argc > 1 ? argv[1] : "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf";
+    const char* model_path = argc > 1 ? argv[1] : "Qwen3.5-9B-UD-Q4_K_XL.gguf";
     const char* prompt = argc > 2 ? argv[2] : "The";
 
     llama_backend_init();

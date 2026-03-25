@@ -78,7 +78,7 @@ def read_gguf_tensors(path):
         return tensors
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/models/Qwen3.5-9B-UD-Q4_K_XL.gguf")
     tensors = read_gguf_tensors(path)
 
     # Group by layer

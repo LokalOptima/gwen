@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-MODEL="Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
+MODEL="${HOME}/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"
 GWEN="./build/gwen"
 GOLDEN_LLAMA="tests/golden"
 GOLDEN_GWEN="tests/golden_gwen"

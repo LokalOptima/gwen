@@ -7,9 +7,9 @@
 
 set -euo pipefail
 
-MODEL="Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
+MODEL="${1:-$HOME/models/Qwen3.5-9B-UD-Q4_K_XL.gguf}"
 GWEN="./build/gwen"
-NAME="${1:-gwen_decode}"
+NAME="${2:-gwen_decode}"
 OUTDIR="profiles"
 mkdir -p "$OUTDIR"
 
@@ -32,12 +32,13 @@ fi
 # --gpu-metrics-device=all captures SM/memory utilization
 nsys profile \
     --trace=cuda \
+    --cuda-graph-trace=node \
     --cuda-memory-usage=true \
     --force-overwrite=true \
     --output="$OUTDIR/$NAME" \
     "$GWEN" --model "$MODEL" \
-    --prompt "The meaning of life is" \
-    --n-predict 100 --greedy --benchmark 2>&1 | head -3
+    --no-mtp --greedy --max-predict 100 --benchmark \
+    "1 2 3 4 5 6 7 8" 2>&1 | head -3
 
 echo ""
 echo "Trace saved to: $OUTDIR/${NAME}.nsys-rep"

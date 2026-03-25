@@ -47,7 +47,7 @@ def load_token_counts(counts_path: Path, n_vocab: int) -> np.ndarray:
 def main():
     parser = argparse.ArgumentParser(description="Build reduced LM head for faster MTP")
     parser.add_argument("--gguf", type=Path,
-                        default=Path("Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"),
+                        default=Path.home() / "models" / "Qwen3.5-9B-UD-Q4_K_XL.gguf",
                         help="Path to GGUF model file")
     parser.add_argument("--counts", type=Path,
                         default=Path("data/token_counts.bin"),

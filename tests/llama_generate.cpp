@@ -7,7 +7,7 @@
 #include <algorithm>
 
 int main(int argc, char** argv) {
-    const char* model_path = argc > 1 ? argv[1] : "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf";
+    const char* model_path = argc > 1 ? argv[1] : "Qwen3.5-9B-UD-Q4_K_XL.gguf";
     const char* prompt = argc > 2 ? argv[2] : "The quick brown fox";
     int n_predict = argc > 3 ? atoi(argv[3]) : 30;
 

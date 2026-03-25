@@ -2,7 +2,7 @@
 # Compare GWEN vs llama.cpp outputs token-by-token (greedy decoding)
 # Usage: ./scripts/compare_outputs.sh [n_tokens] [prompt]
 
-MODEL="/home/lapo/git/gwen/Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
+MODEL="${HOME}/models/Qwen3.5-9B-UD-Q4_K_XL.gguf"
 GWEN="./build/gwen"
 LLAMA="/home/lapo/git/gwen/third_party/llama.cpp/build/bin/llama-simple"
 N=${1:-30}

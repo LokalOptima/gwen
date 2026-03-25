@@ -258,6 +258,31 @@ static __device__ __forceinline__ int get_int_b2(const void* x, int i32) {
     return x16[2 * i32] | (x16[2 * i32 + 1] << 16);
 }
 
+// ============================================================
+// IQ4_XS lookup table and helpers
+// ============================================================
+static __device__ const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+// Efficient 16-entry int8 lookup via __byte_perm
+// Given q4 with 4-bit indices packed in each nibble, returns:
+//   .x = looked-up values for even nibbles (low nibble of each byte)
+//   .y = looked-up values for odd nibbles (high nibble of each byte)
+static __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
+    const uint32_t* table32 = (const uint32_t*)table;
+    uint32_t tmp[2];
+    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    #pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
+        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
 template<int NW>
 __global__ void __launch_bounds__(NW * 32)
 kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
@@ -319,6 +344,155 @@ kernel_gemv_q6_k_dp4a(const block_q6_k* __restrict__ W,
 
     // Reduction
     __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32];
+    if (threadIdx.y > 0)
+        tmp_shared[threadIdx.y - 1][threadIdx.x] = sumf;
+    __syncthreads();
+
+    if (threadIdx.y == 0) {
+        #pragma unroll
+        for (int w = 0; w < NW - 1; w++)
+            sumf += tmp_shared[w][threadIdx.x];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
+        if (threadIdx.x == 0) {
+            if (residual)
+                y[row] = __float2half(sumf + __half2float(residual[row]));
+            else
+                y[row] = __float2half(sumf);
+        }
+    }
+}
+
+// ============================================================
+// dp4a-accelerated Q8_0 GEMV
+// Q8_0 block: 32 elements, {half d, int8_t qs[32]} = 34 bytes
+// qs is at 2-byte alignment → use get_int_b2
+// ============================================================
+
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
+kernel_gemv_q8_0_dp4a(const block_q8_0* __restrict__ W,
+                       const block_q8_1* __restrict__ x_q8,
+                       half* __restrict__ y,
+                       const half* __restrict__ residual,
+                       int out_features, int blocks_per_row) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid = threadIdx.x + threadIdx.y * 32;
+
+    // Q8_0 has 8 int4 positions per block (32 bytes / 4 = 8 ints)
+    constexpr int QI = 8;
+    constexpr int VDR = 2;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;  // NW=2→16, NW=4→32
+
+    float sumf = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int iqs = (tid * VDR) % QI;  // 0,2,4,6
+
+        const block_q8_0& blk = W[row * blocks_per_row + kbx];
+
+        // Weight: 2-byte aligned qs → use get_int_b2
+        int v0 = get_int_b2(blk.qs, iqs + 0);
+        int v1 = get_int_b2(blk.qs, iqs + 1);
+
+        // Input: Q8_1 block maps 1:1 to Q8_0 block (same group size 32)
+        const block_q8_1& bq8 = x_q8[kbx];
+        const int* u = reinterpret_cast<const int*>(bq8.qs) + iqs;
+        int u0 = u[0];
+        int u1 = u[1];
+
+        int sumi = __dp4a(v0, u0, __dp4a(v1, u1, 0));
+
+        float d_w = __half2float(blk.d);
+        float d_x = __low2float(bq8.ds);  // ds.x = delta
+
+        sumf += d_w * d_x * (float)sumi;
+    }
+
+    // Reduction: warps 1..NW-1 write to shared, warp 0 accumulates
+    __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32];
+
+    if (threadIdx.y > 0)
+        tmp_shared[threadIdx.y - 1][threadIdx.x] = sumf;
+    __syncthreads();
+
+    if (threadIdx.y == 0) {
+        #pragma unroll
+        for (int w = 0; w < NW - 1; w++)
+            sumf += tmp_shared[w][threadIdx.x];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sumf += __shfl_xor_sync(0xFFFFFFFF, sumf, offset);
+        if (threadIdx.x == 0) {
+            if (residual)
+                y[row] = __float2half(sumf + __half2float(residual[row]));
+            else
+                y[row] = __float2half(sumf);
+        }
+    }
+}
+
+// ============================================================
+// dp4a-accelerated IQ4_XS GEMV
+// IQ4_XS: 256 elements per block, non-linear 4-bit with lookup table
+// {half d, uint16_t scales_h, uint8_t scales_l[4], uint8_t qs[128]} = 136 bytes
+// qs at offset 8 → 4-byte aligned, use direct int* cast
+// ============================================================
+
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
+kernel_gemv_iq4_xs_dp4a(const void* __restrict__ W_raw,
+                         const block_q8_1* __restrict__ x_q8,
+                         half* __restrict__ y,
+                         const half* __restrict__ residual,
+                         int out_features, int blocks_per_row) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid = threadIdx.x + threadIdx.y * 32;
+    const block_iq4_xs* W = static_cast<const block_iq4_xs*>(W_raw);
+
+    constexpr int QI = 32;  // 128 bytes qs / 4 bytes per int = 32 int positions
+    constexpr int VDR = 4;  // 4 ints per thread per step (= 32 nibbles = 1 sub-block)
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;  // NW=2→8, NW=4→16
+
+    float sumf = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int iqs = (tid * VDR) % QI;  // 0,4,8,12,16,20,24,28
+
+        const block_iq4_xs& blk = W[row * blocks_per_row + kbx];
+        const int* qs_int = reinterpret_cast<const int*>(blk.qs);
+
+        int sumi = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int aux_q4 = qs_int[iqs + j];
+            const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+
+            const block_q8_1& bq8 = x_q8[kbx * 8 + iqs / 4];
+            const int* u = reinterpret_cast<const int*>(bq8.qs);
+            int u0 = u[j + 0];
+            int u1 = u[j + 4];
+
+            sumi = __dp4a(v.x, u0, sumi);
+            sumi = __dp4a(v.y, u1, sumi);
+        }
+
+        const int ls = ((blk.scales_l[iqs / 8] >> (iqs & 4)) & 0xF) |
+                       (((blk.scales_h >> (iqs / 2)) & 3) << 4);
+        sumi *= (ls - 32);
+
+        float d = __half2float(blk.d) * __low2float(x_q8[kbx * 8 + iqs / 4].ds);
+        sumf += d * (float)sumi;
+    }
+
+    // Same reduction as other dp4a kernels
+    __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32];
+
     if (threadIdx.y > 0)
         tmp_shared[threadIdx.y - 1][threadIdx.x] = sumf;
     __syncthreads();
@@ -585,6 +759,167 @@ kernel_gemv_q6_k_dp4a_batch2(const block_q6_k* __restrict__ W,
     }
 }
 
+// Batch-2 variant: read Q8_0 weights once, dot with 2 Q8_1 inputs
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
+kernel_gemv_q8_0_dp4a_batch2(const block_q8_0* __restrict__ W,
+                              const block_q8_1* __restrict__ x_q8_0,
+                              const block_q8_1* __restrict__ x_q8_1,
+                              half* __restrict__ y0, half* __restrict__ y1,
+                              const half* __restrict__ res0, const half* __restrict__ res1,
+                              int out_features, int blocks_per_row) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid = threadIdx.x + threadIdx.y * 32;
+
+    constexpr int QI = 8;
+    constexpr int VDR = 2;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;
+
+    float sumf0 = 0.0f, sumf1 = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int iqs = (tid * VDR) % QI;
+
+        const block_q8_0& blk = W[row * blocks_per_row + kbx];
+        int v0 = get_int_b2(blk.qs, iqs + 0);
+        int v1 = get_int_b2(blk.qs, iqs + 1);
+        float d_w = __half2float(blk.d);
+
+        // Token 0
+        {
+            const block_q8_1& bq8 = x_q8_0[kbx];
+            const int* u = reinterpret_cast<const int*>(bq8.qs) + iqs;
+            int sumi = __dp4a(v0, u[0], __dp4a(v1, u[1], 0));
+            sumf0 += d_w * __low2float(bq8.ds) * (float)sumi;
+        }
+        // Token 1
+        {
+            const block_q8_1& bq8 = x_q8_1[kbx];
+            const int* u = reinterpret_cast<const int*>(bq8.qs) + iqs;
+            int sumi = __dp4a(v0, u[0], __dp4a(v1, u[1], 0));
+            sumf1 += d_w * __low2float(bq8.ds) * (float)sumi;
+        }
+    }
+
+    __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32][2];
+
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y - 1][threadIdx.x][0] = sumf0;
+        tmp_shared[threadIdx.y - 1][threadIdx.x][1] = sumf1;
+    }
+    __syncthreads();
+
+    if (threadIdx.y == 0) {
+        #pragma unroll
+        for (int w = 0; w < NW - 1; w++) {
+            sumf0 += tmp_shared[w][threadIdx.x][0];
+            sumf1 += tmp_shared[w][threadIdx.x][1];
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sumf0 += __shfl_xor_sync(0xFFFFFFFF, sumf0, offset);
+            sumf1 += __shfl_xor_sync(0xFFFFFFFF, sumf1, offset);
+        }
+        if (threadIdx.x == 0) {
+            y0[row] = __float2half(sumf0 + (res0 ? __half2float(res0[row]) : 0.0f));
+            y1[row] = __float2half(sumf1 + (res1 ? __half2float(res1[row]) : 0.0f));
+        }
+    }
+}
+
+// Batch-2 IQ4_XS: read weights + lookup once, dot with 2 Q8_1 inputs
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
+kernel_gemv_iq4_xs_dp4a_batch2(const void* __restrict__ W_raw,
+                                const block_q8_1* __restrict__ x_q8_0,
+                                const block_q8_1* __restrict__ x_q8_1,
+                                half* __restrict__ y0, half* __restrict__ y1,
+                                const half* __restrict__ res0, const half* __restrict__ res1,
+                                int out_features, int blocks_per_row) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid = threadIdx.x + threadIdx.y * 32;
+    const block_iq4_xs* W = static_cast<const block_iq4_xs*>(W_raw);
+
+    constexpr int QI = 32;
+    constexpr int VDR = 4;
+    constexpr int BLOCKS_PER_ITER = VDR * NW * 32 / QI;
+
+    float sumf0 = 0.0f, sumf1 = 0.0f;
+
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int iqs = (tid * VDR) % QI;
+
+        const block_iq4_xs& blk = W[row * blocks_per_row + kbx];
+        const int* qs_int = reinterpret_cast<const int*>(blk.qs);
+
+        // Shared: lookup table dereference (expensive part)
+        int2 vs[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            vs[j] = get_int_from_table_16(qs_int[iqs + j], kvalues_iq4nl);
+        }
+
+        const int ls = ((blk.scales_l[iqs / 8] >> (iqs & 4)) & 0xF) |
+                       (((blk.scales_h >> (iqs / 2)) & 3) << 4);
+        const int ls_adj = ls - 32;
+        float d_w = __half2float(blk.d);
+
+        // Token 0
+        {
+            int sumi = 0;
+            const block_q8_1& bq8 = x_q8_0[kbx * 8 + iqs / 4];
+            const int* u = reinterpret_cast<const int*>(bq8.qs);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = __dp4a(vs[j].x, u[j + 0], sumi);
+                sumi = __dp4a(vs[j].y, u[j + 4], sumi);
+            }
+            sumf0 += d_w * __low2float(bq8.ds) * (float)(sumi * ls_adj);
+        }
+        // Token 1
+        {
+            int sumi = 0;
+            const block_q8_1& bq8 = x_q8_1[kbx * 8 + iqs / 4];
+            const int* u = reinterpret_cast<const int*>(bq8.qs);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = __dp4a(vs[j].x, u[j + 0], sumi);
+                sumi = __dp4a(vs[j].y, u[j + 4], sumi);
+            }
+            sumf1 += d_w * __low2float(bq8.ds) * (float)(sumi * ls_adj);
+        }
+    }
+
+    __shared__ float tmp_shared[NW > 1 ? NW - 1 : 1][32][2];
+
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y - 1][threadIdx.x][0] = sumf0;
+        tmp_shared[threadIdx.y - 1][threadIdx.x][1] = sumf1;
+    }
+    __syncthreads();
+
+    if (threadIdx.y == 0) {
+        #pragma unroll
+        for (int w = 0; w < NW - 1; w++) {
+            sumf0 += tmp_shared[w][threadIdx.x][0];
+            sumf1 += tmp_shared[w][threadIdx.x][1];
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sumf0 += __shfl_xor_sync(0xFFFFFFFF, sumf0, offset);
+            sumf1 += __shfl_xor_sync(0xFFFFFFFF, sumf1, offset);
+        }
+        if (threadIdx.x == 0) {
+            y0[row] = __float2half(sumf0 + (res0 ? __half2float(res0[row]) : 0.0f));
+            y1[row] = __float2half(sumf1 + (res1 ? __half2float(res1[row]) : 0.0f));
+        }
+    }
+}
+
 // ============================================================
 // Legacy FP16 GEMV kernels (kept for fallback and Q8_0)
 // ============================================================
@@ -840,6 +1175,7 @@ void gwen_gemv(const void* W, const half* x, half* y,
         case GGMLType::Q5_K: gwen_gemv_q5_k(W, x, y, out_features, in_features, stream); break;
         case GGMLType::Q6_K: gwen_gemv_q6_k(W, x, y, out_features, in_features, stream); break;
         case GGMLType::Q8_0: gwen_gemv_q8_0(W, x, y, out_features, in_features, stream); break;
+        case GGMLType::IQ4_XS: GWEN_CHECK(false, "IQ4_XS requires dp4a path (use gwen_gemv_dp4a)"); break;
         default: GWEN_CHECK(false, "Unsupported GEMV type");
     }
 }
@@ -880,8 +1216,27 @@ static void gemv_dp4a_internal(const void* W, const void* x_q8, half* y, const h
                 kernel_gemv_q6_k_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row);
             break;
         }
+        case GGMLType::Q8_0: {
+            int blocks_per_row_q8 = in_features / 32;  // Q8_0 block = 32 elements, NOT QK_K
+            bool small_q8 = (blocks_per_row_q8 <= 16);
+            auto Wp = static_cast<const block_q8_0*>(W);
+            if (small_q8)
+                kernel_gemv_q8_0_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row_q8);
+            else
+                kernel_gemv_q8_0_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8, y, residual, out_features, blocks_per_row_q8);
+            break;
+        }
+        case GGMLType::IQ4_XS: {
+            // IQ4_XS uses QK_K=256 super-blocks, same as Q4_K/Q5_K/Q6_K
+            bool small_iq4 = (blocks_per_row <= 4);
+            if (small_iq4)
+                kernel_gemv_iq4_xs_dp4a<2><<<out_features, dim3(32, 2), 0, stream>>>(W, bq8, y, residual, out_features, blocks_per_row);
+            else
+                kernel_gemv_iq4_xs_dp4a<4><<<out_features, dim3(32, 4), 0, stream>>>(W, bq8, y, residual, out_features, blocks_per_row);
+            break;
+        }
         default:
-            GWEN_CHECK(false, "Unsupported dp4a GEMV type (Q4_K/Q5_K/Q6_K only)");
+            GWEN_CHECK(false, "Unsupported dp4a GEMV type");
     }
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
@@ -936,8 +1291,26 @@ static void gemv_dp4a_batch2_internal(const void* W,
                 kernel_gemv_q6_k_dp4a_batch2<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
             break;
         }
+        case GGMLType::Q8_0: {
+            int blocks_per_row_q8 = in_features / 32;
+            bool small_q8 = (blocks_per_row_q8 <= 16);
+            auto Wp = static_cast<const block_q8_0*>(W);
+            if (small_q8)
+                kernel_gemv_q8_0_dp4a_batch2<2><<<out_features, dim3(32, 2), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row_q8);
+            else
+                kernel_gemv_q8_0_dp4a_batch2<4><<<out_features, dim3(32, 4), 0, stream>>>(Wp, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row_q8);
+            break;
+        }
+        case GGMLType::IQ4_XS: {
+            bool small_iq4 = (blocks_per_row <= 4);
+            if (small_iq4)
+                kernel_gemv_iq4_xs_dp4a_batch2<2><<<out_features, dim3(32, 2), 0, stream>>>(W, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            else
+                kernel_gemv_iq4_xs_dp4a_batch2<4><<<out_features, dim3(32, 4), 0, stream>>>(W, bq8_0, bq8_1, y0, y1, res0, res1, out_features, blocks_per_row);
+            break;
+        }
         default:
-            GWEN_CHECK(false, "Unsupported dp4a batch2 GEMV type (Q4_K/Q5_K/Q6_K only)");
+            GWEN_CHECK(false, "Unsupported dp4a batch2 GEMV type");
     }
     GWEN_CHECK_CUDA(cudaGetLastError());
 }

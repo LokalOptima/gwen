@@ -206,15 +206,12 @@ For the 0.8B (K=V=16), both formulas give `k_head = head` — which is why the 0
 ## Current State
 
 **What works:**
-- 0.8B GGUF: 195 tok/s, exact match with llama-simple
-- 9B GGUF: ~27 tok/s, correct output matches llama-simple
+- 9B GGUF: 118 tok/s, correct output matches llama-simple (see [post #35](35-closing-the-gap-dp4a-iq4xs.md) for optimization journey)
 - 9B loading: all 427 tensors, 5.4 GB → GPU in ~1 sec
-- All K-quant types: Q4_K, Q5_K, Q6_K, Q8_0, F16
+- All K-quant types: Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS, F16
+- dp4a GEMV for all types, native IQ4_XS kernel
+- K-quant prefill via MMQ GEMM + cuBLAS
 - CUDA graphs for decode
-
-**Not yet implemented:**
-- Prefill for K-quant path
-- Performance optimization (dp4a, L2 tuning)
 
 ## Lessons Learned
 
@@ -230,6 +227,4 @@ For the 0.8B (K=V=16), both formulas give `k_head = head` — which is why the 0
 
 ## Next Steps
 
-- K-quant prefill (dequant-then-GEMM for multi-token prompt processing)
-- dp4a decode optimization (quantize input to Q8_1, use integer SIMD)
-- CUDA graph optimization and L2 cache tuning for 9B weight reads
+See [post #35](35-closing-the-gap-dp4a-iq4xs.md) — dp4a wiring, Q8_0 kernel, native IQ4_XS kernel brought decode from 45.7 to 118 tok/s.

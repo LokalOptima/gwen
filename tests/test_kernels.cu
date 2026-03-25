@@ -459,7 +459,7 @@ int main(int argc, char** argv) {
     print_result(results.back());
 
     // Test with real model weights if available
-    std::string model_path = "Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf";
+    std::string model_path = "Qwen3.5-9B-UD-Q4_K_XL.gguf";
     if (argc > 1) model_path = argv[1];
 
     FILE* f = fopen(model_path.c_str(), "rb");
