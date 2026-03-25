@@ -778,6 +778,9 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// launch_fattn requires full llama.cpp backend types (ggml_tensor, ggml_backend_cuda_context, etc.)
+// GWEN does not use this function — it drives the flash-attention kernel directly.
+#ifdef GGML_CUDA_FULL_BACKEND
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1034,3 +1037,4 @@ void launch_fattn(
     }
     CUDA_CHECK(cudaGetLastError());
 }
+#endif // GGML_CUDA_FULL_BACKEND

@@ -3093,6 +3093,9 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
 
+// launch_mul_mat_q / mul_mat_q_case / ggml_cuda_mul_mat_q / ggml_cuda_op_mul_mat_q
+// require full llama.cpp backend types.  GWEN drives the kernel directly.
+#ifdef GGML_CUDA_FULL_BACKEND
 template <ggml_type type, int mmq_x>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -3306,3 +3309,4 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+#endif // GGML_CUDA_FULL_BACKEND

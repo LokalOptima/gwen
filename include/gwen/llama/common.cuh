@@ -1,34 +1,28 @@
 #pragma once
 
-#include "ggml.h"
-#include "ggml-impl.h"
-#include "ggml-cuda.h"
+#include "ggml-defs.h"
 
 #include <cstdint>
 #include <memory>
-
-#define GGML_COMMON_DECL_CUDA
-#define GGML_COMMON_IMPL_CUDA
-#if defined(GGML_USE_MUSA)
-#define GGML_COMMON_DECL_MUSA
-#define GGML_COMMON_IMPL_MUSA
-#endif
-#include "ggml-common.h"
-
 #include <array>
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-#if   defined(GGML_USE_MUSA)
-#include "vendors/musa.h"
-#else
-#include "vendors/cuda.h"
-#endif // defined(GGML_USE_HIP)
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#if CUDART_VERSION >= 12050
+#include <cuda_fp8.h>
+#endif
+#if CUDART_VERSION >= 12080
+#include <cuda_fp4.h>
+#endif
 
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
@@ -43,8 +37,6 @@
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
 #define GGML_CUDA_CC_ADA_LOVELACE    890
-// While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
-// https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_functionality.html#blackwell-sm120-gemms
 #define GGML_CUDA_CC_BLACKWELL       1200
 #define GGML_CUDA_CC_DGX_SPARK       1210
 #define GGML_CUDA_CC_RUBIN           1300
@@ -53,20 +45,17 @@
 #define GGML_CUDA_CC_IS_NVIDIA(cc)   (cc < GGML_CUDA_CC_OFFSET_MTHREADS)
 
 // AMD
-// GCN/CDNA, wave size is 64
-#define GGML_CUDA_CC_GCN4       (GGML_CUDA_CC_OFFSET_AMD + 0x803)  // Tonga, Fiji, Polaris, minimum for fast fp16
-#define GGML_CUDA_CC_VEGA       (GGML_CUDA_CC_OFFSET_AMD + 0x900)  // Vega56/64, minimum for fp16 dual issue
-#define GGML_CUDA_CC_VEGA20     (GGML_CUDA_CC_OFFSET_AMD + 0x906)  // MI50/Radeon VII, minimum for dp4a
-#define GGML_CUDA_CC_CDNA1      (GGML_CUDA_CC_OFFSET_AMD + 0x908)  // MI100, minimum for MFMA, acc registers
-#define GGML_CUDA_CC_CDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x910)  // MI210, minimum acc register renameing
-#define GGML_CUDA_CC_CDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x942)  // MI300
-
-// RDNA removes MFMA, dp4a, xnack, acc registers, wave size is 32
-#define GGML_CUDA_CC_RDNA1      (GGML_CUDA_CC_OFFSET_AMD + 0x1010) // RX 5000
-#define GGML_CUDA_CC_RDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x1030) // RX 6000, minimum for dp4a
-#define GGML_CUDA_CC_RDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x1100) // RX 7000, minimum for WMMA
-#define GGML_CUDA_CC_RDNA3_5    (GGML_CUDA_CC_OFFSET_AMD + 0x1150) // AI 370, AI Max 395 laptops.
-#define GGML_CUDA_CC_RDNA4      (GGML_CUDA_CC_OFFSET_AMD + 0x1200) // RX 9000
+#define GGML_CUDA_CC_GCN4       (GGML_CUDA_CC_OFFSET_AMD + 0x803)
+#define GGML_CUDA_CC_VEGA       (GGML_CUDA_CC_OFFSET_AMD + 0x900)
+#define GGML_CUDA_CC_VEGA20     (GGML_CUDA_CC_OFFSET_AMD + 0x906)
+#define GGML_CUDA_CC_CDNA1      (GGML_CUDA_CC_OFFSET_AMD + 0x908)
+#define GGML_CUDA_CC_CDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x910)
+#define GGML_CUDA_CC_CDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x942)
+#define GGML_CUDA_CC_RDNA1      (GGML_CUDA_CC_OFFSET_AMD + 0x1010)
+#define GGML_CUDA_CC_RDNA2      (GGML_CUDA_CC_OFFSET_AMD + 0x1030)
+#define GGML_CUDA_CC_RDNA3      (GGML_CUDA_CC_OFFSET_AMD + 0x1100)
+#define GGML_CUDA_CC_RDNA3_5    (GGML_CUDA_CC_OFFSET_AMD + 0x1150)
+#define GGML_CUDA_CC_RDNA4      (GGML_CUDA_CC_OFFSET_AMD + 0x1200)
 
 #define GGML_CUDA_CC_IS_AMD(cc)     (cc >= GGML_CUDA_CC_OFFSET_AMD)
 #define GGML_CUDA_CC_IS_RDNA(cc)    (cc >= GGML_CUDA_CC_RDNA1)
@@ -83,11 +72,10 @@
 #define GGML_CUDA_CC_IS_CDNA3(cc)   (cc >= GGML_CUDA_CC_CDNA3 && cc < GGML_CUDA_CC_RDNA1)
 
 // Moore Threads
-#define MUSART_HMASK 40300 // MUSA rc4.3, min. ver. for half2 -> uint mask comparisons
-
-#define GGML_CUDA_CC_QY1 (GGML_CUDA_CC_OFFSET_MTHREADS + 0x210) // MTT S80, MTT S3000
-#define GGML_CUDA_CC_QY2 (GGML_CUDA_CC_OFFSET_MTHREADS + 0x220) // MTT S4000
-#define GGML_CUDA_CC_PH1 (GGML_CUDA_CC_OFFSET_MTHREADS + 0x310) // MTT S5000
+#define MUSART_HMASK 40300
+#define GGML_CUDA_CC_QY1 (GGML_CUDA_CC_OFFSET_MTHREADS + 0x210)
+#define GGML_CUDA_CC_QY2 (GGML_CUDA_CC_OFFSET_MTHREADS + 0x220)
+#define GGML_CUDA_CC_PH1 (GGML_CUDA_CC_OFFSET_MTHREADS + 0x310)
 
 #define GGML_CUDA_CC_IS_MTHREADS(cc) (cc >= GGML_CUDA_CC_OFFSET_MTHREADS && cc < GGML_CUDA_CC_OFFSET_AMD)
 #define GGML_CUDA_CC_IS_QY1(cc)      (cc >= GGML_CUDA_CC_QY1 && cc < GGML_CUDA_CC_QY2)
@@ -96,7 +84,7 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
 #    define GGML_CUDA_USE_CUB
-#endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#endif
 
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
@@ -156,99 +144,44 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 
 #define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
 
-#if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
-    static const char * cublas_get_error_str(const cublasStatus_t err) {
-        return cublasGetStatusString(err);
-    }
-#else
-    static const char * cublas_get_error_str(const cublasStatus_t err) {
-        switch (err) {
-            case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
-            case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
-            case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
-            case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
-            case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
-            case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
-            case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
-            case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
-            case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
-            default: return "unknown error";
-        }
-    }
-#endif // CUDART_VERSION >= 12000
-
-#define CUBLAS_CHECK(err) CUDA_CHECK_GEN(err, CUBLAS_STATUS_SUCCESS, cublas_get_error_str)
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
-static const char * cu_get_error_str(CUresult err) {
-    const char * err_str;
-    cuGetErrorString(err, &err_str);
-    return err_str;
-}
-#define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
-#endif
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-#    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
-        do {                                                                                                   \
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
-            const int   id                                                = ggml_cuda_get_device();            \
-            if (!shared_memory_limit_raised[id]) {                                                             \
-                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
-                shared_memory_limit_raised[id] = true;                                                         \
-            }                                                                                                  \
-        } while (0)
-#else
-#    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes) \
-        do {                                             \
-            GGML_UNUSED(nbytes);                         \
-        } while (0)
-#endif // !(defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 #define GGML_CUDA_ASSUME(x) __builtin_assume(x)
 #else
 #define GGML_CUDA_ASSUME(x)
-#endif // CUDART_VERSION >= 11010
-
-#if (!defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)) || (defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_VMM))
-#define GGML_USE_VMM
-#endif // (!defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)) || (defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_VMM))
+#endif
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 #define FP16_AVAILABLE
-#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
+#endif
 
 #if defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
 #define FAST_FP16_AVAILABLE
-#endif // defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
-
-
+#endif
 
 // The Volta instructions are in principle available on Turing or newer but they are effectively unusable:
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
 #define VOLTA_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+#endif
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 #define TURING_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+#endif
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define AMPERE_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
 #    define BLACKWELL_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+#endif
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif
 
 #if !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 #define FLASH_ATTN_AVAILABLE
-#endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
+#endif
 
 #define LDMATRIX_TRANS_AVAILABLE
 
@@ -263,13 +196,11 @@ static bool fast_fp16_available(const int cc) {
         (GGML_CUDA_CC_IS_MTHREADS(cc) && fp16_available(cc));
 }
 
-// To be used for feature selection of external libraries, e.g. cuBLAS.
 static bool fast_fp16_hardware_available(const int cc) {
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_PASCAL && cc != 610) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 }
 
-// To be used for feature selection of external libraries, e.g. cuBLAS.
 static bool fp16_mma_hardware_available(const int cc) {
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
@@ -291,7 +222,7 @@ static bool amd_mfma_available(const int cc) {
     return GGML_CUDA_CC_IS_CDNA(cc);
 #else
     return false;
-#endif //!defined(GGML_HIP_NO_MMQ_MFMA)
+#endif
 }
 
 static bool amd_wmma_available(const int cc) {
@@ -329,7 +260,7 @@ static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
     return 16;
 #else
     return 8;
-#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#endif
 }
 
 
@@ -345,14 +276,14 @@ static __device__ void no_device_code(
 
 #if defined(GGML_USE_MUSA)
     __builtin_unreachable();
-#endif // defined(GGML_USE_MUSA)
+#endif
 }
 
 #ifdef __CUDA_ARCH__
 #define NO_DEVICE_CODE no_device_code(__FILE__, __LINE__, __FUNCTION__, __CUDA_ARCH__, STRINGIZE(__CUDA_ARCH_LIST__))
 #else
 #define NO_DEVICE_CODE //GGML_ABORT("NO_DEVICE_CODE not valid in host code.")
-#endif // __CUDA_ARCH__
+#endif
 
 // The compiler is always able to unroll loops if they contain continue expressions.
 // In such cases loop unrolling can still be achieved via recursion:
@@ -383,7 +314,7 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif
 }
 
 template<int width = WARP_SIZE>
@@ -417,7 +348,7 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #else
     NO_DEVICE_CODE;
     return a;
-#endif // FP16_AVAILABLE
+#endif
 }
 
 template<int width = WARP_SIZE>
@@ -499,7 +430,7 @@ static __device__ __forceinline__ half2 warp_prefix_inclusive_sum(half2 a) {
 #else
     NO_DEVICE_CODE;
     return a;
-#endif // FP16_AVAILABLE
+#endif
 }
 
 enum class block_reduce_method {
@@ -589,13 +520,13 @@ static __device__ __forceinline__ half ggml_cuda_hmax(const half a, const half b
     return __float2half(fmaxf(__half2float(a), __half2float(b)));
 #else
     return __hmax(a, b);
-#endif // !defined(GGML_USE_HIP) && CUDART_VERSION < CUDART_HMAX
+#endif
 
 #else
    NO_DEVICE_CODE;
    GGML_UNUSED(b);
    return a;
-#endif // FP16_AVAILABLE
+#endif
 }
 
 static __device__ __forceinline__ half2 ggml_cuda_hmax2(const half2 a, const half2 b) {
@@ -620,7 +551,7 @@ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
 #else
    GGML_UNUSED(x);
    NO_DEVICE_CODE;
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || defined(GGML_USE_HIP)
+#endif
 }
 
 #if (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || \
@@ -630,17 +561,17 @@ static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half
     const uint32_t mask_high = 0xFFFF0000 * (float(__high2half(a)) > float(__high2half(b)));
     return mask_low | mask_high;
 }
-#endif // (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
+#endif
 
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
-#else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+#else
     const int8_t * a8 = (const int8_t *) &a;
     const int8_t * b8 = (const int8_t *) &b;
     return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
-#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+#endif
 
 }
 
@@ -666,8 +597,8 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
     const float2 tmpu = __half22float2(u);
     acc += tmpv.x * tmpu.x;
     acc += tmpv.y * tmpu.y;
-#endif // FAST_FP16_AVAILABLE
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
+#endif
 }
 
 static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v, const half2 u) {
@@ -680,14 +611,10 @@ static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v,
     tmpacc.x += tmpv.x * tmpu.x;
     tmpacc.y += tmpv.y * tmpu.y;
     acc = make_half2(tmpacc.x, tmpacc.y);
-#endif // FAST_FP16_AVAILABLE
+#endif
 }
 
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes, especially on AMD.
-// Important: do not use this function if dst and src both point at registers.
-//     Due to the strict aliasing rule the compiler can do incorrect optimizations if src and dst have different types.
-//     The function is intended for copies between registers and SRAM/VRAM to make the compiler emit the right instructions.
-//     If dst and src point at different address spaces then they are guaranteed to not be aliased.
 template <int nbytes, int alignment = 0>
 static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * __restrict__ dst, const void * __restrict__ src) {
     static_assert(
@@ -734,7 +661,7 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
     float result;
     memcpy(&result, &bits, sizeof(float));
     return result;
-#endif // CUDART_VERSION >= 12050
+#endif
 }
 
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
@@ -760,45 +687,31 @@ __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e)
 }
 
 // See https://gmplib.org/~tege/divcnst-pldi94.pdf figure 4.1.
-// Precompute mp (m' in the paper) and L such that division
-// can be computed using a multiply (high 32b of 64b result)
-// and a shift:
-//
-// n/d = (mulhi(n, mp) + n) >> L;
 static const uint3 init_fastdiv_values(uint64_t d_64) {
     GGML_ASSERT(d_64 != 0);
     GGML_ASSERT(d_64 <= std::numeric_limits<uint32_t>::max());
 
     uint32_t d = (uint32_t)d_64;
 
-    // compute L = ceil(log2(d));
     uint32_t L = 0;
     while (L < 32 && (uint32_t{ 1 } << L) < d) {
         L++;
     }
 
     uint32_t mp = (uint32_t) ((uint64_t{ 1 } << 32) * ((uint64_t{ 1 } << L) - d) / d + 1);
-    // pack divisor as well to reduce error surface
     return make_uint3(mp, L, d);
 }
 
 static __device__ __forceinline__ uint32_t fastdiv(uint32_t n, const uint3 fastdiv_values) {
-    // expects fastdiv_values to contain <mp, L, divisor> in <x, y, z>
-    // fastdiv_values.z is unused and optimized away by the compiler.
-    // Compute high 32 bits of n * mp
     const uint32_t hi = __umulhi(n, fastdiv_values.x);
-    // add n, apply bit shift
     return (hi + n) >> fastdiv_values.y;
 }
 
 static __device__ __forceinline__ uint32_t fastmodulo(uint32_t n, const uint3 fastdiv_values) {
-    // expects  fastdiv_values to contain <mp, L, divisor> in <x, y, z> (see init_fastdiv_values)
     return n - fastdiv(n, fastdiv_values) * fastdiv_values.z;
 }
 
-// Calculate both division and modulo at once, returns <n/divisor, n%divisor>
 static __device__ __forceinline__ uint2 fast_div_modulo(uint32_t n, const uint3 fastdiv_values) {
-    // expects  fastdiv_values to contain <mp, L, divisor> in <x, y, z> (see init_fastdiv_values)
     const uint32_t div_val = fastdiv(n, fastdiv_values);
     const uint32_t mod_val = n - div_val * fastdiv_values.z;
     return make_uint2(div_val, mod_val);
@@ -965,401 +878,4 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR3_S;
     static constexpr int qi = QI3_S;
-};
-
-//////////////////////
-
-struct ggml_cuda_device_info {
-    int device_count;
-
-    struct cuda_device_info {
-        int     cc;                             // compute capability
-        int     nsm;                            // number of streaming multiprocessors
-        size_t  smpb;                           // max. shared memory per block
-        size_t  smpbo;                          // max. shared memory per block (with opt-in)
-        bool    integrated;                     // Device is integrated as opposed to discrete
-        bool    vmm;                            // virtual memory support
-        size_t  vmm_granularity;                // granularity of virtual memory
-        size_t  total_vram;
-        int     warp_size;                      // Number of threads in a dispatch
-        bool    supports_cooperative_launch;    // whether cooperative launch is supported
-    };
-
-    cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
-
-    std::array<float, GGML_CUDA_MAX_DEVICES> default_tensor_split = {};
-};
-
-const ggml_cuda_device_info & ggml_cuda_info();
-
-void ggml_cuda_set_device(int device);
-int ggml_cuda_get_device();
-
-struct ggml_cuda_pool {
-    virtual ~ggml_cuda_pool() = default;
-
-    virtual void * alloc(size_t size, size_t * actual_size) = 0;
-    virtual void free(void * ptr, size_t size) = 0;
-};
-
-template<typename T>
-struct ggml_cuda_pool_alloc {
-    ggml_cuda_pool * pool = nullptr;
-    T * ptr = nullptr;
-    size_t actual_size = 0;
-
-    ggml_cuda_pool_alloc() = default;
-
-    explicit ggml_cuda_pool_alloc(ggml_cuda_pool & pool) : pool(&pool) {
-    }
-
-    ggml_cuda_pool_alloc(ggml_cuda_pool & pool, size_t size) : pool(&pool) {
-        alloc(size);
-    }
-
-    ~ggml_cuda_pool_alloc() {
-        if (ptr != nullptr) {
-            pool->free(ptr, actual_size);
-        }
-    }
-
-    // size is in number of elements
-    T * alloc(size_t size) {
-        GGML_ASSERT(pool != nullptr);
-        GGML_ASSERT(ptr == nullptr);
-        ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size);
-        return ptr;
-    }
-
-    T * alloc(ggml_cuda_pool & pool, size_t size) {
-        this->pool = &pool;
-        return alloc(size);
-    }
-
-    T * get() {
-        return ptr;
-    }
-
-    ggml_cuda_pool_alloc(const ggml_cuda_pool_alloc &) = delete;
-    ggml_cuda_pool_alloc(ggml_cuda_pool_alloc &&) = delete;
-    ggml_cuda_pool_alloc& operator=(const ggml_cuda_pool_alloc &) = delete;
-    ggml_cuda_pool_alloc& operator=(ggml_cuda_pool_alloc &&) = delete;
-};
-
-
-// backend interface
-
-struct ggml_tensor_extra_gpu {
-    void * data_device[GGML_CUDA_MAX_DEVICES]; // 1 pointer for each device for split tensors
-    cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
-};
-
-
-#if (defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS)) || defined(GGML_MUSA_GRAPHS)
-#define USE_CUDA_GRAPH
-#endif
-
-struct ggml_cuda_graph_node_properties {
-    void * node_data;
-    ggml_op node_op;
-    enum ggml_type node_type;
-    int32_t flags;
-    int64_t ne[GGML_MAX_DIMS];
-    size_t nb[GGML_MAX_DIMS];
-    void * src_data[GGML_MAX_SRC];
-    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
-};
-
-static_assert(std::is_trivial<ggml_cuda_graph_node_properties>::value, "ggml_cuda_graph_node_properties must be trivial");
-
-struct ggml_cuda_graph {
-#ifdef USE_CUDA_GRAPH
-    ~ggml_cuda_graph() {
-        if (instance != nullptr) {
-            CUDA_CHECK(cudaGraphExecDestroy(instance));
-        }
-        if (graph != nullptr) {
-            CUDA_CHECK(cudaGraphDestroy(graph));
-        }
-    }
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t instance = nullptr;
-    size_t num_nodes = 0;
-    std::vector<cudaGraphNode_t> nodes;
-    bool disable_due_to_gpu_arch = false;
-    bool warmup_complete = false;
-    std::vector<ggml_cuda_graph_node_properties> props;
-
-    // these are extra tensors (inputs) that participate in the ggml graph but are not nodes
-    // they properties also have to match in order to be able to safely reuse a CUDA graph
-    // ref: https://github.com/ggml-org/llama.cpp/pull/18583
-    // ref: https://github.com/ggml-org/llama.cpp/pull/19165
-    std::vector<ggml_cuda_graph_node_properties> extra;
-
-    bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
-    }
-#endif
-};
-
-struct ggml_cuda_concurrent_event {
-    std::vector<cudaEvent_t> join_events;
-    cudaEvent_t              fork_event = nullptr;
-
-    int                                          n_streams = 0;
-    std::unordered_map<const ggml_tensor *, int> stream_mapping;
-
-    // Original order of nodes in this concurrent region (before interleaving)
-    // Used to restore grouping for fusion within streams
-    std::vector<const ggml_tensor *> original_order;
-
-    const ggml_tensor * join_node;
-
-    ggml_cuda_concurrent_event() = default;
-
-    ggml_cuda_concurrent_event(const ggml_cuda_concurrent_event &) = delete;
-    ggml_cuda_concurrent_event & operator=(const ggml_cuda_concurrent_event &) = delete;
-
-    explicit ggml_cuda_concurrent_event(int n_streams) : n_streams(n_streams) {
-        join_events.resize(n_streams);
-
-        for (size_t i = 0; i < join_events.size(); ++i) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&join_events[i], cudaEventDisableTiming));
-        }
-
-        CUDA_CHECK(cudaEventCreateWithFlags(&fork_event, cudaEventDisableTiming));
-    }
-
-    ggml_cuda_concurrent_event(ggml_cuda_concurrent_event && other) noexcept
-    : join_events(std::move(other.join_events))
-    , fork_event(other.fork_event)
-    , n_streams(other.n_streams)
-    , stream_mapping(std::move(other.stream_mapping))
-    , original_order(std::move(other.original_order))
-    , join_node(other.join_node) {
-        other.fork_event = nullptr;
-    }
-
-    // 1. check if any branches write to overlapping memory ranges (except the join node)
-    // 2. check whether all srcs are either within the branch or outside the nodes covered by ggml_cuda_concurrent_event
-    // we assume all nodes have the same buffer
-    bool is_valid() const {
-        std::vector<std::vector<std::pair<int64_t, int64_t>>> write_ranges;
-        write_ranges.resize(n_streams);
-
-        // get join_node's memory range to exclude from overlap checking.
-        // multiple nodes can use join_node's buffer; we synchronize on the join node.
-        const ggml_tensor * join_t     = join_node->view_src ? join_node->view_src : join_node;
-        const int64_t       join_start = (int64_t) join_t->data;
-        const int64_t       join_end   = join_start + ggml_nbytes(join_t);
-
-        for (const auto & [tensor, stream] : stream_mapping) {
-            const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
-            const int64_t       t_start = (int64_t) t->data;
-            const int64_t       t_end   = t_start + ggml_nbytes(t);
-
-            // skip tensors that overlap with join_node's buffer.
-            if ((t_start <= join_start && join_start < t_end) || (join_start <= t_start && t_start < join_end)) {
-                continue;
-            }
-
-            // concurrent streams begin from 1
-            write_ranges[stream - 1].emplace_back(t_start, t_end);
-        }
-
-        for (int i = 0; i < n_streams; ++i) {
-            // sorts first by start then by end of write range
-            std::sort(write_ranges[i].begin(), write_ranges[i].end());
-        }
-
-        bool writes_overlap = false;
-        bool dependent_srcs = false;
-        for (const auto & [tensor, stream] : stream_mapping) {
-            const ggml_tensor * t = tensor->view_src ? tensor->view_src : tensor;
-            const int64_t       t_start = (int64_t) t->data;
-            const int64_t       t_end   = t_start + ggml_nbytes(t);
-
-            // skip tensors that overlap with join_node's buffer
-            if ((t_start <= join_start && join_start < t_end) || (join_start <= t_start && t_start < join_end)) {
-                continue;
-            }
-
-            // check if this buffer's write data overlaps with another stream's
-            std::pair<int64_t, int64_t> data_range = std::make_pair(t_start, t_end);
-            for (int i = 0; i < n_streams; ++i) {
-                if (i == stream - 1) {
-                    continue;
-                }
-                auto it = std::lower_bound(write_ranges[i].begin(), write_ranges[i].end(), data_range);
-
-                if (it != write_ranges[i].end()) {
-                    const std::pair<int64_t, int64_t> & other = *it;
-
-                    // std::lower_bound returns the first element where other >= data_range (lexicographically).
-                    // This guarantees other.first >= data_range.first.
-                    // Therefore, overlap occurs iff other.first < data_range.second
-                    // (i.e., the other range starts before this range ends).
-                    if (other.first < data_range.second) {
-                        GGML_LOG_DEBUG("Writes overlap for %s", tensor->name);
-                        writes_overlap = true;
-                        break;
-                    }
-                }
-            }
-
-            //check if all srcs are either in branch or don't have a branch
-            for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                if (!tensor->src[i]) {
-                    continue;
-                }
-
-                auto it = stream_mapping.find(tensor->src[i]);
-
-                if (it == stream_mapping.end()) {
-                    continue;
-                }
-
-                if (it->second != stream) {
-                    dependent_srcs = true;
-                    break;
-                }
-            }
-
-            if (dependent_srcs || writes_overlap) {
-                break;
-            }
-        }
-
-        return !writes_overlap && !dependent_srcs;
-    }
-
-    ~ggml_cuda_concurrent_event() {
-        if (fork_event != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(fork_event));
-        }
-        for (cudaEvent_t e : join_events) {
-            if (e != nullptr) {
-                CUDA_CHECK(cudaEventDestroy(e));
-            }
-        }
-    }
-};
-
-struct ggml_cuda_stream_context {
-    std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
-
-    void reset() {
-        concurrent_events.clear();
-    }
-};
-
-struct ggml_backend_cuda_context {
-    int device;
-    std::string name;
-    cudaEvent_t copy_event = nullptr;
-
-    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
-    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
-
-    int curr_stream_no = 0;
-
-#ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
-        auto it = cuda_graphs.find(first_node_ptr);
-        if (it == cuda_graphs.end()) {
-            cuda_graphs[first_node_ptr] = std::make_unique<ggml_cuda_graph>();
-            return cuda_graphs[first_node_ptr].get();
-        }
-        return it->second.get();
-    }
-
-    // Check if any CUDA graph is enabled for this context (used by kernels that need to know
-    // if graphs are in use without having access to the specific graph key)
-    bool any_cuda_graph_enabled() const {
-        for (const auto & [key, graph] : cuda_graphs) {
-            if (graph && graph->is_enabled()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Check if any CUDA graph has an instance for this context
-    bool any_cuda_graph_has_instance() const {
-        for (const auto & [key, graph] : cuda_graphs) {
-            if (graph && graph->instance != nullptr) {
-                return true;
-            }
-        }
-        return false;
-    }
-#endif // USE_CUDA_GRAPH
-
-    explicit ggml_backend_cuda_context(int device) :
-        device(device),
-        name(GGML_CUDA_NAME + std::to_string(device)) {
-    }
-
-    ggml_cuda_stream_context concurrent_stream_context;
-
-    ~ggml_backend_cuda_context();
-
-    cudaStream_t stream(int device, int stream) {
-        if (streams[device][stream] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
-        }
-        return streams[device][stream];
-    }
-
-    cudaStream_t stream() { return stream(device, curr_stream_no); }
-
-    ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
-
-    cublasHandle_t cublas_handle(int device) {
-        if (cublas_handles[device] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
-        }
-        return cublas_handles[device];
-    }
-
-    cublasHandle_t cublas_handle() {
-        return cublas_handle(device);
-    }
-
-    // pool
-    std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
-
-    static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
-
-    ggml_cuda_pool & pool(int device) {
-        if (pools[device][curr_stream_no] == nullptr) {
-            pools[device][curr_stream_no] = new_pool_for_device(device, curr_stream_no);
-        }
-        return *pools[device][curr_stream_no];
-    }
-
-    ggml_cuda_pool & pool() {
-        return pool(device);
-    }
-};
-
-struct ggml_cuda_mm_fusion_args_host {
-    const ggml_tensor * x_bias = nullptr;
-    const ggml_tensor * gate = nullptr;
-    const ggml_tensor * gate_bias = nullptr;
-    ggml_glu_op glu_op;
-};
-struct ggml_cuda_mm_fusion_args_device {
-    const void * x_bias = nullptr;
-    const void * gate = nullptr;
-    const void * gate_bias = nullptr;
-    ggml_glu_op glu_op;
 };
