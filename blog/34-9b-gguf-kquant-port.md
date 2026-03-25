@@ -163,7 +163,7 @@ Layer 1's ffn_gate is IQ4_XS, converted to F16 at load. The conversion code set 
 
 Fix: apply the same 2D swap in the IQ4_XS conversion path.
 
-### 0.8B Works, 9B Doesn't
+### 0.8B Works, 9B Doesn't (Initially)
 
 After fixing both NaN sources, the model ran and produced coherent-ish text. But comparing against llama-simple:
 
@@ -174,25 +174,47 @@ gwen:         "1 2 3 4 5 6 7 8 2 2 3 3 3 3 3 3 3 3"
 
 Testing with the 0.8B GGUF (same K-quant path): **exact match** with llama-simple. The K-quant GEMV kernels are correct for the 0.8B's symmetric K=V=16 heads.
 
-The 9B's DeltaNet with K=16/V=32 is where the bug lives. Even single-token prompts diverge: GWEN's top prediction for "1" is a Chinese character (token 96287 = 元), while llama-simple predicts "9".
+The 9B's DeltaNet with K=16/V=32 is where the bug lived. Even single-token prompts diverged: GWEN's top prediction for "1" was a Chinese character (token 96287 = 元), while llama-simple predicted "9".
+
+### The Hunt: Per-Layer Chain Verification
+
+To find the bug, I wrote a Python reference implementing the full 32-layer forward pass, comparing against GWEN's per-layer binary dumps. Every single layer matched (cosine similarity > 0.999 for all 32 layers). Both Python and GWEN produced the same wrong output.
+
+This meant the bug wasn't in any CUDA kernel — it was in the architecture implementation itself. Something about how my code interpreted the GGUF weights.
+
+### Root Cause: V-Head Tiled Ordering
+
+The answer was in `convert_hf_to_gguf.py`. llama.cpp's GGUF conversion reorders ALL V-head-indexed tensors from **grouped** to **tiled** order:
+
+- **Grouped** (HuggingFace): `[K0_v0, K0_v1, K1_v0, K1_v1, ...]`
+- **Tiled** (GGUF): `[K0_v0, K1_v0, ..., K0_v1, K1_v1, ...]`
+
+This reordering applies to: QKV-V, attn_gate, ssm_alpha, ssm_beta, ssm_a, ssm_dt.bias, ssm_conv1d (V channels), and ssm_out (columns). It's done so `ggml_repeat` can efficiently broadcast K-head Q/K to match V-head count.
+
+GWEN's DeltaNet kernel used grouped-order mapping:
+```cuda
+int k_head = head * n_k_heads / n_v_heads;  // WRONG for tiled GGUF
+```
+
+The fix is tiled-order mapping:
+```cuda
+int k_head = head % n_k_heads;  // CORRECT for tiled GGUF
+```
+
+For the 0.8B (K=V=16), both formulas give `k_head = head` — which is why the 0.8B worked. For the 9B (K=16, V=32), the formulas diverge: grouped gives `head/2`, tiled gives `head%16`.
 
 ## Current State
 
 **What works:**
 - 0.8B GGUF: 195 tok/s, exact match with llama-simple
+- 9B GGUF: ~27 tok/s, correct output matches llama-simple
 - 9B loading: all 427 tensors, 5.4 GB → GPU in ~1 sec
-- 9B decode: 28 tok/s, no NaN, CUDA graphs working
 - All K-quant types: Q4_K, Q5_K, Q6_K, Q8_0, F16
+- CUDA graphs for decode
 
-**What's broken:**
-- 9B output correctness — DeltaNet K≠V asymmetry handling
-- Prefill not yet implemented for K-quant path
-
-**Debugging infrastructure built:**
-- `GWEN_DEBUG` build flag: per-layer intermediate value checks
-- `GWEN_LAYER_LIMIT=N`: run only first N layers
-- `GWEN_LOGITS_BIN=path`: binary logit dumps for comparison
-- `GWEN_DUMP_LOGITS=1`: top-5 per position
+**Not yet implemented:**
+- Prefill for K-quant path
+- Performance optimization (dp4a, L2 tuning)
 
 ## Lessons Learned
 
@@ -202,13 +224,12 @@ The 9B's DeltaNet with K=16/V=32 is where the bug lives. Even single-token promp
 
 3. **Don't assume equivalent code paths are equivalent.** The IQ4_XS conversion created WeightRefs outside the normal `weight_from_tensor` path, missing the shape swap. Every path that creates a WeightRef needs the same conventions.
 
-4. **NaN is your friend.** It's much easier to debug than "slightly wrong output." The shape bug that caused NaN was found in minutes; the remaining correctness issue (which produces valid-but-wrong logits) is far harder to track down.
+4. **NaN is your friend.** It's much easier to debug than "slightly wrong output." The shape bug that caused NaN was found in minutes.
+
+5. **Read the conversion script, not just the inference code.** The V-head tiled reordering was invisible from the GGUF file or the inference code — it only existed in `convert_hf_to_gguf.py`. The per-layer Python chain verification proved the bug was in weight interpretation, not computation, directing the search to the conversion pipeline.
 
 ## Next Steps
 
-The remaining correctness bug requires per-layer activation comparison against llama.cpp. The `kernel_deltanet_fused` GQA mapping (`k_head = head * n_k_heads / n_v_heads`) looks correct dimensionally, but something about how the S matrix accumulates with shared K-heads is producing subtly wrong results. The DeltaNet recurrence is the prime suspect.
-
-After correctness, the targets are:
 - K-quant prefill (dequant-then-GEMM for multi-token prompt processing)
 - dp4a decode optimization (quantize input to Q8_1, use integer SIMD)
 - CUDA graph optimization and L2 cache tuning for 9B weight reads

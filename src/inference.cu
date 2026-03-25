@@ -560,7 +560,9 @@ kernel_deltanet_fused(
 {
     int head = blockIdx.x;  // V head index
     if (head >= n_v_heads) return;
-    int k_head = head * n_k_heads / n_v_heads;  // shared K head
+    // GGUF stores V-heads in tiled order: [K0_v0, K1_v0, ..., K0_v1, K1_v1, ...]
+    // so the K-head for V-head `head` is head % n_k_heads (not head * n_k_heads / n_v_heads)
+    int k_head = (n_k_heads == n_v_heads) ? head : head % n_k_heads;
     int tid = threadIdx.x;  // 0..127
     int warp_id = tid / 32;
     int lane = tid % 32;
@@ -741,7 +743,7 @@ kernel_deltanet_fused_2tok(
 {
     int head = blockIdx.x;  // V head index
     if (head >= n_v_heads) return;
-    int k_head = head * n_k_heads / n_v_heads;  // shared K head
+    int k_head = (n_k_heads == n_v_heads) ? head : head % n_k_heads;
     int tid = threadIdx.x;
     int warp_id = tid / 32;
     int lane = tid % 32;
