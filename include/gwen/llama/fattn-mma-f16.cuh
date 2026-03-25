@@ -169,18 +169,9 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
 #if defined(AMPERE_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
-#elif defined(TURING_MMA_AVAILABLE)
-    return ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
-#elif defined(AMD_MFMA_AVAILABLE)
-    return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
-#elif defined(VOLTA_MMA_AVAILABLE)
-    return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
-#elif defined(AMD_WMMA_AVAILABLE)
-    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
 #else
-    GGML_UNUSED_VARS(DKQ, DV, ncols);
-    return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
-#endif // defined(AMPERE_MMA_AVAILABLE)
+    return ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
+#endif
 }
 
 static __host__ int ggml_cuda_fattn_mma_get_nthreads(const int DKQ, const int DV, const int ncols, const int cc) {
@@ -473,7 +464,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int jt,
         const int kb0,
         const int k_VKQ_sup) {
-#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
     constexpr int  cols_per_warp   = T_B_KQ::I;
@@ -491,13 +481,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : nbatch_V2 + 4;
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
-#if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
-#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-    T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
-#else // Volta
-    T_C_KQ KQ_C[nbatch_fa/(np*T_C_KQ::J)];
-#endif // defined(TURING_MMA_AVAILABLE)
 
     if constexpr (nstages > 1) {
         static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
@@ -708,23 +692,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
-#if defined(TURING_MMA_AVAILABLE)
             // Values per KQ column are spread across 4 threads:
             constexpr int offset_first = 2;
             constexpr int offset_last  = 1;
-#elif defined(AMD_MFMA_AVAILABLE)
-            // MFMA: 4 threads per Q column (threadIdx.x % 16 == col, spaced by 16).
-            constexpr int offset_first = 32;
-            constexpr int offset_last  = 16;
-#elif defined(AMD_WMMA_AVAILABLE)
-            // Values per KQ column are spread across 2 threads:
-            constexpr int offset_first = 16;
-            constexpr int offset_last  = 16;
-#else // Volta
-            // Values per KQ column are spread across 2 threads:
-            constexpr int offset_first = 2;
-            constexpr int offset_last  = 2;
-#endif // defined(TURING_MMA_AVAILABLE)
 #pragma unroll
             for (int offset = offset_first; offset >= offset_last; offset >>= 1) {
                 KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xFFFFFFFF, KQ_max_new[col], offset, warp_size));
@@ -766,7 +736,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
         }
 
-#if defined(TURING_MMA_AVAILABLE)
         if constexpr (cols_per_warp == 8) {
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
 #pragma unroll
@@ -789,27 +758,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
             }
         }
-#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-        const half2 KQ_max_scale_h2 = make_half2(
-            KQ_max_scale[0], KQ_max_scale[0]);
-#pragma unroll
-        for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
-#pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
-            }
-        }
-#else // Volta
-        const half2 KQ_max_scale_h2 = make_half2(
-            KQ_max_scale[(threadIdx.x / 2) % 2], KQ_max_scale[(threadIdx.x / 2) % 2]);
-#pragma unroll
-        for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
-#pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
-            }
-        }
-#endif // defined(TURING_MMA_AVAILABLE)
     }
 
     // Convert KQ C tiles into B tiles for VKQ calculation:
@@ -843,10 +791,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     }
 
 
-#if defined(AMD_WMMA_AVAILABLE) && !defined(LDMATRIX_TRANS_AVAILABLE)
-    T_A_VKQ A_identity;
-    make_identity_mat(A_identity);
-#endif // defined(AMD_WMMA_AVAILABLE) && !defined(LDMATRIX_TRANS_AVAILABLE)
 
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
 #pragma unroll
@@ -868,7 +812,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
         const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
 
-#if defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
         constexpr int i0_stride = cols_per_warp == 8 ? T_C_VKQ::I : 2*T_C_VKQ::J;
 #pragma unroll
         for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
@@ -878,29 +821,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 const int k0 = k00 + (threadIdx.y % np)*T_A_VKQ::J;
 
                 T_A_VKQ A; // Transposed in SRAM but not in registers, gets transposed on load.
-#if defined(LDMATRIX_TRANS_AVAILABLE)
                 load_ldmatrix_trans(A, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
-#elif defined(AMD_MFMA_AVAILABLE)
-                // MFMA A register layout: A_mat[i=lane%16][k=4*(lane/16)+reg].
-                // Normal load gives A_mat[seq][dv] but we need A_mat[dv][seq] = V^T.
-                // Load with transposed addressing: 4 strided half loads.
-                {
-                    const half2 * xs0 = tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2;
-                    const half * xs0_h = (const half *) xs0;
-                    const int stride_h = stride_tile_V * 2; // stride in half units
-                    half * A_h = (half *) A.x;
-#pragma unroll
-                    for (int l = 0; l < 4; ++l) {
-                        A_h[l] = xs0_h[(4*(threadIdx.x / 16) + l) * stride_h + threadIdx.x % 16];
-                    }
-                }
-#else
-                // TODO: Try to transpose tile_V when loading gmem to smem.
-                // Use mma to transpose T_A_VKQ for RDNA.
-                T_A_VKQ A_trans;
-                load_ldmatrix(A_trans, tile_V_i + 2*k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
-                mma(A, A_trans, A_identity);
-#endif // defined(LDMATRIX_TRANS_AVAILABLE)
                 if constexpr (T_B_KQ::I == 8) {
                     mma(VKQ_C[i_VKQ_0/i0_stride], A, B[k00/(np*T_A_VKQ::J)]);
                 } else {
@@ -915,38 +836,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 }
             }
         }
-#else // Volta
-        constexpr int i0_stride = 2*T_C_VKQ::J;
-#pragma unroll
-        for (int i_VKQ_0 = i0_start; i_VKQ_0 < i0_stop; i_VKQ_0 += i0_stride) {
-            static_assert(nbatch_fa % (np*T_A_VKQ::I) == 0, "bad loop size");
-            static_assert(2*T_B_VKQ::J == T_A_VKQ::I, "bad tile sizes");
-#pragma unroll
-            for (int k00 = 0; k00 < nbatch_fa; k00 += np*T_A_VKQ::I) {
-                const int k0 = k00 + (threadIdx.y % np)*T_A_VKQ::I;
-
-                T_A_VKQ A; // Transposed in both SRAM and registers, load normally.
-                load_ldmatrix(A, tile_V_i + k0*stride_tile_V + (i_VKQ_0 - i0_start)/2, stride_tile_V);
-                mma(VKQ_C[i_VKQ_0/i0_stride], B[k00/(np*T_A_VKQ::I)], A);
-            }
-        }
-#endif // defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 
         if constexpr (nstages <= 1) {
             __syncthreads(); // Only needed if tile_K == tile_V.
         }
     }
-#else
-    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup,
-        scale, slope, logit_softcap, ne01, ne02,
-        stride_K, stride_V, stride_mask,
-        tile_Q, tile_K, tile_V, tile_mask,
-        Q_B, VKQ_C, KQ_max, KQ_rowsum, kb0);
-    NO_DEVICE_CODE;
-#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
 }
 
-#if defined(TURING_MMA_AVAILABLE)
 template<int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2>; // row-major
     using T_B_KQ  = tile<16,  8, half2>; // column-major
@@ -963,25 +859,6 @@ template<> struct mma_tile_sizes<8> {
     using T_B_VKQ = tile< 8,  8, half2>; // column-major
     using T_C_VKQ = tile<16,  4, half2>; // row-major
 };
-#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-template<int ncols> struct mma_tile_sizes {
-    using T_A_KQ  = tile<16,  8, half2>; // row-major
-    using T_B_KQ  = tile<16,  8, half2>; // column-major
-    using T_C_KQ  = tile<16, 16, float>; // column-major
-    using T_A_VKQ = tile<16,  8, half2>; // row-major
-    using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
-};
-#else // Volta
-template<int ncols> struct mma_tile_sizes {
-    using T_A_KQ  = tile< 8,  4, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
-    using T_B_KQ  = tile<32,  4, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
-    using T_C_KQ  = tile<32,  8, float, DATA_LAYOUT_I_MAJOR>;          // column-major
-    using T_A_VKQ = tile< 8,  4, half2, DATA_LAYOUT_J_MAJOR_MIRRORED>; // column-major
-    using T_B_VKQ = tile<32,  4, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
-    using T_C_VKQ = tile<32,  4, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
-};
-#endif // defined(TURING_MMA_AVAILABLE)
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
@@ -1008,7 +885,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int zt_gqa,
         const int kb0_start,
         const int kb0_stop) {
-#if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -1049,13 +925,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
-#if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
-#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
-#else // Volta
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
-#endif // defined(TURING_MMA_AVAILABLE)
 
     float KQ_rowsum[cols_per_thread] = {0.0f};
     float KQ_max[cols_per_thread];
@@ -1188,23 +1058,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     // Finally, sum up partial KQ rowsums.
     {
-#if defined(TURING_MMA_AVAILABLE)
         // The partial sums are spread across 8/4 threads.
         constexpr int offset_first = cols_per_warp == 8 ? 16 : 2;
         constexpr int offset_last  = cols_per_warp == 8 ?  4 : 1;
-#elif defined(AMD_MFMA_AVAILABLE)
-        // The partial sums are spread across 4 threads (wavefront64, 16 cols).
-        constexpr int offset_first = 32;
-        constexpr int offset_last  = 16;
-#elif defined(AMD_WMMA_AVAILABLE)
-        // The partial sums are spread across 2 threads.
-        constexpr int offset_first = 16;
-        constexpr int offset_last  = 16;
-#else // Volta
-        // The partial sums are spread across 2 threads.
-        constexpr int offset_first = 2;
-        constexpr int offset_last  = 2;
-#endif // defined(TURING_MMA_AVAILABLE)
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
 #pragma unroll
@@ -1235,7 +1091,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_max_add;
         }
 
-#if defined(TURING_MMA_AVAILABLE)
         if constexpr (cols_per_warp == 8) {
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
 #pragma unroll
@@ -1258,26 +1113,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-        const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[0]);
-#pragma unroll
-        for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
-#pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
-            }
-        }
-#else // Volta
-        const int col = (threadIdx.x / 2) % 2;
-        const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[col], KQ_max_scale[col]);
-#pragma unroll
-        for (int i = 0; i < (DV/2)/T_C_VKQ::J; ++i) {
-#pragma unroll
-            for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                VKQ_C[i].x[l] *= KQ_max_scale_h2;
-            }
-        }
-#endif // defined(TURING_MMA_AVAILABLE)
     }
 
     // Combine VKQ accumulator values if np > 1.
@@ -1314,19 +1149,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // jc_cwm = jc combine write meta
         // KQ_cmr = KQ combine max rowsum
         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
-#if defined(TURING_MMA_AVAILABLE)
         const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
         const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
         const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
-#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(0);
-        const float2 KQ_cmr = make_float2(KQ_max[0], KQ_rowsum[0]);
-        const bool thread_should_write = threadIdx.x / 16 < cols_per_thread;
-#else // Volta
-        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_KQ::get_i(threadIdx.x & 2);
-        const float2 KQ_cmr = make_float2(KQ_max[(threadIdx.x & 2) / 2], KQ_rowsum[(threadIdx.x & 2) / 2]);
-        const bool thread_should_write = T_C_KQ::J == 8 || T_C_KQ::get_j(threadIdx.x & 2) < 8;
-#endif // defined(TURING_MMA_AVAILABLE)
 
         if (((!needs_fixup && !is_fixup) || np > 1) && thread_should_write) {
             ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
@@ -1516,13 +1341,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             __syncthreads();
         }
     }
-#else
-    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
-        scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
-        stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
-        jt, kb0_start, kb0_stop);
-    NO_DEVICE_CODE;
-#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)) || defined(AMD_MFMA_AVAILABLE)
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view>
@@ -1570,19 +1388,7 @@ static __global__ void flash_attn_ext_f16(
     }
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
-#if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 > 32 || ncols1*ncols2 < 16 || DKQ > 128 || ncols2 == 1) {
-        NO_DEVICE_CODE;
-        return;
-    }
-#endif // defined(AMD_WMMA_AVAILABLE)
 
-#if defined(AMD_MFMA_AVAILABLE)
-    if (DKQ != 64 && DKQ != 80 && DKQ != 96 && DKQ != 112 && DKQ != 128) {
-        NO_DEVICE_CODE;
-        return;
-    }
-#endif // defined(AMD_MFMA_AVAILABLE)
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int ncols     = ncols1 * ncols2;
@@ -1741,11 +1547,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-#if defined(GGML_USE_HIP)
-    using fattn_kernel_ptr_t = const void*;
-#else
     using fattn_kernel_ptr_t = fattn_kernel_t;
-#endif // defined(GGML_USE_HIP)
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;

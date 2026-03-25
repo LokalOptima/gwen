@@ -7,16 +7,11 @@
 #include <cstdint>
 #include <memory>
 
-#if defined(GGML_USE_HIP)
-#define GGML_COMMON_DECL_HIP
-#define GGML_COMMON_IMPL_HIP
-#else
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #if defined(GGML_USE_MUSA)
 #define GGML_COMMON_DECL_MUSA
 #define GGML_COMMON_IMPL_MUSA
-#endif
 #endif
 #include "ggml-common.h"
 
@@ -29,9 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(GGML_USE_HIP)
-#include "vendors/hip.h"
-#elif defined(GGML_USE_MUSA)
+#if   defined(GGML_USE_MUSA)
 #include "vendors/musa.h"
 #else
 #include "vendors/cuda.h"
@@ -230,13 +223,7 @@ static const char * cu_get_error_str(CUresult err) {
 #define FAST_FP16_AVAILABLE
 #endif // defined(FP16_AVAILABLE) && __CUDA_ARCH__ != 610
 
-#if defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)
-#define AMD_MFMA_AVAILABLE
-#endif // defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)
 
-#if defined(GGML_USE_HIP) && (defined(RDNA4) || defined(RDNA3))
-#define AMD_WMMA_AVAILABLE
-#endif // defined(GGML_USE_HIP) && defined(RDNA4)
 
 // The Volta instructions are in principle available on Turing or newer but they are effectively unusable:
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
@@ -263,9 +250,7 @@ static const char * cu_get_error_str(CUresult err) {
 #define FLASH_ATTN_AVAILABLE
 #endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 
-#if defined(TURING_MMA_AVAILABLE)
 #define LDMATRIX_TRANS_AVAILABLE
-#endif // defined(TURING_MMA_AVAILABLE)
 
 static bool fp16_available(const int cc) {
     return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL ||
@@ -335,24 +320,16 @@ static bool blackwell_mma_available(const int cc) {
 }
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
-#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
-    return 64;
-#else
     return 32;
-#endif // defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
 }
 
 // Maximum number of bytes that can be copied in a single instruction.
 static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
-#ifdef GGML_USE_HIP
-    return 16;
-#else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return 16;
 #else
     return 8;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-#endif // GGML_USE_HIP
 }
 
 
@@ -360,14 +337,8 @@ static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
 static __device__ void no_device_code(
     const char * file_name, const int line, const char * function_name, const int arch, const char * arch_list) {
 
-#if defined(GGML_USE_HIP)
-    printf("%s:%d: ERROR: HIP kernel %s has no device code compatible with HIP arch %d.\n",
-           file_name, line, function_name, arch);
-    GGML_UNUSED(arch_list);
-#else
     printf("%s:%d: ERROR: CUDA kernel %s has no device code compatible with CUDA arch %d. ggml-cuda.cu was compiled for: %s\n",
            file_name, line, function_name, arch, arch_list);
-#endif // defined(GGML_USE_HIP)
     __trap();
 
     GGML_UNUSED(no_device_code); // suppress unused function warning
@@ -628,9 +599,7 @@ static __device__ __forceinline__ half ggml_cuda_hmax(const half a, const half b
 }
 
 static __device__ __forceinline__ half2 ggml_cuda_hmax2(const half2 a, const half2 b) {
-#if defined(GGML_USE_HIP)
-    return half2(__hmax(a.x, b.x), __hmax(a.y, b.y));
-#elif CUDART_VERSION >= CUDART_HMAX
+#if   CUDART_VERSION >= CUDART_HMAX
     return __hmax2(a, b);
 #else
     half2 ret;
@@ -664,33 +633,6 @@ static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half
 #endif // (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
 
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
-#if defined(GGML_USE_HIP)
-#if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
-    c = __builtin_amdgcn_sdot4(a, b, c, false);
-#elif defined(RDNA3) || defined(RDNA4)
-    c = __builtin_amdgcn_sudot4( true, a, true, b, c, false);
-#elif defined(RDNA1) || defined(__gfx900__)
-    int tmp1;
-    int tmp2;
-    asm("\n \
-        v_mul_i32_i24 %1, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0 src1_sel:BYTE_0 \n \
-        v_mul_i32_i24 %2, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1 src1_sel:BYTE_1 \n \
-        v_add3_u32 %0, %1, %2, %0 \n \
-        v_mul_i32_i24 %1, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2 src1_sel:BYTE_2 \n \
-        v_mul_i32_i24 %2, sext(%3), sext(%4) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3 src1_sel:BYTE_3 \n \
-        v_add3_u32 %0, %1, %2, %0 \n \
-        "
-        : "+v"(c), "=&v"(tmp1), "=&v"(tmp2)
-        : "v"(a), "v"(b)
-    );
-#else
-    const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
-    const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
-    c += va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
-#endif
-    return c;
-
-#else // defined(GGML_USE_HIP)
 
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
@@ -700,7 +642,6 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
     return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
 
-#endif // defined(GGML_USE_HIP)
 }
 
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
@@ -712,9 +653,6 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float2 v
     acc += v.y*u.y;
 }
 
-#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4) || defined(__gfx906__) || defined(CDNA))
-#define V_DOT2_F32_F16_AVAILABLE
-#endif // defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4) || defined(__gfx906__) || defined(CDNA))
 
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v, const half2 u) {
 #ifdef V_DOT2_F32_F16_AVAILABLE
