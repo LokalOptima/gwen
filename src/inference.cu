@@ -4525,6 +4525,49 @@ kernel_swiglu_batch_f32(const float* __restrict__ gate, const float* __restrict_
     y[idx] = g * sig * u;
 }
 
+// ============================================================
+// IQ4_XS → FP16 dequantization kernel (for prefill GEMM)
+// ============================================================
+// One block per row, 256 threads. Each row = n_blocks × 256 elements.
+// Dequant: value = d * (sub_scale - 32) * kvalues_iq4nl[nibble]
+static __device__ const int8_t kvalues_iq4nl_prefill[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+__global__ void __launch_bounds__(256)
+kernel_dequant_iq4xs_to_f16(const void* __restrict__ src,
+                             half* __restrict__ dst,
+                             int n_rows, int n_cols) {
+    int row = blockIdx.x;
+    if (row >= n_rows) return;
+
+    int n_blocks = n_cols / 256;  // QK_K = 256 elements per block
+    const block_iq4_xs* src_row = static_cast<const block_iq4_xs*>(src) + row * n_blocks;
+    half* dst_row = dst + row * n_cols;
+
+    for (int blk = 0; blk < n_blocks; blk++) {
+        const block_iq4_xs& b = src_row[blk];
+        float d = __half2float(b.d);
+        int base = blk * 256;
+
+        // 8 sub-blocks of 32 elements each
+        for (int sb = threadIdx.x / 32; sb < 8; sb += 8) {
+            int lane = threadIdx.x % 32;
+            // Extract 6-bit sub-block scale
+            int ls = ((b.scales_l[sb / 2] >> ((sb % 2) * 4)) & 0xF) |
+                     (((b.scales_h >> (sb * 2)) & 3) << 4);
+            float scale = d * (ls - 32);
+
+            int elem = base + sb * 32 + lane;
+            // Each element is a 4-bit nibble
+            int byte_idx = sb * 16 + lane / 2;
+            int nibble = (b.qs[byte_idx] >> ((lane % 2) * 4)) & 0xF;
+            float val = scale * kvalues_iq4nl_prefill[nibble];
+            dst_row[elem] = __float2half(val);
+        }
+    }
+}
+
 int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens) {
     const auto& cfg = model.config;
     const float q_scale = 1.0f / sqrtf((float)cfg.ssm_state_size);
@@ -4546,15 +4589,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
         int M = (int)w.shape[0];
         int K = (int)w.shape[1];
         if (use_mmq_prefill) {
-            if (w.type == GGMLType::IQ4_XS) {
-                // IQ4_XS has no MMQ kernel — fall back to sequential dp4a GEMV
-                for (int tok = 0; tok < N; tok++) {
-                    const half* x_tok = X + tok * K;
-                    half* y_tok = Y + tok * M;
-                    gwen_quantize_q8_1(x_tok, x_q8_a, K, s);
-                    gwen_gemv_dp4a(w.device_data, x_q8_a, y_tok, M, K, w.type, s);
-                }
-            } else if (is_kquant_type(w.type)) {
+            if (is_kquant_type(w.type)) {
                 gwen_gemm_mmq(w.device_data, w.type, X, Y, mmq_scratch, M, K, N, s);
             } else if (w.type == GGMLType::F16) {
                 // cuBLAS FP16 GEMM for IQ4_XS→F16 converted weights

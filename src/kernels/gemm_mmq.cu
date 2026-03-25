@@ -525,7 +525,8 @@ void gwen_gemm_mmq(
         case GGMLType::Q4_K: launch_mmq<GGML_TYPE_Q4_K>(W, X, Y, scratch, M, K, N, stream); break;
         case GGMLType::Q5_K: launch_mmq<GGML_TYPE_Q5_K>(W, X, Y, scratch, M, K, N, stream); break;
         case GGMLType::Q6_K: launch_mmq<GGML_TYPE_Q6_K>(W, X, Y, scratch, M, K, N, stream); break;
-        case GGMLType::Q8_0: launch_mmq<GGML_TYPE_Q8_0>(W, X, Y, scratch, M, K, N, stream); break;
+        case GGMLType::Q8_0:  launch_mmq<GGML_TYPE_Q8_0>(W, X, Y, scratch, M, K, N, stream); break;
+        case GGMLType::IQ4_XS: launch_mmq<GGML_TYPE_IQ4_XS>(W, X, Y, scratch, M, K, N, stream); break;
         default:
             GWEN_CHECK(false, "Unsupported type for mmq GEMM");
     }

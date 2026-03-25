@@ -20,7 +20,7 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).parent.parent
 MODEL_PATH = Path.home() / "models" / "Qwen3.5-9B-UD-Q4_K_XL.gguf"
-LLAMACPP_BIN = PROJECT_ROOT / "third_party" / "llama.cpp" / "build" / "bin"
+LLAMACPP_BIN = Path.home() / "git" / "llama.cpp" / "build" / "bin"
 GWEN_BIN = PROJECT_ROOT / "build" / "gwen"
 REFERENCE_DIR = PROJECT_ROOT / "tests" / "golden"
 
@@ -78,9 +78,10 @@ def run_gwen(prompt: str, n_predict: int = N_PREDICT) -> dict:
     cmd = [
         str(GWEN_BIN),
         "--model", str(MODEL_PATH),
-        "--prompt", prompt,
-        "--n-predict", str(n_predict),
+        "--no-mtp",
         "--greedy",
+        "--max-predict", str(n_predict),
+        prompt,
     ]
 
     result = subprocess.run(cmd, capture_output=True, timeout=120)
