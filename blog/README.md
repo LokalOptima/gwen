@@ -1,6 +1,6 @@
 # GWEN Blog — Building a GPU-native Qwen3.5 Inference Engine
 
-A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inference in pure CUDA/CUTLASS, hyper-optimized for the RTX 5070 Ti.
+A technical blog documenting the journey of reimplementing Qwen3.5 inference in pure CUDA/CUTLASS, hyper-optimized for the RTX 5070 Ti.
 
 ## Posts
 
@@ -38,3 +38,4 @@ A technical blog documenting the journey of reimplementing Qwen3.5-0.8B inferenc
 31. [FP8 — The Right Format for SM_120](31-fp8-the-right-format.md) — Abandoning Q4_K GGML for FP8 E4M3 native tensor core format. Complete GWFP8 pipeline: quantizer, loader, GEMV kernels, F32 residual decode path. CUTLASS block scaling analysis for prefill GEMM.
 32. [Porting GWEN to 4B with NVFP4](32-nvfp4-4b-port.md) — Scaling to Qwen3.5-4B with FP4 E2M1 quantization: V/K head asymmetry, GWFP4 format, FP4 GEMV kernels, and debugging the `(1+weight)` RMSNorm convention bug via 3-way comparison.
 33. [FP4 GEMV: From 12 to 139 tok/s](33-fp4-gemv-optimization.md) — Constant memory serialization was the bottleneck: shared memory LUT gave 3.1×, CUDA graph 3.3×, thread utilization fix 6%. 12.4 → 139.1 tok/s, 75.6% of llama.cpp.
+34. [Scaling to 9B: GGUF K-Quant Decode](34-9b-gguf-kquant-port.md) — Porting GWEN from 0.8B to Qwen3.5-9B with Unsloth UD-Q4_K_XL. GGML shape convention trap, IQ4_XS CPU conversion, separate lm_head, K-quant GEMV dispatch. 0.8B exact match; 9B DeltaNet K≠V correctness bug in progress.
