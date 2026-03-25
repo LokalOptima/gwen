@@ -40,9 +40,10 @@ set(GWEN_SOURCES
 )
 
 if(GWEN_SOURCES)
+    find_package(CUDAToolkit REQUIRED)
     add_library(gwen_core STATIC ${GWEN_SOURCES})
     target_include_directories(gwen_core PUBLIC include)
-    target_link_libraries(gwen_core)
+    target_link_libraries(gwen_core CUDA::cublas)
     set_target_properties(gwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
@@ -58,6 +59,20 @@ if(EXISTS ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda/common.cuh)
     set_target_properties(gwen_fattn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     target_link_libraries(gwen_core gwen_fattn)
     message(STATUS "llama.cpp found — MMA flash attention enabled")
+
+    # --- MMQ fused K-quant GEMM (compiled against llama.cpp headers) ---
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/kernels/gemm_mmq.cu)
+        add_library(gwen_mmq STATIC src/kernels/gemm_mmq.cu)
+        target_include_directories(gwen_mmq PRIVATE
+            include
+            ${LLAMA_CPP_PATH}/ggml/include
+            ${LLAMA_CPP_PATH}/ggml/src
+            ${LLAMA_CPP_PATH}/ggml/src/ggml-cuda
+        )
+        set_target_properties(gwen_mmq PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        target_link_libraries(gwen_core gwen_mmq)
+        message(STATUS "MMQ fused K-quant GEMM enabled")
+    endif()
 
     # --- FP8 GEMM (CUTLASS 3.x SM120 blockwise scaling) ---
     # Requires 120a for block-scaled MMA instructions (SM120 "all features")

@@ -143,6 +143,11 @@ struct InferenceState {
     float* sfb_act_buf = nullptr;         // [ceil(max_prefill/128) * ceil(max_K/128)] scale factors
     void* gemm_fp8_workspace = nullptr;   // CUTLASS workspace
     size_t gemm_fp8_ws_size = 0;
+    // MMQ (K-quant) GEMM prefill scratch
+    void* mmq_scratch = nullptr;          // Q8_1 activations + stream-K fixup
+    size_t mmq_scratch_size = 0;
+    bool use_mmq_prefill = false;         // true for GGUF K-quant models
+    void* cublas_handle = nullptr;        // cuBLAS handle for F16 GEMM (IQ4_XS→F16 weights)
     half* prefill_ffn_gate = nullptr; // [max_prefill, n_ff]
     half* prefill_ffn_up = nullptr;   // [max_prefill, n_ff]
     half* prefill_ffn_out = nullptr;  // [max_prefill, n_ff]
@@ -153,7 +158,8 @@ struct InferenceState {
     int* d_prefill_tokens = nullptr;  // [max_prefill] pre-allocated device token IDs
     int max_prefill = 0;
 
-    void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens, bool f32_path = true);
+    void allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc, int max_tokens,
+                          bool f32_path = true, bool gguf_mode = false);
 
     // --- Batch prefill state (for extract_hidden_batch) ---
     // B independent DeltaNet states and conv states, contiguous for batch kernels

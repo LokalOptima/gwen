@@ -380,9 +380,8 @@ int main(int argc, char** argv) {
     bool is_gguf = ends_with(model_path, ".gguf");
     InferenceState state;
     state.allocate(model->config, allocator);
-    if (!is_fp4 && !is_gguf) {
-        // FP8 prefill path — not yet supported for FP4 or GGUF K-quant models
-        state.allocate_prefill(model->config, allocator, 4096);
+    if (!is_fp4) {
+        state.allocate_prefill(model->config, allocator, 4096, /*f32_path=*/!is_gguf, /*gguf_mode=*/is_gguf);
     }
     if (model->has_mtp) {
         state.allocate_mtp(model->config, allocator, 4096);

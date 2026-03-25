@@ -531,4 +531,17 @@ void gwen_gemm_mmq(
     }
 }
 
+size_t gwen_gemm_mmq_scratch_size(int max_K, int max_N) {
+    // Q8_1_mmq quantized activations: ceil(K_padded/128) * N * sizeof(block_q8_1_mmq)
+    int K_padded = (max_K + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING * MATRIX_ROW_PADDING;
+    int n_q8_blocks_per_col = K_padded / 128;
+    size_t q8_size = (size_t)n_q8_blocks_per_col * max_N * sizeof(block_q8_1_mmq);
+
+    // Stream-K fixup buffer: NSM * MMQ_X * mmq_y * sizeof(float)
+    const int mmq_y = get_mmq_y_host(GWEN_CC);
+    size_t fixup_size = (size_t)GWEN_NSM * MMQ_X * mmq_y * sizeof(float);
+
+    return q8_size + fixup_size;
+}
+
 } // namespace gwen

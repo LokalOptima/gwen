@@ -3,6 +3,7 @@
 #include "gwen/ggml_quants.h"
 
 #include <cuda_fp8.h>
+#include <cublas_v2.h>
 #include <cfloat>
 #include <cstdio>
 #include <algorithm>
@@ -153,6 +154,32 @@ kernel_alpha_beta_to_decay(
     float sp = (biased > 20.0f) ? biased : logf(1.0f + expf(biased));
     decay_out[h] = expf(ssm_a[h] * sp);
     beta_out[h] = 1.0f / (1.0f + expf(-beta_val));
+}
+
+// Batch version: converts [N, n_heads] FP16 alpha/beta projections to gate/beta
+// Gate is stored as ssm_a * softplus(alpha + dt_bias) — NOT exp'd yet.
+// The DeltaNet prefill kernel applies exp() internally.
+// Grid: (ceil(n_heads/32), N), Block: 32
+__global__ void __launch_bounds__(32)
+kernel_batch_alpha_beta_to_gate(
+    const half* __restrict__ alpha_proj,  // [N, n_heads] FP16
+    const half* __restrict__ beta_proj,   // [N, n_heads] FP16
+    const float* __restrict__ ssm_a,      // [n_heads]
+    const float* __restrict__ dt_bias,    // [n_heads]
+    float* __restrict__ gate_out,         // [N, n_heads] — ssm_a * softplus(alpha + bias)
+    float* __restrict__ beta_out,         // [N, n_heads] — sigmoid(beta)
+    int N, int n_heads)
+{
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (h >= n_heads || t >= N) return;
+    int idx = t * n_heads + h;
+    float alpha_val = __half2float(alpha_proj[idx]);
+    float beta_val = __half2float(beta_proj[idx]);
+    float biased = alpha_val + dt_bias[h];
+    float sp = (biased > 20.0f) ? biased : logf(1.0f + expf(biased));
+    gate_out[idx] = ssm_a[h] * sp;  // NOT exp'd — DeltaNet kernel applies exp()
+    beta_out[idx] = 1.0f / (1.0f + expf(-beta_val));
 }
 
 // ============================================================
@@ -1255,15 +1282,15 @@ kernel_l2_normalize_qkv_batch(
 template <int DK = 128>
 __global__ void __launch_bounds__(128, 2)
 kernel_deltanet_prefill_fast(
-    float* __restrict__ S,              // [n_heads, dk, dv] recurrent state (row-major)
-    const half* __restrict__ qkv_batch, // [N, 3*ssm_inner] after conv1d+silu
-    const float* __restrict__ gate_batch, // [N, n_heads]
-    const float* __restrict__ beta_batch, // [N, n_heads]
+    float* __restrict__ S,              // [n_v_heads, dk, dv] recurrent state (row-major)
+    const half* __restrict__ qkv_batch, // [N, qkv_dim] after conv1d+silu
+    const float* __restrict__ gate_batch, // [N, n_v_heads]
+    const float* __restrict__ beta_batch, // [N, n_v_heads]
     half* __restrict__ output_batch,    // [N, ssm_inner]
-    int N, int n_heads, int dk, int dv, int ssm_inner,
+    int N, int n_v_heads, int n_k_heads, int dk, int dv, int qkv_dim, int ssm_inner,
     float q_scale)
 {
-    const int head = blockIdx.x;
+    const int head = blockIdx.x;  // V-head index
     const int col  = blockIdx.z * blockDim.y + threadIdx.y;
     const int lane = threadIdx.x;
 
@@ -1280,14 +1307,16 @@ kernel_deltanet_prefill_fast(
         s_reg[r] = S_col[(r * WARP_SIZE + lane) * dv];
     }
 
-    // Set up pointers for Q, K, V sections + gate/beta — advance by stride each token
-    const int qkv_stride = ssm_inner * 3;          // stride between tokens in QKV tensor
-    const half* q_ptr = qkv_batch + head * dk;      // Q for head, token 0
-    const half* k_ptr = q_ptr + ssm_inner;           // K for head, token 0
-    const half* v_ptr = k_ptr + ssm_inner;           // V for head, token 0
-    const float* g_ptr = gate_batch + head;           // gate for head, token 0
-    const float* b_ptr = beta_batch + head;           // beta for head, token 0
-    half* o_ptr = output_batch + head * dv;           // output for head, token 0
+    // QKV layout: [Q(n_k_heads*dk), K(n_k_heads*dk), V(n_v_heads*dv)]
+    // GGUF tiled order: k_head = head % n_k_heads
+    const int k_head = (n_k_heads == n_v_heads) ? head : head % n_k_heads;
+    const int q_width = n_k_heads * dk;
+    const half* q_ptr = qkv_batch + k_head * dk;      // Q for K-head, token 0
+    const half* k_ptr = qkv_batch + q_width + k_head * dk; // K for K-head, token 0
+    const half* v_ptr = qkv_batch + 2 * q_width + head * dv; // V for V-head, token 0
+    const float* g_ptr = gate_batch + head;
+    const float* b_ptr = beta_batch + head;
+    half* o_ptr = output_batch + head * dv;
 
     for (int t = 0; t < N; t++) {
         // Load Q and K from FP16 (pre-normalized)
@@ -1332,11 +1361,11 @@ kernel_deltanet_prefill_fast(
         }
 
         // Advance pointers (simple adds, no multiplications)
-        q_ptr += qkv_stride;
-        k_ptr += qkv_stride;
-        v_ptr += qkv_stride;
-        g_ptr += n_heads;
-        b_ptr += n_heads;
+        q_ptr += qkv_dim;
+        k_ptr += qkv_dim;
+        v_ptr += qkv_dim;
+        g_ptr += n_v_heads;
+        b_ptr += n_v_heads;
         o_ptr += ssm_inner;
     }
 
@@ -2787,7 +2816,7 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
 }
 
 void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& alloc,
-                                      int max_tokens, bool f32_path) {
+                                      int max_tokens, bool f32_path, bool gguf_mode) {
     auto a = [&](size_t bytes) -> void* { return alloc.alloc(bytes); };
     max_prefill = max_tokens;
 
@@ -2828,21 +2857,30 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
     prefill_dn_beta = static_cast<float*>(a(max_tokens * cfg.ssm_n_v_heads * sizeof(float)));
     d_prefill_tokens = static_cast<int*>(a(max_tokens * sizeof(int)));
 
-    // FP8 GEMM prefill scratch
-    {
+    if (gguf_mode) {
+        // MMQ (K-quant) GEMM prefill scratch
+        use_mmq_prefill = true;
+        int max_K = (int)std::max({cfg.n_embed, cfg.n_ff, (uint32_t)cfg.ssm_inner_size,
+                                    cfg.ssm_qkv_dim()});
+        mmq_scratch_size = gwen_gemm_mmq_scratch_size(max_K, max_tokens);
+        mmq_scratch = a(mmq_scratch_size);
+        // cuBLAS handle for F16 GEMM (IQ4_XS→F16 converted weights)
+        cublasCreate(reinterpret_cast<cublasHandle_t*>(&cublas_handle));
+        // Flash attention needs an F32 scratch buffer (reuse prefill_proj_qkv_f32 name)
+        size_t fa_scratch = (size_t)max_tokens * cfg.n_head * cfg.head_dim * sizeof(float);
+        prefill_proj_qkv_f32 = static_cast<float*>(a(fa_scratch));
+    } else {
+        // FP8 GEMM prefill scratch
         int max_K = (int)std::max({cfg.n_embed, cfg.n_ff, (uint32_t)cfg.ssm_inner_size});
         int max_M = (int)std::max({
             cfg.ssm_qkv_dim(),
             (uint32_t)(cfg.n_head * cfg.head_dim * 2),
             cfg.n_ff
         });
-        // FP8 activation buffer: [max_tokens * max_K] bytes
         fp8_act_buf = static_cast<uint8_t*>(a((size_t)max_tokens * max_K));
-        // Scale factors: [ceil(max_tokens/128) * ceil(max_K/128)] floats
         int n_n_blocks = (max_tokens + 127) / 128;
         int n_k_blocks = (max_K + 127) / 128;
         sfb_act_buf = static_cast<float*>(a((size_t)n_n_blocks * n_k_blocks * sizeof(float)));
-        // CUTLASS workspace
         gemm_fp8_ws_size = gwen_gemm_fp8_workspace_size(max_M, max_K, max_tokens);
         if (gemm_fp8_ws_size > 0) {
             gemm_fp8_workspace = a(gemm_fp8_ws_size);
@@ -3917,6 +3955,55 @@ void gwen_dequant_rows_q6k(const void* table, const int* row_ids, half* dst,
 // Strategy: batch GEMMs for linear projections, sequential for state-dependent ops.
 // Layout: prefill_x[t, dim] = hidden state of token t
 
+// Batched Q4_K embedding lookup
+__global__ void __launch_bounds__(256)
+kernel_embed_lookup_batch_q4k(const void* __restrict__ table,
+                               const int* __restrict__ token_ids,
+                               half* __restrict__ y,
+                               int dim, int n_tokens) {
+    int token_idx = blockIdx.y;
+    if (token_idx >= n_tokens) return;
+
+    int token_id = token_ids[token_idx];
+    int blocks_per_row = dim / 256;
+    int tid = threadIdx.x;
+
+    for (int blk_local = 0; blk_local < blocks_per_row; blk_local++) {
+        int blk_idx = token_id * blocks_per_row + blk_local;
+        const uint8_t* base = static_cast<const uint8_t*>(table) + (size_t)blk_idx * 144;
+
+        half d_half, dmin_half;
+        memcpy(&d_half, base, sizeof(half));
+        memcpy(&dmin_half, base + 2, sizeof(half));
+        float d = __half2float(d_half);
+        float dmin = __half2float(dmin_half);
+        const uint8_t* scales_p = base + 4;
+        const uint8_t* qs = base + 16;
+
+        int sub_block = tid / 32;
+        uint8_t sc_lo, m_lo;
+        if (sub_block < 4) {
+            sc_lo = scales_p[sub_block] & 0x3F;
+            m_lo  = scales_p[sub_block + 4] & 0x3F;
+        } else {
+            sc_lo = (scales_p[sub_block + 4] & 0xF) | ((scales_p[sub_block - 4] >> 6) << 4);
+            m_lo  = (scales_p[sub_block + 4] >> 4) | ((scales_p[sub_block] >> 6) << 4);
+        }
+
+        float scale = d * sc_lo;
+        float min_val = dmin * m_lo;
+
+        int group = tid / 64;
+        int within = tid % 64;
+        int is_high = within / 32;
+        int pos = within % 32;
+        int qs_byte_idx = group * 32 + pos;
+        int q_val = is_high ? (qs[qs_byte_idx] >> 4) : (qs[qs_byte_idx] & 0xF);
+
+        y[(size_t)token_idx * dim + blk_local * 256 + tid] = __float2half(scale * q_val - min_val);
+    }
+}
+
 // Batched embedding lookup
 __global__ void __launch_bounds__(256)
 kernel_embed_lookup_batch_q6k(const void* __restrict__ table,
@@ -4351,31 +4438,61 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     int* d_token_ids = d_prefill_tokens;
     GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
-    // FP8 GEMM helper: quantize FP16 input to FP8, run CUTLASS FP8×FP8 GEMM
-    // Tracks last quantized input to avoid redundant re-quantization
+    // GEMM helper: routes to MMQ (K-quant), cuBLAS (F16), or CUTLASS (FP8)
     const half* last_quant_ptr = nullptr;
     int last_quant_K = 0;
 
-    // GWFP8 shape convention: shape[0]=out_features, shape[1]=in_features
     auto do_gemm = [&](const WeightRef& w, const half* X, half* Y) {
         int M = (int)w.shape[0];
         int K = (int)w.shape[1];
-        if (X != last_quant_ptr || K != last_quant_K) {
-            gwen_quantize_fp16_to_fp8(X, fp8_act_buf, sfb_act_buf, K, N, s);
-            last_quant_ptr = X;
-            last_quant_K = K;
+        if (use_mmq_prefill) {
+            if (is_kquant_type(w.type)) {
+                gwen_gemm_mmq(w.device_data, w.type, X, Y, mmq_scratch, M, K, N, s);
+            } else if (w.type == GGMLType::F16) {
+                // cuBLAS FP16 GEMM for IQ4_XS→F16 converted weights
+                // Y[M,N] = W[M,K] @ X[K,N] where X is [N,K] row-major (= [K,N] col-major)
+                cublasHandle_t handle = reinterpret_cast<cublasHandle_t>(cublas_handle);
+                cublasSetStream(handle, s);
+                __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
+                cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                            M, N, K,
+                            &alpha_h,
+                            static_cast<const __half*>(w.device_data), K,  // W^T: [K,M] → [M,K] after transpose
+                            X, K,                                           // X: [K,N] col-major
+                            &beta_h,
+                            Y, M);                                          // Y: [M,N] col-major
+            } else {
+                GWEN_CHECK(false, "Unsupported weight type for prefill GEMM");
+            }
+        } else {
+            // FP8 path
+            if (X != last_quant_ptr || K != last_quant_K) {
+                gwen_quantize_fp16_to_fp8(X, fp8_act_buf, sfb_act_buf, K, N, s);
+                last_quant_ptr = X;
+                last_quant_K = K;
+            }
+            gwen_gemm_fp8(w.device_data, w.device_sfa, fp8_act_buf, sfb_act_buf,
+                           Y, M, K, N, gemm_fp8_workspace, gemm_fp8_ws_size, s);
         }
-        gwen_gemm_fp8(w.device_data, w.device_sfa, fp8_act_buf, sfb_act_buf,
-                       Y, M, K, N, gemm_fp8_workspace, gemm_fp8_ws_size, s);
     };
 
-    // 1. Batch embedding lookup → FP16 residual [N, 1024]
+    // 1. Batch embedding lookup → FP16 residual [N, n_embed]
     {
         dim3 grid(1, N);
-        kernel_embed_lookup_batch_fp8<<<grid, 256, 0, s>>>(
-            static_cast<const uint8_t*>(model.token_embd.device_data),
-            model.token_embd.device_scales,
-            d_token_ids, prefill_x, cfg.n_embed, N);
+        if (model.token_embd.type == GGMLType::FP8_E4M3) {
+            kernel_embed_lookup_batch_fp8<<<grid, 256, 0, s>>>(
+                static_cast<const uint8_t*>(model.token_embd.device_data),
+                model.token_embd.device_scales,
+                d_token_ids, prefill_x, cfg.n_embed, N);
+        } else if (model.token_embd.type == GGMLType::Q4_K) {
+            kernel_embed_lookup_batch_q4k<<<grid, 256, 0, s>>>(
+                model.token_embd.device_data,
+                d_token_ids, prefill_x, cfg.n_embed, N);
+        } else {
+            kernel_embed_lookup_batch_q6k<<<grid, 256, 0, s>>>(
+                model.token_embd.device_data,
+                d_token_ids, prefill_x, cfg.n_embed, N);
+        }
     }
 
     // FP16 residual accumulators (matching extract_hidden_batch pipeline)
@@ -4416,14 +4533,29 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
             }
 
             // Gate/beta computation
-            kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_v_heads, N), 32, 0, s>>>(
-                pf_norm,
-                w.ssm_alpha.device_data, w.ssm_beta.device_data,
-                w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
-                static_cast<const float*>(w.ssm_a.device_data),
-                static_cast<const float*>(w.ssm_dt_bias.device_data),
-                prefill_dn_gate, prefill_dn_beta,
-                N, cfg.n_embed, cfg.ssm_n_v_heads);
+            if (w.ssm_alpha.type == GGMLType::FP8_E4M3) {
+                // FP8: inline dot product in batch kernel
+                kernel_batch_compute_gate_beta<<<dim3(cfg.ssm_n_v_heads, N), 32, 0, s>>>(
+                    pf_norm,
+                    w.ssm_alpha.device_data, w.ssm_beta.device_data,
+                    w.ssm_alpha.device_scales, w.ssm_beta.device_scales,
+                    static_cast<const float*>(w.ssm_a.device_data),
+                    static_cast<const float*>(w.ssm_dt_bias.device_data),
+                    prefill_dn_gate, prefill_dn_beta,
+                    N, cfg.n_embed, cfg.ssm_n_v_heads);
+            } else {
+                // K-quant/F16: batch GEMM for alpha/beta projections, then convert
+                int n_vh = cfg.ssm_n_v_heads;
+                half* alpha_batch = prefill_ffn_out;  // reuse as scratch (n_vh << n_ff)
+                half* beta_batch = alpha_batch + (size_t)N * n_vh;
+                do_gemm(w.ssm_alpha, pf_norm, alpha_batch);
+                do_gemm(w.ssm_beta, pf_norm, beta_batch);
+                kernel_batch_alpha_beta_to_gate<<<dim3((n_vh+31)/32, N), 32, 0, s>>>(
+                    alpha_batch, beta_batch,
+                    static_cast<const float*>(w.ssm_a.device_data),
+                    static_cast<const float*>(w.ssm_dt_bias.device_data),
+                    prefill_dn_gate, prefill_dn_beta, N, n_vh);
+            }
 
             // Pre-normalize Q and K (L2 norm) — avoids 10 warp reductions per token inside DeltaNet
             // QKV layout: [N, Q(k*dk) | K(k*dk) | V(v*dv)]
@@ -4445,8 +4577,9 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                     state.S, prefill_proj_qkv,
                     prefill_dn_gate, prefill_dn_beta,
                     prefill_ffn_gate,  // reuse as DeltaNet output
-                    N, cfg.ssm_n_v_heads, cfg.ssm_state_size, cfg.ssm_state_size,
-                    cfg.ssm_inner_size, q_scale);
+                    N, cfg.ssm_n_v_heads, cfg.ssm_n_k_heads,
+                    cfg.ssm_state_size, cfg.ssm_state_size,
+                    cfg.ssm_qkv_dim(), cfg.ssm_inner_size, q_scale);
             }
 
             // Gated RMSNorm (FP16)

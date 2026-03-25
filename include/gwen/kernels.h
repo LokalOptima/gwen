@@ -336,6 +336,18 @@ size_t gwen_gemm_fp8_workspace_size(int max_M, int max_K, int max_N);
 // GEMM (for prefill — batch of tokens)
 // ============================================================
 
+// Fused K-quant MMQ GEMM: quantized weights × FP16 activations → FP16 output.
+// Activations are quantized to Q8_1 on-the-fly inside the kernel.
+// W: [M, K] quantized (Q4_K/Q5_K/Q6_K/Q8_0), device pointer
+// X: [K, N] FP16 column-major (= [N, K] row-major activations transposed)
+// Y: [M, N] FP16 output
+// scratch: workspace for Q8_1 activations + stream-K fixup (see scratch_size fn)
+void gwen_gemm_mmq(const void* W, GGMLType type, const half* X, half* Y, void* scratch,
+                    int M, int K, int N, cudaStream_t stream = 0);
+
+// Required scratch size for gwen_gemm_mmq
+size_t gwen_gemm_mmq_scratch_size(int max_K, int max_N);
+
 // ============================================================
 // Row dequantization (selective rows from quantized matrix)
 // ============================================================
