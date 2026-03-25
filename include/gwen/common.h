@@ -52,6 +52,14 @@ enum class GGMLType : uint32_t {
     Q5_K   = 13,
     Q6_K   = 14,
     Q8_K   = 15,
+    IQ2_XXS = 16,
+    IQ2_XS  = 17,
+    IQ3_XXS = 18,
+    IQ1_S   = 19,
+    IQ4_NL  = 20,
+    IQ3_S   = 21,
+    IQ2_S   = 22,
+    IQ4_XS  = 23,
     I8     = 24,
     I16    = 25,
     I32    = 26,
@@ -96,6 +104,7 @@ struct ModelConfig {
     uint32_t eos_token_id    = 248046;
     uint32_t pad_token_id    = 248055;
     uint32_t context_length  = 262144;
+    bool     tie_word_embeddings = true;  // false for 9B+ (separate output.weight)
 
     bool is_full_attention_layer(int layer_idx) const {
         return (layer_idx + 1) % full_attn_interval == 0;

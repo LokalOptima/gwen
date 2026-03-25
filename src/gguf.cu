@@ -25,8 +25,10 @@ const char* ggml_type_name(GGMLType type) {
         case GGMLType::Q5_K: return "Q5_K";
         case GGMLType::Q6_K: return "Q6_K";
         case GGMLType::Q8_K: return "Q8_K";
+        case GGMLType::IQ4_XS: return "IQ4_XS";
         case GGMLType::BF16: return "BF16";
         case GGMLType::FP8_E4M3: return "FP8_E4M3";
+        case GGMLType::FP4_E2M1: return "FP4_E2M1";
         default: return "UNKNOWN";
     }
 }
@@ -50,6 +52,7 @@ uint32_t ggml_type_block_size(GGMLType type) {
         case GGMLType::Q5_K: return 256;
         case GGMLType::Q6_K: return 256;
         case GGMLType::Q8_K: return 256;
+        case GGMLType::IQ4_XS: return 256;
         default: return 0;
     }
 }
@@ -73,6 +76,7 @@ size_t ggml_type_block_bytes(GGMLType type) {
         case GGMLType::Q5_K: return 176;  // 2(d) + 2(dmin) + 12(scales) + 32(qh) + 128(qs)
         case GGMLType::Q6_K: return 210;  // 128(ql) + 64(qh) + 16(scales) + 2(d)
         case GGMLType::Q8_K: return 292;
+        case GGMLType::IQ4_XS: return 136;  // 2(d) + 2(scales_h) + 4(scales_l) + 128(qs)
         default: return 0;
     }
 }

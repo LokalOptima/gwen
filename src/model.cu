@@ -7,6 +7,9 @@ namespace gwen {
 
 
 // Helper: fill WeightRef from a GGUF tensor
+// GGML stores 2D shapes as [ne0=cols=in_features, ne1=rows=out_features]
+// GWEN convention: shape[0]=out_features, shape[1]=in_features
+// So we swap for 2D tensors at load time.
 static WeightRef weight_from_tensor(const GGUFTensor& t) {
     WeightRef w;
     w.host_data = t.data;
@@ -14,11 +17,123 @@ static WeightRef weight_from_tensor(const GGUFTensor& t) {
     w.n_elements = t.n_elements;
     w.size_bytes = t.size_bytes;
     w.shape = t.shape;
+    // Swap GGML [cols, rows] → GWEN [rows, cols] for 2D weight matrices
+    if (w.shape.size() == 2) {
+        std::swap(w.shape[0], w.shape[1]);
+    }
     return w;
 }
 
 static WeightRef weight_from_tensor(const GGUFFile& gguf, const std::string& name) {
     return weight_from_tensor(gguf.get_tensor(name));
+}
+
+// IQ4_XS lookup table (non-linear 4-bit quantization)
+static const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+// Dequantize IQ4_XS block data to FP16 (CPU-side, at model load time)
+// block_iq4_xs: {half d, uint16_t scales_h, uint8_t scales_l[4], uint8_t qs[128]} = 136 bytes per 256 elements
+static void dequant_iq4xs_to_fp16(const void* src, uint16_t* dst_fp16, size_t n_elements) {
+    const uint8_t* data = static_cast<const uint8_t*>(src);
+    size_t n_blocks = n_elements / 256;
+
+    for (size_t i = 0; i < n_blocks; i++) {
+        const uint8_t* block = data + i * 136;
+
+        // Read d (FP16 stored as uint16_t)
+        uint16_t d_bits;
+        memcpy(&d_bits, block, 2);
+        // Convert FP16 bits to float
+        uint32_t sign = (d_bits >> 15) & 1;
+        uint32_t exp = (d_bits >> 10) & 0x1F;
+        uint32_t mant = d_bits & 0x3FF;
+        float d;
+        if (exp == 0) {
+            d = (sign ? -1.0f : 1.0f) * (mant / 1024.0f) * (1.0f / 16384.0f);  // subnormal
+        } else if (exp == 31) {
+            d = 0.0f;  // inf/nan, shouldn't happen for scales
+        } else {
+            uint32_t f32_bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+            memcpy(&d, &f32_bits, 4);
+        }
+
+        uint16_t scales_h;
+        memcpy(&scales_h, block + 2, 2);
+        const uint8_t* scales_l = block + 4;
+        const uint8_t* qs = block + 8;
+
+        for (int ib = 0; ib < 8; ib++) {
+            int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
+                     (((scales_h >> (2 * ib)) & 3) << 4);
+            float dl = d * (ls - 32);
+
+            for (int j = 0; j < 16; j++) {
+                float v0 = dl * kvalues_iq4nl[qs[j] & 0xF];
+                float v1 = dl * kvalues_iq4nl[qs[j] >> 4];
+
+                // Convert float to FP16 bits (simple conversion)
+                auto f32_to_fp16 = [](float val) -> uint16_t {
+                    uint32_t bits;
+                    memcpy(&bits, &val, 4);
+                    uint32_t s = (bits >> 16) & 0x8000;
+                    int32_t e = ((bits >> 23) & 0xFF) - 127 + 15;
+                    uint32_t m = bits & 0x7FFFFF;
+                    if (e <= 0) return s;  // underflow to zero
+                    if (e >= 31) return s | 0x7C00;  // overflow to inf
+                    return s | (e << 10) | (m >> 13);
+                };
+
+                dst_fp16[ib * 32 + j] = f32_to_fp16(v0);
+                dst_fp16[ib * 32 + j + 16] = f32_to_fp16(v1);
+            }
+            qs += 16;
+        }
+        dst_fp16 += 256;
+    }
+}
+
+// Convert an IQ4_XS tensor to FP16, storing result in a new host buffer
+// Returns the buffer; caller must keep it alive for the model's lifetime
+static std::vector<uint8_t> convert_iq4xs_to_fp16(const GGUFTensor& t) {
+    size_t fp16_bytes = t.n_elements * sizeof(uint16_t);
+    std::vector<uint8_t> buf(fp16_bytes);
+    dequant_iq4xs_to_fp16(t.data, reinterpret_cast<uint16_t*>(buf.data()), t.n_elements);
+    return buf;
+}
+
+// Load tensor, converting IQ4_XS to FP16 at load time
+static WeightRef weight_from_tensor_convert(const GGUFFile& gguf, const std::string& name,
+                                             std::vector<std::vector<uint8_t>>& converted_buffers) {
+    const auto& t = gguf.get_tensor(name);
+    if (t.type == GGMLType::IQ4_XS) {
+        converted_buffers.push_back(convert_iq4xs_to_fp16(t));
+        auto& buf = converted_buffers.back();
+        WeightRef w;
+        w.host_data = buf.data();
+        w.type = GGMLType::F16;
+        w.n_elements = t.n_elements;
+        w.size_bytes = buf.size();
+        w.shape = t.shape;
+        // Swap GGML [cols, rows] → GWEN [rows, cols] for 2D weight matrices
+        if (w.shape.size() == 2) {
+            std::swap(w.shape[0], w.shape[1]);
+        }
+        // Sanity check: verify first few converted values
+        const uint16_t* fp16_data = reinterpret_cast<const uint16_t*>(buf.data());
+        bool has_nan = false;
+        for (int i = 0; i < 8; i++) {
+            uint16_t h = fp16_data[i];
+            uint32_t exp = (h >> 10) & 0x1F;
+            if (exp == 31) has_nan = true;
+        }
+        fprintf(stderr, "  Converted %s: IQ4_XS → F16 (%.1f MB → %.1f MB)%s\n",
+                name.c_str(), t.size_bytes / 1024.0 / 1024.0, buf.size() / 1024.0 / 1024.0,
+                has_nan ? " WARNING: NaN in first 8 values!" : "");
+        return w;
+    }
+    return weight_from_tensor(t);
 }
 
 std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
@@ -34,6 +149,23 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     model->token_embd = weight_from_tensor(gguf, "token_embd.weight");
     model->output_norm = weight_from_tensor(gguf, "output_norm.weight");
 
+    // Separate output.weight (lm_head) for models with tie_word_embeddings=false
+    auto* output_tensor = gguf.find_tensor("output.weight");
+    if (output_tensor) {
+        model->output_weight = weight_from_tensor(*output_tensor);
+        model->config.tie_word_embeddings = false;
+        fprintf(stderr, "  output.weight: [%lu, %lu] %s (separate lm_head)\n",
+                output_tensor->shape[0], output_tensor->shape[1],
+                ggml_type_name(output_tensor->type));
+    } else {
+        model->config.tie_word_embeddings = true;
+    }
+
+    // Helper: load tensor with automatic IQ4_XS → FP16 conversion
+    auto load = [&](const std::string& name) -> WeightRef {
+        return weight_from_tensor_convert(gguf, name, model->converted_buffers_);
+    };
+
     // Per-layer weights
     model->layers.resize(cfg.n_layers);
     for (uint32_t i = 0; i < cfg.n_layers; i++) {
@@ -44,33 +176,33 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
 
         if (layer.is_full_attention) {
             auto& w = layer.full_attn;
-            w.attn_norm      = weight_from_tensor(gguf, prefix + "attn_norm.weight");
-            w.attn_q         = weight_from_tensor(gguf, prefix + "attn_q.weight");
-            w.attn_k         = weight_from_tensor(gguf, prefix + "attn_k.weight");
-            w.attn_v         = weight_from_tensor(gguf, prefix + "attn_v.weight");
-            w.attn_q_norm    = weight_from_tensor(gguf, prefix + "attn_q_norm.weight");
-            w.attn_k_norm    = weight_from_tensor(gguf, prefix + "attn_k_norm.weight");
-            w.attn_output    = weight_from_tensor(gguf, prefix + "attn_output.weight");
-            w.post_attn_norm = weight_from_tensor(gguf, prefix + "post_attention_norm.weight");
-            w.ffn_gate       = weight_from_tensor(gguf, prefix + "ffn_gate.weight");
-            w.ffn_up         = weight_from_tensor(gguf, prefix + "ffn_up.weight");
-            w.ffn_down       = weight_from_tensor(gguf, prefix + "ffn_down.weight");
+            w.attn_norm      = load(prefix + "attn_norm.weight");
+            w.attn_q         = load(prefix + "attn_q.weight");
+            w.attn_k         = load(prefix + "attn_k.weight");
+            w.attn_v         = load(prefix + "attn_v.weight");
+            w.attn_q_norm    = load(prefix + "attn_q_norm.weight");
+            w.attn_k_norm    = load(prefix + "attn_k_norm.weight");
+            w.attn_output    = load(prefix + "attn_output.weight");
+            w.post_attn_norm = load(prefix + "post_attention_norm.weight");
+            w.ffn_gate       = load(prefix + "ffn_gate.weight");
+            w.ffn_up         = load(prefix + "ffn_up.weight");
+            w.ffn_down       = load(prefix + "ffn_down.weight");
         } else {
             auto& w = layer.deltanet;
-            w.attn_norm      = weight_from_tensor(gguf, prefix + "attn_norm.weight");
-            w.attn_qkv       = weight_from_tensor(gguf, prefix + "attn_qkv.weight");
-            w.attn_gate      = weight_from_tensor(gguf, prefix + "attn_gate.weight");
-            w.ssm_conv1d     = weight_from_tensor(gguf, prefix + "ssm_conv1d.weight");
-            w.ssm_a          = weight_from_tensor(gguf, prefix + "ssm_a");
-            w.ssm_dt_bias    = weight_from_tensor(gguf, prefix + "ssm_dt.bias");
-            w.ssm_alpha      = weight_from_tensor(gguf, prefix + "ssm_alpha.weight");
-            w.ssm_beta       = weight_from_tensor(gguf, prefix + "ssm_beta.weight");
-            w.ssm_norm       = weight_from_tensor(gguf, prefix + "ssm_norm.weight");
-            w.ssm_out        = weight_from_tensor(gguf, prefix + "ssm_out.weight");
-            w.post_attn_norm = weight_from_tensor(gguf, prefix + "post_attention_norm.weight");
-            w.ffn_gate       = weight_from_tensor(gguf, prefix + "ffn_gate.weight");
-            w.ffn_up         = weight_from_tensor(gguf, prefix + "ffn_up.weight");
-            w.ffn_down       = weight_from_tensor(gguf, prefix + "ffn_down.weight");
+            w.attn_norm      = load(prefix + "attn_norm.weight");
+            w.attn_qkv       = load(prefix + "attn_qkv.weight");
+            w.attn_gate      = load(prefix + "attn_gate.weight");
+            w.ssm_conv1d     = load(prefix + "ssm_conv1d.weight");
+            w.ssm_a          = load(prefix + "ssm_a");
+            w.ssm_dt_bias    = load(prefix + "ssm_dt.bias");
+            w.ssm_alpha      = load(prefix + "ssm_alpha.weight");
+            w.ssm_beta       = load(prefix + "ssm_beta.weight");
+            w.ssm_norm       = load(prefix + "ssm_norm.weight");
+            w.ssm_out        = load(prefix + "ssm_out.weight");
+            w.post_attn_norm = load(prefix + "post_attention_norm.weight");
+            w.ffn_gate       = load(prefix + "ffn_gate.weight");
+            w.ffn_up         = load(prefix + "ffn_up.weight");
+            w.ffn_down       = load(prefix + "ffn_down.weight");
         }
     }
 
@@ -856,6 +988,9 @@ static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
 
 void Model::upload_weights(CudaAllocator& allocator) {
     upload_weight(allocator, token_embd);
+    if (!config.tie_word_embeddings) {
+        upload_weight(allocator, output_weight);
+    }
     upload_weight(allocator, output_norm);
 
     for (auto& layer : layers) {
@@ -925,6 +1060,9 @@ void Model::upload_weights(CudaAllocator& allocator) {
         }
     }
     prepare_sfa(token_embd);
+    if (!config.tie_word_embeddings) {
+        prepare_sfa(output_weight);
+    }
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
 
     // Upload reduced LM head if loaded
@@ -982,6 +1120,7 @@ void Model::print_info() const {
            config.rope_sections[0], config.rope_sections[1],
            config.rope_sections[2], config.rope_sections[3]);
     fprintf(stderr, "Context length: %u\n", config.context_length);
+    fprintf(stderr, "Tie embeddings: %s\n", config.tie_word_embeddings ? "yes" : "no");
     fprintf(stderr, "RMSNorm eps: %e\n", config.rms_norm_eps);
 
     // Print layer pattern
@@ -992,7 +1131,8 @@ void Model::print_info() const {
     fprintf(stderr, "\n");
 
     // Weight summary
-    size_t total_bytes = token_embd.size_bytes + output_norm.size_bytes;
+    size_t total_bytes = token_embd.size_bytes + output_norm.size_bytes +
+                         (config.tie_word_embeddings ? 0 : output_weight.size_bytes);
     for (auto& layer : layers) {
         if (layer.is_full_attention) {
             auto& w = layer.full_attn;

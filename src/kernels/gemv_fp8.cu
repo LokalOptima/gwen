@@ -318,6 +318,14 @@ kernel_fp16_to_f32(const half* __restrict__ x, float* __restrict__ y, int n) {
     if (idx < n) y[idx] = __half2float(x[idx]);
 }
 
+// FP16→F32 conversion + F32 residual add: y[i] = half2float(x[i]) + residual[i]
+__global__ void __launch_bounds__(256)
+kernel_fp16_to_f32_add(const half* __restrict__ x, float* __restrict__ y,
+                        const float* __restrict__ residual, int n) {
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx < n) y[idx] = __half2float(x[idx]) + residual[idx];
+}
+
 // F32→FP16 conversion (F32 residual → FP16 for MTP hidden copy)
 __global__ void __launch_bounds__(256)
 kernel_f32_to_fp16(const float* __restrict__ x, half* __restrict__ y, int n) {
@@ -403,6 +411,11 @@ void gwen_rmsnorm_f32_input_batch2(const float* x0_f32, const float* x1_f32,
 
 void gwen_fp16_to_f32(const half* x, float* y, int n, cudaStream_t stream) {
     kernel_fp16_to_f32<<<(n + 255) / 256, 256, 0, stream>>>(x, y, n);
+    GWEN_CHECK_CUDA(cudaGetLastError());
+}
+
+void gwen_fp16_to_f32_add(const half* x, float* y, const float* residual, int n, cudaStream_t stream) {
+    kernel_fp16_to_f32_add<<<(n + 255) / 256, 256, 0, stream>>>(x, y, residual, n);
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 

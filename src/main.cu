@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
 
     // Apply defaults from ~/.cache/gwen/ (auto-download if needed)
     if (model_path.empty()) model_path = gwen::default_model_path();
-    if (mtp_path.empty() && !no_mtp) mtp_path = gwen::default_mtp_path();
+    if (mtp_path.empty() && !no_mtp && !ends_with(model_path, ".gguf")) mtp_path = gwen::default_mtp_path();
 
     gwen::ensure_file(model_path, (std::string(gwen::RELEASE_BASE) + "/" + gwen::DEFAULT_MODEL).c_str());
     if (!mtp_path.empty()) {
@@ -371,13 +371,17 @@ int main(int argc, char** argv) {
 
     // Tokenize prompt
     auto prompt_tokens = tokenizer->encode(prompt);
+    fprintf(stderr, "Prompt tokens (%zu): ", prompt_tokens.size());
+    for (size_t i = 0; i < prompt_tokens.size(); i++) fprintf(stderr, "%d ", prompt_tokens[i]);
+    fprintf(stderr, "\n");
 
     // Allocate inference state
     bool is_fp4 = ends_with(model_path, ".gwfp4");
+    bool is_gguf = ends_with(model_path, ".gguf");
     InferenceState state;
     state.allocate(model->config, allocator);
-    if (!is_fp4) {
-        // FP8 prefill path — not yet supported for FP4 models
+    if (!is_fp4 && !is_gguf) {
+        // FP8 prefill path — not yet supported for FP4 or GGUF K-quant models
         state.allocate_prefill(model->config, allocator, 4096);
     }
     if (model->has_mtp) {

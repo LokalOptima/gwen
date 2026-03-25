@@ -125,6 +125,7 @@ void gwen_rmsnorm_f32_input_batch2(const float* x0_f32, const float* x1_f32,
 
 // FP16→F32 / F32→FP16 conversion
 void gwen_fp16_to_f32(const half* x, float* y, int n, cudaStream_t stream = 0);
+void gwen_fp16_to_f32_add(const half* x, float* y, const float* residual, int n, cudaStream_t stream = 0);
 void gwen_f32_to_fp16(const float* x, half* y, int n, cudaStream_t stream = 0);
 
 // ============================================================

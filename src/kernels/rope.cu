@@ -166,10 +166,57 @@ kernel_embed_lookup_f32(const float* __restrict__ table,
     }
 }
 
+// Q4_K embedding lookup — dequantize one row from Q4_K embedding table
+__global__ void __launch_bounds__(256)
+kernel_embed_lookup_q4k(const void* __restrict__ table, const int* __restrict__ d_token_id,
+                        half* __restrict__ y, int dim) {
+    int token_id = *d_token_id;
+    int blocks_per_row = dim / 256;
+    int tid = threadIdx.x;
+
+    for (int blk_local = 0; blk_local < blocks_per_row; blk_local++) {
+        int blk_idx = token_id * blocks_per_row + blk_local;
+        // Q4_K block: 144 bytes = 2(d) + 2(dmin) + 12(scales) + 128(qs)
+        const uint8_t* base = static_cast<const uint8_t*>(table) + (size_t)blk_idx * 144;
+
+        half d_half, dmin_half;
+        memcpy(&d_half, base, sizeof(half));
+        memcpy(&dmin_half, base + 2, sizeof(half));
+        float d = __half2float(d_half);
+        float dmin = __half2float(dmin_half);
+        const uint8_t* scales_p = base + 4;
+        const uint8_t* qs = base + 16;
+
+        int sub_block = tid / 32;
+        uint8_t sc_lo, m_lo;
+        if (sub_block < 4) {
+            sc_lo = scales_p[sub_block] & 0x3F;
+            m_lo  = scales_p[sub_block + 4] & 0x3F;
+        } else {
+            sc_lo = (scales_p[sub_block + 4] & 0xF) | ((scales_p[sub_block - 4] >> 6) << 4);
+            m_lo  = (scales_p[sub_block + 4] >> 4) | ((scales_p[sub_block] >> 6) << 4);
+        }
+
+        float scale = d * sc_lo;
+        float min_val = dmin * m_lo;
+
+        int group = tid / 64;
+        int within = tid % 64;
+        int is_high = within / 32;
+        int pos = within % 32;
+        int qs_byte_idx = group * 32 + pos;
+        int q_val = is_high ? (qs[qs_byte_idx] >> 4) : (qs[qs_byte_idx] & 0xF);
+
+        y[blk_local * 256 + tid] = __float2half(scale * q_val - min_val);
+    }
+}
+
 void gwen_embed_lookup(const void* table, GGMLType table_type,
                        const int* d_token_id, half* y, int dim,
                        cudaStream_t stream, const float* scales) {
-    if (table_type == GGMLType::Q6_K) {
+    if (table_type == GGMLType::Q4_K) {
+        kernel_embed_lookup_q4k<<<1, 256, 0, stream>>>(table, d_token_id, y, dim);
+    } else if (table_type == GGMLType::Q6_K) {
         kernel_embed_lookup_q6k<<<1, 256, 0, stream>>>(table, d_token_id, y, dim);
     } else if (table_type == GGMLType::FP8_E4M3) {
         GWEN_CHECK(scales != nullptr, "FP8 embed lookup requires scales");

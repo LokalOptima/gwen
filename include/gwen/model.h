@@ -106,8 +106,12 @@ struct Model {
     std::vector<uint8_t> gwfp8_file_data_;  // file contents (mmap'd or loaded)
     std::vector<uint8_t> gwfp4_file_data_;  // GWFP4 file contents
 
+    // Host-side storage for load-time format conversions (e.g. IQ4_XS → Q4_K)
+    std::vector<std::vector<uint8_t>> converted_buffers_;
+
     // Global weights
-    WeightRef token_embd;       // [n_embed, n_vocab] Q6_K
+    WeightRef token_embd;       // [n_embed, n_vocab] Q6_K / Q4_K
+    WeightRef output_weight;    // [n_embed, n_vocab] Q6_K — separate lm_head (when tie_word_embeddings=false)
     WeightRef output_norm;      // [n_embed] F32
 
     // Per-layer weights

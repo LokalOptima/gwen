@@ -2704,6 +2704,10 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     d_alpha = static_cast<float*>(a(cfg.ssm_n_v_heads * sizeof(float)));
     d_beta  = static_cast<float*>(a(cfg.ssm_n_v_heads * sizeof(float)));
 
+    // K-quant GEMV scratch — FP16 intermediate for residual_f32 dispatch
+    int max_gemv_out = std::max(cfg.n_ff, std::max(cfg.n_embed, cfg.ssm_inner_size));
+    gemv_scratch = static_cast<half*>(a(max_gemv_out * sizeof(half)));
+
     // dp4a Q8_1 scratch buffers — sized for the largest input vector
     // Largest: n_ff=3584 (FFN down input), n_embed=1024 (most projections)
     int max_q8_dim = std::max(cfg.n_ff, std::max(cfg.n_embed, cfg.ssm_inner_size));
@@ -3124,7 +3128,18 @@ void InferenceState::extract_hidden(Model& model, const std::vector<int>& tokens
 // Reads token_id from d_token_id and pos from d_pos (device memory).
 // Buffer convention: buf_a holds hidden state at layer start/end.
 
-// GEMV dispatch: works for both FP8 and FP4 weights
+// Helper: get the LM head weight (separate output.weight or tied token_embd)
+static inline const WeightRef& lm_head_weight(const Model& model) {
+    return model.config.tie_word_embeddings ? model.token_embd : model.output_weight;
+}
+
+// Helper: is this a K-quant GGUF type?
+static inline bool is_kquant_type(GGMLType t) {
+    return t == GGMLType::Q4_K || t == GGMLType::Q5_K ||
+           t == GGMLType::Q6_K || t == GGMLType::Q8_0;
+}
+
+// GEMV dispatch: FP8, FP4, F16, and K-quant (Q4_K/Q5_K/Q6_K/Q8_0)
 static inline void gemv_dispatch(const WeightRef& w, const half* x, half* y,
                                   int out_features, int in_features, cudaStream_t s) {
     if (w.type == GGMLType::FP4_E2M1) {
@@ -3133,23 +3148,35 @@ static inline void gemv_dispatch(const WeightRef& w, const half* x, half* y,
     } else if (w.type == GGMLType::F16) {
         gwen_gemv_fp16(static_cast<const half*>(w.device_data), x, y,
                         out_features, in_features, s);
+    } else if (is_kquant_type(w.type)) {
+        gwen_gemv(w.device_data, x, y, out_features, in_features, w.type, s);
     } else {
+        // FP8 (default for GWFP8 models)
         gwen_gemv_fp8(w.device_data, w.device_scales, x, y, out_features, in_features, s);
     }
 }
 
+// GEMV + F32 residual: y_f32 = W*x + res_f32
+// K-quant path: GEMV → FP16 scratch, then fused FP16→F32+add
 static inline void gemv_dispatch_residual_f32(const WeightRef& w, const half* x,
                                                float* y_f32, const float* res_f32,
-                                               int out_features, int in_features, cudaStream_t s) {
+                                               int out_features, int in_features,
+                                               cudaStream_t s, half* scratch = nullptr) {
     if (w.type == GGMLType::FP4_E2M1) {
         gwen_gemv_fp4_residual_f32(w.device_data, w.device_scales_fp4, w.fp4_global_scale,
                                     x, y_f32, res_f32, out_features, in_features, s);
+    } else if (is_kquant_type(w.type) || w.type == GGMLType::F16) {
+        // Two-step: GEMV to FP16 scratch, then FP16→F32 + residual add
+        GWEN_CHECK(scratch != nullptr, "K-quant residual dispatch requires scratch buffer");
+        gemv_dispatch(w, x, scratch, out_features, in_features, s);
+        gwen_fp16_to_f32_add(scratch, y_f32, res_f32, out_features, s);
     } else {
         gwen_gemv_fp8_residual_f32(w.device_data, w.device_scales, x, y_f32, res_f32,
                                     out_features, in_features, s);
     }
 }
 
+// Batch-2 GEMV: read weights once, produce 2 outputs
 static inline void gemv_dispatch_batch2(const WeightRef& w,
                                          const half* x0, const half* x1,
                                          half* y0, half* y1,
@@ -3157,20 +3184,31 @@ static inline void gemv_dispatch_batch2(const WeightRef& w,
     if (w.type == GGMLType::FP4_E2M1) {
         gwen_gemv_fp4_batch2(w.device_data, w.device_scales_fp4, w.fp4_global_scale,
                               x0, x1, y0, y1, out_features, in_features, s);
+    } else if (is_kquant_type(w.type) || w.type == GGMLType::F16) {
+        // Fallback: two sequential GEMVs (no batch2 kernel for K-quants yet)
+        gemv_dispatch(w, x0, y0, out_features, in_features, s);
+        gemv_dispatch(w, x1, y1, out_features, in_features, s);
     } else {
         gwen_gemv_fp8_batch2(w.device_data, w.device_scales, x0, x1, y0, y1,
                               out_features, in_features, s);
     }
 }
 
+// Batch-2 GEMV + F32 residual
 static inline void gemv_dispatch_batch2_residual_f32(const WeightRef& w,
                                                       const half* x0, const half* x1,
                                                       float* y0, float* y1,
                                                       const float* r0, const float* r1,
-                                                      int out_features, int in_features, cudaStream_t s) {
+                                                      int out_features, int in_features,
+                                                      cudaStream_t s, half* scratch = nullptr) {
     if (w.type == GGMLType::FP4_E2M1) {
         gwen_gemv_fp4_batch2_residual_f32(w.device_data, w.device_scales_fp4, w.fp4_global_scale,
                                            x0, x1, y0, y1, r0, r1, out_features, in_features, s);
+    } else if (is_kquant_type(w.type) || w.type == GGMLType::F16) {
+        // Fallback: two sequential residual dispatches
+        GWEN_CHECK(scratch != nullptr, "K-quant batch2 residual dispatch requires scratch buffer");
+        gemv_dispatch_residual_f32(w, x0, y0, r0, out_features, in_features, s, scratch);
+        gemv_dispatch_residual_f32(w, x1, y1, r1, out_features, in_features, s, scratch);
     } else {
         gwen_gemv_fp8_batch2_residual_f32(w.device_data, w.device_scales, x0, x1, y0, y1,
                                            r0, r1, out_features, in_features, s);
@@ -3187,11 +3225,22 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                       d_token_id, buf_a, cfg.n_embed, s, model.token_embd.device_scales);
     gwen_fp16_to_f32(buf_a, buf_a_f32, cfg.n_embed, s);
 
+#ifdef GWEN_DEBUG
+    {   // Debug: check embedding output for NaN
+        GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+        float dbg[4]; GWEN_CHECK_CUDA(cudaMemcpy(dbg, buf_a_f32, 16, cudaMemcpyDeviceToHost));
+        GWEN_LOG("[DBG embed] %.6f %.6f %.6f %.6f\n", dbg[0], dbg[1], dbg[2], dbg[3]);
+    }
+#endif
+
     int dn_state_idx = 0;
     int kv_cache_idx = 0;
 
-    // 2. Process each layer
-    for (uint32_t layer_idx = 0; layer_idx < cfg.n_layers; layer_idx++) {
+    // 2. Process each layer (GWEN_LAYER_LIMIT env var to run subset for debugging)
+    uint32_t n_layers_run = cfg.n_layers;
+    const char* layer_limit_env = getenv("GWEN_LAYER_LIMIT");
+    if (layer_limit_env) n_layers_run = std::min((uint32_t)atoi(layer_limit_env), cfg.n_layers);
+    for (uint32_t layer_idx = 0; layer_idx < n_layers_run; layer_idx++) {
         const auto& layer = model.layers[layer_idx];
 
         if (!layer.is_full_attention) {
@@ -3205,6 +3254,22 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             gemv_dispatch(w.attn_qkv, x_norm, qkv, w.attn_qkv.shape[0], w.attn_qkv.shape[1], s);
             gemv_dispatch(w.attn_gate, x_norm, gate_z, w.attn_gate.shape[0], w.attn_gate.shape[1], s);
 
+#ifdef GWEN_DEBUG
+            if (layer_idx <= 1) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, x_norm, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u norm] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, qkv, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u qkv] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, gate_z, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u gate] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
+
             int qkv_dim = cfg.ssm_qkv_dim();
             int conv_blocks = (qkv_dim + 255) / 256;
             kernel_conv1d_silu<<<conv_blocks, 256, 0, s>>>(
@@ -3212,14 +3277,24 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                 static_cast<const float*>(w.ssm_conv1d.device_data),
                 qkv_dim, cfg.ssm_conv_kernel);
 
+
+#ifdef GWEN_DEBUG
+            if (layer_idx <= 1) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, qkv, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u conv] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
             int q_width = cfg.ssm_n_k_heads * cfg.ssm_state_size;
             half* q = qkv;
             half* k = qkv + q_width;
             half* v = qkv + 2 * q_width;
 
             // Fused: L2-norm(Q,K) + gate/beta + S update
-            if (w.ssm_alpha.type == GGMLType::FP4_E2M1) {
-                // FP4 path: compute alpha/beta projections via GEMV, convert to decay/beta
+            if (w.ssm_alpha.type != GGMLType::FP8_E4M3) {
+                // Non-FP8 path (FP4, F16, K-quant): compute alpha/beta projections via GEMV, convert to decay/beta
                 // Use attn_out as scratch for half-precision projections (avoid aliasing with d_alpha/d_beta)
                 half* alpha_h = attn_out;  // [n_v_heads] half scratch
                 half* beta_h = attn_out + cfg.ssm_n_v_heads;  // [n_v_heads] half scratch
@@ -3252,23 +3327,88 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                     cfg.ssm_n_v_heads, cfg.ssm_n_k_heads, cfg.ssm_state_size, cfg.n_embed);
             }
 
+
+#ifdef GWEN_DEBUG
+            if (layer_idx <= 1) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, attn_out, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u deltanet] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
             // Gated RMSNorm
             kernel_gated_rmsnorm<<<cfg.ssm_n_v_heads, 32, 0, s>>>(
                 attn_out, static_cast<const float*>(w.ssm_norm.device_data),
                 gate_z, gated_out,
                 cfg.ssm_n_v_heads, cfg.ssm_state_size, cfg.rms_norm_eps);
+
+#ifdef GWEN_DEBUG
+            if (layer_idx <= 1) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, gated_out, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u gated] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
             // Output projection with F32 residual
             gemv_dispatch_residual_f32(w.ssm_out, gated_out, buf_b_f32, buf_a_f32,
-                          w.ssm_out.shape[0], w.ssm_out.shape[1], s);
+                          w.ssm_out.shape[0], w.ssm_out.shape[1], s, gemv_scratch);
+
+#ifdef GWEN_DEBUG
+            if (layer_idx == 0) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(f4, buf_b_f32, 16, cudaMemcpyDeviceToHost));
+                GWEN_LOG("[DBG L%u ssm_out_res] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
 
             // FFN: RMSNorm F32→FP16, GEMV gate/up, SwiGLU, GEMV down
             gwen_rmsnorm_f32_input(buf_b_f32, static_cast<const float*>(w.post_attn_norm.device_data),
                                    x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+
+#ifdef GWEN_DEBUG
+            if (layer_idx <= 1) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, x_norm, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u ffn_norm] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
+
             gemv_dispatch(w.ffn_gate, x_norm, ffn_gate, w.ffn_gate.shape[0], w.ffn_gate.shape[1], s);
             gemv_dispatch(w.ffn_up, x_norm, ffn_up, w.ffn_up.shape[0], w.ffn_up.shape[1], s);
+
+#ifdef GWEN_DEBUG
+            if (layer_idx <= 1) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, ffn_gate, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u ffn_gate] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, ffn_up, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u ffn_up] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
+
             gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
+
+#ifdef GWEN_DEBUG
+            if (layer_idx <= 1) {
+                GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+                half h4[4]; float f4[4];
+                GWEN_CHECK_CUDA(cudaMemcpy(h4, ffn_out, 8, cudaMemcpyDeviceToHost));
+                for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+                GWEN_LOG("[DBG L%u swiglu] %.6f %.6f %.6f %.6f\n", layer_idx, f4[0], f4[1], f4[2], f4[3]);
+            }
+#endif
+
             gemv_dispatch_residual_f32(w.ffn_down, ffn_out, buf_a_f32, buf_b_f32,
-                          w.ffn_down.shape[0], w.ffn_down.shape[1], s);
+                          w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch);
 
         } else {
             const auto& w = layer.full_attn;
@@ -3313,7 +3453,7 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
 
             // Output projection with F32 residual
             gemv_dispatch_residual_f32(w.attn_output, gated_out, buf_b_f32, buf_a_f32,
-                          w.attn_output.shape[0], w.attn_output.shape[1], s);
+                          w.attn_output.shape[0], w.attn_output.shape[1], s, gemv_scratch);
 
             // FFN
             gwen_rmsnorm_f32_input(buf_b_f32, static_cast<const float*>(w.post_attn_norm.device_data),
@@ -3322,9 +3462,19 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             gemv_dispatch(w.ffn_up, x_norm, ffn_up, w.ffn_up.shape[0], w.ffn_up.shape[1], s);
             gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
             gemv_dispatch_residual_f32(w.ffn_down, ffn_out, buf_a_f32, buf_b_f32,
-                          w.ffn_down.shape[0], w.ffn_down.shape[1], s);
+                          w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch);
 
         }
+
+#ifdef GWEN_DEBUG
+        {
+            GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+            float dbg[4]; GWEN_CHECK_CUDA(cudaMemcpy(dbg, buf_a_f32, 16, cudaMemcpyDeviceToHost));
+            bool has_nan = (dbg[0] != dbg[0] || dbg[1] != dbg[1] || dbg[2] != dbg[2] || dbg[3] != dbg[3]);
+            if (layer_idx == 0 || layer_idx == cfg.n_layers - 1 || has_nan)
+                GWEN_LOG("[DBG L%u] %.6f %.6f %.6f %.6f%s\n", layer_idx, dbg[0], dbg[1], dbg[2], dbg[3], has_nan ? " NAN!" : "");
+        }
+#endif
     }
 
     // 3. Save hidden state for MTP (before LM head destroys it)
@@ -3335,7 +3485,32 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
     // 4. LM Head + argmax
     gwen_rmsnorm_f32_input(buf_a_f32, static_cast<const float*>(model.output_norm.device_data),
                            x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-    gemv_dispatch(model.token_embd, x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);
+
+#ifdef GWEN_DEBUG
+    {
+        GWEN_CHECK_CUDA(cudaStreamSynchronize(s));
+        half h4[4]; float f4[4];
+        GWEN_CHECK_CUDA(cudaMemcpy(h4, x_norm, 8, cudaMemcpyDeviceToHost));
+        for (int _i=0;_i<4;_i++) f4[_i]=__half2float(h4[_i]);
+        GWEN_LOG("[DBG x_norm_final] %.6f %.6f %.6f %.6f\n", f4[0], f4[1], f4[2], f4[3]);
+
+        const auto& lmw = lm_head_weight(model);
+        GWEN_LOG("[DBG lm_head] type=%s shape=[%lu,%lu] size=%zu on_device=%d\n",
+                 ggml_type_name(lmw.type), lmw.shape[0], lmw.shape[1],
+                 lmw.size_bytes, lmw.on_device());
+        // Verify first 16 bytes of LM head GPU data match host
+        uint8_t gpu_bytes[16], host_bytes[16];
+        GWEN_CHECK_CUDA(cudaMemcpy(gpu_bytes, lmw.device_data, 16, cudaMemcpyDeviceToHost));
+        memcpy(host_bytes, lmw.host_data, 16);
+        bool match = memcmp(gpu_bytes, host_bytes, 16) == 0;
+        GWEN_LOG("[DBG lm_head data] gpu=%02x%02x%02x%02x host=%02x%02x%02x%02x %s\n",
+                 gpu_bytes[0], gpu_bytes[1], gpu_bytes[2], gpu_bytes[3],
+                 host_bytes[0], host_bytes[1], host_bytes[2], host_bytes[3],
+                 match ? "MATCH" : "MISMATCH!");
+    }
+#endif
+
+    gemv_dispatch(lm_head_weight(model), x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
@@ -3461,7 +3636,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             // --- Batch2 GEMV: ssm_out with F32 residual ---
             gemv_dispatch_batch2_residual_f32(w.ssm_out, gated_out, b2_gated_out,
                       buf_b_f32, b2_buf_b_f32, buf_a_f32, b2_buf_a_f32,
-                      w.ssm_out.shape[0], w.ssm_out.shape[1], s);
+                      w.ssm_out.shape[0], w.ssm_out.shape[1], s, gemv_scratch);
 
             // --- Batch2 RMSNorm F32→FP16 (FFN input) ---
             gwen_rmsnorm_f32_input_batch2(buf_b_f32, b2_buf_b_f32,
@@ -3482,7 +3657,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             // --- Batch2 GEMV: FFN down with F32 residual ---
             gemv_dispatch_batch2_residual_f32(w.ffn_down, ffn_out, b2_ffn_out,
                       buf_a_f32, b2_buf_a_f32, buf_b_f32, b2_buf_b_f32,
-                      w.ffn_down.shape[0], w.ffn_down.shape[1], s);
+                      w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch);
 
         } else {
             const auto& w = layer.full_attn;
@@ -3567,7 +3742,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
             // --- Batch2 output proj with F32 residual ---
             gemv_dispatch_batch2_residual_f32(w.attn_output, gated_out, b2_gated_out,
                       buf_b_f32, b2_buf_b_f32, buf_a_f32, b2_buf_a_f32,
-                      w.attn_output.shape[0], w.attn_output.shape[1], s);
+                      w.attn_output.shape[0], w.attn_output.shape[1], s, gemv_scratch);
 
             // --- Batch2 RMSNorm F32→FP16 for FFN ---
             gwen_rmsnorm_f32_input_batch2(buf_b_f32, b2_buf_b_f32,
@@ -3584,7 +3759,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                       ffn_out, b2_ffn_out, cfg.n_ff, s);
             gemv_dispatch_batch2_residual_f32(w.ffn_down, ffn_out, b2_ffn_out,
                       buf_a_f32, b2_buf_a_f32, buf_b_f32, b2_buf_b_f32,
-                      w.ffn_down.shape[0], w.ffn_down.shape[1], s);
+                      w.ffn_down.shape[0], w.ffn_down.shape[1], s, gemv_scratch);
         }
     }
 
@@ -3603,7 +3778,7 @@ void InferenceState::forward_body_2tok(Model& model, cudaStream_t s) {
                       static_cast<const float*>(model.output_norm.device_data),
                       x_norm, b2_x_norm,
                       cfg.n_embed, cfg.rms_norm_eps, s);
-    gemv_dispatch_batch2(model.token_embd, x_norm, b2_x_norm, logits_h, b2_logits_h,
+    gemv_dispatch_batch2(lm_head_weight(model), x_norm, b2_x_norm, logits_h, b2_logits_h,
               cfg.n_vocab, cfg.n_embed, s);
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
@@ -3651,8 +3826,13 @@ int InferenceState::forward(Model& model, int token_id) {
     int params[2] = {token_id, pos};
     GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_id, params, 2 * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
+#ifdef GWEN_DEBUG
+    // Debug: run without CUDA graph to allow sync/memcpy debug checks
+    forward_body(model, compute_stream);
+    GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+#else
     // CUDA graph: captures the full forward pass on first call, replays thereafter.
-    // Host-side type dispatches (FP4/FP8/FP16) are invariant per model — safe to capture.
+    // Host-side type dispatches (FP4/FP8/FP16/K-quant) are invariant per model — safe to capture.
     if (!graph_captured) {
         cudaGraph_t graph;
         GWEN_CHECK_CUDA(cudaStreamBeginCapture(compute_stream, cudaStreamCaptureModeGlobal));
@@ -3663,9 +3843,8 @@ int InferenceState::forward(Model& model, int token_id) {
         graph_captured = true;
     }
     GWEN_CHECK_CUDA(cudaGraphLaunch(graph_exec, compute_stream));
-
-    // Sync and get result
     GWEN_CHECK_CUDA(cudaStreamSynchronize(compute_stream));
+#endif
     int next_token;
     GWEN_CHECK_CUDA(cudaMemcpy(&next_token, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -4444,7 +4623,7 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
                       x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
     // 4. LM Head GEMV on last token
-    gemv_dispatch(model.token_embd, x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);
+    gemv_dispatch(lm_head_weight(model), x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
@@ -4821,7 +5000,7 @@ void InferenceState::predict_from_hidden(Model& model, half* hidden_gpu, int N, 
         half* norm_t = prefill_norm + (size_t)t * cfg.n_embed;
 
         // GEMV: embed_tokens × normed → logits [n_vocab]
-        gemv_dispatch(model.token_embd, norm_t, logits_h, cfg.n_vocab, cfg.n_embed, s);
+        gemv_dispatch(lm_head_weight(model), norm_t, logits_h, cfg.n_vocab, cfg.n_embed, s);
 
         // FP16 → FP32 for argmax
         int logit_blocks = (cfg.n_vocab + 255) / 256;
@@ -5129,7 +5308,7 @@ void InferenceState::forward_mtp_body(Model& model, cudaStream_t s) {
         // Full LM head — FP8 GEMV
         gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(mtp_w.output_norm.device_data),
                           x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-        gemv_dispatch(model.token_embd, x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);
+        gemv_dispatch(lm_head_weight(model), x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);
 
         int logit_blocks = (cfg.n_vocab + 255) / 256;
         kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);

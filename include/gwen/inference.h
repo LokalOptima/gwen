@@ -68,6 +68,9 @@ struct InferenceState {
     float* d_alpha = nullptr;    // [ssm_n_heads]
     float* d_beta = nullptr;     // [ssm_n_heads]
 
+    // K-quant GEMV scratch — FP16 intermediate for residual_f32 path
+    half* gemv_scratch = nullptr;   // [max(n_embed, n_ff)] FP16 temp for K-quant GEMV→F32+residual
+
     // dp4a GEMV scratch — Q8_1 quantized input vectors
     void* x_q8_a = nullptr;        // Q8_1 of buf_a/x_norm (max: n_ff/32 blocks for FFN down)
     void* x_q8_b = nullptr;        // Q8_1 of ffn_out/gated_out (max: n_ff/32 blocks)
