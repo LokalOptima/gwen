@@ -49,12 +49,13 @@ echo ""
 # ── 2. Performance ──
 echo "── Decode Speed ──"
 
-# GWEN
-GWEN_JSON=$("${GWEN}" --model "$MODEL" --prompt "The meaning of life is" \
-    --n-predict "$N" --greedy --benchmark 2>&1 | head -1)
-GWEN_DECODE=$(echo "$GWEN_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"decode_tok_per_s\"]:.1f}')" 2>/dev/null || echo "??")
-GWEN_TTFT=$(echo "$GWEN_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"ttft_ms\"]:.1f}')" 2>/dev/null || echo "??")
-GWEN_VRAM=$(echo "$GWEN_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"peak_vram_mb\"]:.0f}')" 2>/dev/null || echo "??")
+# GWEN — use gwen_bench for decode, parse CSV output
+GWEN_BENCH_CSV=$(./build/gwen_bench -m "$MODEL" -p 0 -n "$N" -r 3 -o csv 2>/dev/null | tail -1)
+GWEN_DECODE=$(echo "$GWEN_BENCH_CSV" | python3 -c "import sys; print(sys.stdin.readline().strip().split(',')[4])" 2>/dev/null || echo "??")
+# TTFT from a single prefill+decode run
+GWEN_STDERR=$("${GWEN}" --model "$MODEL" "The meaning of life is" \
+    --max-predict 1 --greedy 2>&1 >/dev/null)
+GWEN_TTFT=$(echo "$GWEN_STDERR" | grep -oP 'TTFT: \K[0-9.]+' || echo "??")
 
 # llama.cpp
 LLAMA_OUT=$(timeout 30 "$LLAMA_SIMPLE" -m "$MODEL" \
@@ -85,7 +86,6 @@ printf "  %-22s %10s %12s %8s\n" "───────────────�
 printf "  %-22s %7s t/s %9s t/s %8s\n" "Decode throughput" "$GWEN_DECODE" "${LLAMA_TPS:-??}" "$RATIO"
 printf "  %-22s %7s ms  %9s ms\n" "Per-token latency" "$GWEN_MS_VAL" "${LLAMA_MS:-??}"
 printf "  %-22s %7s ms  %9s t/s\n" "TTFT / Prompt eval" "$GWEN_TTFT" "${LLAMA_PROMPT:-??}"
-printf "  %-22s %7s MB\n" "Peak VRAM" "$GWEN_VRAM"
 echo ""
 
 # ── 3. Breakdown ──

@@ -30,21 +30,15 @@ gen_prompt() {
     python3 -c "print(' '.join(['word'] * $n))"
 }
 
-# Run GWEN prefill benchmark, return tok/s values
+# Run GWEN prefill benchmark via gwen_bench, return mean and stddev
 bench_gwen() {
     local pp=$1
-    local prompt
-    prompt=$(gen_prompt "$pp")
-    local results=()
-    for i in $(seq 1 "$RUNS"); do
-        local json
-        json=$(flock --exclusive /tmp/gpu.lock "$GWEN" "$prompt" --max-predict 1 --greedy --benchmark 2>&1 | grep '{"prompt_tokens"')
-        local tps
-        tps=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"prompt_tokens\"] / (d[\"ttft_ms\"]/1000):.1f}')" 2>/dev/null || echo "0")
-        results+=("$tps")
-    done
-    # Print all values space-separated
-    echo "${results[*]}"
+    local csv
+    csv=$(flock --exclusive /tmp/gpu.lock ./build/gwen_bench -p "$pp" -n 0 -r "$RUNS" -o csv 2>/dev/null | tail -1)
+    local mean std
+    mean=$(echo "$csv" | cut -d',' -f5)
+    std=$(echo "$csv" | cut -d',' -f6)
+    echo "$mean $std"
 }
 
 # Run llama.cpp prefill benchmark
@@ -85,8 +79,7 @@ printf "  %-8s  %20s  %20s  %8s\n" "------" "--------------------" "------------
 
 for pp in $LENGTHS; do
     # GWEN
-    gwen_vals=$(bench_gwen "$pp")
-    read -r gwen_mean gwen_std <<< "$(compute_stats $gwen_vals)"
+    read -r gwen_mean gwen_std <<< "$(bench_gwen "$pp")"
 
     if $GWEN_ONLY; then
         printf "  pp%-5s  %10s ± %-7s\n" "$pp" "$gwen_mean" "$gwen_std"

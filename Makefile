@@ -22,7 +22,7 @@ run: $(BUILD_DIR)/gwen
 
 # ── Benchmark ────────────────────────────────────────────────────────
 bench: $(BUILD_DIR)/gwen
-	$(BUILD_DIR)/gwen "$(PROMPT)" --max-predict $(N) --greedy --benchmark
+	$(BUILD_DIR)/gwen_bench -p 512 -n $(N) -r 5
 
 # ── Utility ──────────────────────────────────────────────────────────
 info: $(BUILD_DIR)/gwen

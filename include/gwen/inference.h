@@ -4,6 +4,7 @@
 #include "gwen/model.h"
 #include "gwen/memory.h"
 #include <cuda_runtime.h>
+#include <functional>
 
 namespace gwen {
 
@@ -121,9 +122,11 @@ struct InferenceState {
     // Generate tokens (standard greedy)
     // teacher_tokens: if non-empty, feed these tokens as input instead of own predictions
     //                 (for teacher-forced comparison against a reference engine)
+    // on_token: if non-null, called with each generated token ID for streaming output
     std::vector<int> generate(Model& model, const std::vector<int>& prompt_tokens,
                               int n_predict, bool greedy = true, float temperature = 1.0f,
-                              const std::vector<int>& teacher_tokens = {});
+                              const std::vector<int>& teacher_tokens = {},
+                              std::function<void(int)> on_token = nullptr);
 };
 
 } // namespace gwen

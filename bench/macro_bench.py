@@ -156,63 +156,61 @@ def bench_llamacpp(prompt: str, n_predict: int, warmup_runs: int = 1, bench_runs
 
 
 def bench_gwen(prompt: str, n_predict: int, warmup_runs: int = 1, bench_runs: int = 3) -> BenchResult:
-    """Benchmark gwen inference."""
+    """Benchmark gwen inference using gwen_bench."""
+    gwen_bench_bin = PROJECT_ROOT / "build" / "gwen_bench"
+    prompt_tokens = len(prompt.split())  # approximate
+
+    # Run gwen_bench for decode throughput
     cmd = [
-        str(GWEN_BIN),
-        "--model", str(MODEL_PATH),
-        "--prompt", prompt,
-        "--n-predict", str(n_predict),
-        "--greedy",
-        "--benchmark",  # enable timing output
+        str(gwen_bench_bin),
+        "-m", str(MODEL_PATH),
+        "-p", "0",
+        "-n", str(n_predict),
+        "-r", str(bench_runs),
+        "-o", "csv",
     ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    decode_tps = 0.0
+    if result.returncode == 0:
+        # CSV format: model,size_gib,params_b,test,mean_tps,stddev_tps
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("qwen"):
+                parts = line.split(",")
+                decode_tps = float(parts[4])
+                break
 
-    # Warmup
-    for _ in range(warmup_runs):
-        subprocess.run(cmd, capture_output=True, timeout=300)
+    # Run gwen_bench for prefill throughput (as proxy for TTFT)
+    ttft_ms = 0.0
+    if prompt_tokens > 0:
+        cmd_pp = [
+            str(gwen_bench_bin),
+            "-m", str(MODEL_PATH),
+            "-p", str(prompt_tokens),
+            "-n", "0",
+            "-r", str(bench_runs),
+            "-o", "csv",
+        ]
+        result_pp = subprocess.run(cmd_pp, capture_output=True, text=True, timeout=300)
+        if result_pp.returncode == 0:
+            for line in result_pp.stdout.strip().split("\n"):
+                if line.startswith("qwen"):
+                    parts = line.split(",")
+                    pp_tps = float(parts[4])
+                    if pp_tps > 0:
+                        ttft_ms = prompt_tokens / pp_tps * 1000
+                    break
 
-    # Benchmark runs
-    results_raw = []
-    for _ in range(bench_runs):
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            print(f"  gwen error: {result.stderr[:200]}", file=sys.stderr)
-            return BenchResult(
-                engine="gwen", prompt_tokens=0, decode_tokens=0,
-                ttft_ms=0, decode_tok_per_s=0, total_time_ms=0, peak_vram_mb=0
-            )
-        # Parse gwen benchmark JSON output (expected on stderr)
-        try:
-            timing = json.loads(result.stderr.strip().split("\n")[-1])
-            results_raw.append(timing)
-        except (json.JSONDecodeError, IndexError):
-            pass
+    total_ms = ttft_ms + (n_predict / decode_tps * 1000 if decode_tps > 0 else 0)
 
-    # Aggregate (use median)
-    if results_raw:
-        ttft = np.median([r.get("ttft_ms", 0) for r in results_raw])
-        decode_tps = np.median([r.get("decode_tok_per_s", 0) for r in results_raw])
-        total = np.median([r.get("total_ms", 0) for r in results_raw])
-        vram = np.median([r.get("peak_vram_mb", 0) for r in results_raw])
-        return BenchResult(
-            engine="gwen",
-            prompt_tokens=results_raw[0].get("prompt_tokens", len(prompt.split())),
-            decode_tokens=results_raw[0].get("decode_tokens", n_predict),
-            ttft_ms=ttft,
-            decode_tok_per_s=decode_tps,
-            total_time_ms=total,
-            peak_vram_mb=vram,
-            embed_ms=np.median([r.get("embed_ms", 0) for r in results_raw]),
-            deltanet_ms=np.median([r.get("deltanet_ms", 0) for r in results_raw]),
-            attention_ms=np.median([r.get("attention_ms", 0) for r in results_raw]),
-            ffn_ms=np.median([r.get("ffn_ms", 0) for r in results_raw]),
-            sampling_ms=np.median([r.get("sampling_ms", 0) for r in results_raw]),
-            other_ms=np.median([r.get("other_ms", 0) for r in results_raw]),
-        )
-    else:
-        return BenchResult(
-            engine="gwen", prompt_tokens=0, decode_tokens=0,
-            ttft_ms=0, decode_tok_per_s=0, total_time_ms=0, peak_vram_mb=0
-        )
+    return BenchResult(
+        engine="gwen",
+        prompt_tokens=prompt_tokens,
+        decode_tokens=n_predict,
+        ttft_ms=ttft_ms,
+        decode_tok_per_s=decode_tps,
+        total_time_ms=total_ms,
+        peak_vram_mb=0,
+    )
 
 
 def run_benchmark_suite(args):

@@ -3262,7 +3262,8 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 
 std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& prompt_tokens,
                                            int n_predict, bool greedy, float temperature,
-                                           const std::vector<int>& teacher_tokens) {
+                                           const std::vector<int>& teacher_tokens,
+                                           std::function<void(int)> on_token) {
     std::vector<int> output_tokens;
 
     auto t_start = std::chrono::high_resolution_clock::now();
@@ -3280,6 +3281,8 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
             }
         }
     }
+
+    if (on_token) on_token(output_tokens.back());
 
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t_prefill = std::chrono::high_resolution_clock::now();
@@ -3320,6 +3323,7 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
 
         int next = forward(model, input_token);
         output_tokens.push_back(next);
+        if (on_token) on_token(next);
 
         if (dump_logits) {
             // Copy logits to host and print top-5

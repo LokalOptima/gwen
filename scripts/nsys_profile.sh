@@ -37,7 +37,7 @@ nsys profile \
     --force-overwrite=true \
     --output="$OUTDIR/$NAME" \
     "$GWEN" --model "$MODEL" \
-    --greedy --max-predict 100 --benchmark \
+    --greedy --max-predict 100 \
     "1 2 3 4 5 6 7 8" 2>&1 | head -3
 
 echo ""
