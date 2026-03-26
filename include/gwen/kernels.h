@@ -69,23 +69,8 @@ void gwen_gemv_dp4a(const void* W, const void* x_q8, half* y,
 void gwen_gemv_dp4a_residual(const void* W, const void* x_q8, half* y, const half* residual,
                               int out_features, int in_features, GGMLType type, cudaStream_t stream = 0);
 
-// Batch-2 dp4a GEMV: read quantized weights ONCE, produce 2 outputs
-// y0 = W * x_q8_0 [+ res0], y1 = W * x_q8_1 [+ res1]
-void gwen_gemv_dp4a_batch2(const void* W,
-                            const void* x_q8_0, const void* x_q8_1,
-                            half* y0, half* y1,
-                            int out_features, int in_features,
-                            GGMLType type, cudaStream_t stream = 0);
-
-void gwen_gemv_dp4a_residual_batch2(const void* W,
-                                     const void* x_q8_0, const void* x_q8_1,
-                                     half* y0, half* y1,
-                                     const half* res0, const half* res1,
-                                     int out_features, int in_features,
-                                     GGMLType type, cudaStream_t stream = 0);
-
 // ============================================================
-// FP16 GEMV (for MTP weights stored as FP16)
+// FP16 GEMV (for weights stored as FP16)
 // ============================================================
 
 // y = W * x, where W is [out_features, in_features] in FP16
@@ -129,27 +114,8 @@ void gwen_silu_inplace(half* x, int n, cudaStream_t stream = 0);
 // SwiGLU: y = SiLU(gate) * up (fused)
 void gwen_swiglu(const half* gate, const half* up, half* y, int n, cudaStream_t stream = 0);
 
-// Batch2 SwiGLU: process two tokens in one launch
-void gwen_swiglu_batch2(const half* gate0, const half* gate1,
-                         const half* up0, const half* up1,
-                         half* y0, half* y1,
-                         int n, cudaStream_t stream = 0);
-
 // Fused SwiGLU + Q8_1 quantize: computes SwiGLU and writes Q8_1 directly (skips FP16 intermediate)
 void gwen_swiglu_quantize_q8_1(const half* gate, const half* up, void* y_q8, int n, cudaStream_t stream = 0);
-
-// Batch2: fused SwiGLU + Q8_1 for two independent inputs in one launch
-void gwen_swiglu_quantize_q8_1_batch2(
-        const half* gate_a, const half* gate_b,
-        const half* up_a, const half* up_b,
-        void* y_q8_a, void* y_q8_b,
-        int n, cudaStream_t stream = 0);
-
-// Batch2: Q8_1 quantize two independent FP16 vectors in one launch
-void gwen_quantize_q8_1_batch2(
-        const half* x_a, const half* x_b,
-        void* y_q8_a, void* y_q8_b,
-        int n, cudaStream_t stream = 0);
 
 // Sigmoid: y = 1 / (1 + exp(-x))
 void gwen_sigmoid(const half* x, half* y, int n, cudaStream_t stream = 0);

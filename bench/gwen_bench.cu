@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
     // Positional model path
     for (int i = optind; i < argc; i++) {
         std::string arg = argv[i];
-        if (model_path.empty() && (ends_with(arg, ".gguf") || ends_with(arg, ".gwfp8") || ends_with(arg, ".gwfp4"))) {
+        if (model_path.empty() && ends_with(arg, ".gguf")) {
             model_path = arg;
         }
     }

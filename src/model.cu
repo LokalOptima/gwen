@@ -27,93 +27,9 @@ static WeightRef weight_from_tensor(const GGUFFile& gguf, const std::string& nam
     return weight_from_tensor(gguf.get_tensor(name));
 }
 
-// IQ4_XS lookup table (non-linear 4-bit quantization)
-static const int8_t kvalues_iq4nl[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-};
-
-// Dequantize IQ4_XS block data to FP16 (CPU-side, at model load time)
-// block_iq4_xs: {half d, uint16_t scales_h, uint8_t scales_l[4], uint8_t qs[128]} = 136 bytes per 256 elements
-static void dequant_iq4xs_to_fp16(const void* src, uint16_t* dst_fp16, size_t n_elements) {
-    const uint8_t* data = static_cast<const uint8_t*>(src);
-    size_t n_blocks = n_elements / 256;
-
-    for (size_t i = 0; i < n_blocks; i++) {
-        const uint8_t* block = data + i * 136;
-
-        // Read d (FP16 stored as uint16_t)
-        uint16_t d_bits;
-        memcpy(&d_bits, block, 2);
-        // Convert FP16 bits to float
-        uint32_t sign = (d_bits >> 15) & 1;
-        uint32_t exp = (d_bits >> 10) & 0x1F;
-        uint32_t mant = d_bits & 0x3FF;
-        float d;
-        if (exp == 0) {
-            d = (sign ? -1.0f : 1.0f) * (mant / 1024.0f) * (1.0f / 16384.0f);  // subnormal
-        } else if (exp == 31) {
-            d = 0.0f;  // inf/nan, shouldn't happen for scales
-        } else {
-            uint32_t f32_bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-            memcpy(&d, &f32_bits, 4);
-        }
-
-        uint16_t scales_h;
-        memcpy(&scales_h, block + 2, 2);
-        const uint8_t* scales_l = block + 4;
-        const uint8_t* qs = block + 8;
-
-        for (int ib = 0; ib < 8; ib++) {
-            int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) |
-                     (((scales_h >> (2 * ib)) & 3) << 4);
-            float dl = d * (ls - 32);
-
-            for (int j = 0; j < 16; j++) {
-                float v0 = dl * kvalues_iq4nl[qs[j] & 0xF];
-                float v1 = dl * kvalues_iq4nl[qs[j] >> 4];
-
-                // Convert float to FP16 bits (simple conversion)
-                auto f32_to_fp16 = [](float val) -> uint16_t {
-                    uint32_t bits;
-                    memcpy(&bits, &val, 4);
-                    uint32_t s = (bits >> 16) & 0x8000;
-                    int32_t e = ((bits >> 23) & 0xFF) - 127 + 15;
-                    uint32_t m = bits & 0x7FFFFF;
-                    if (e <= 0) return s;  // underflow to zero
-                    if (e >= 31) return s | 0x7C00;  // overflow to inf
-                    return s | (e << 10) | (m >> 13);
-                };
-
-                dst_fp16[ib * 32 + j] = f32_to_fp16(v0);
-                dst_fp16[ib * 32 + j + 16] = f32_to_fp16(v1);
-            }
-            qs += 16;
-        }
-        dst_fp16 += 256;
-    }
-}
-
-// Convert an IQ4_XS tensor to FP16, storing result in a new host buffer
-// Returns the buffer; caller must keep it alive for the model's lifetime
-static std::vector<uint8_t> convert_iq4xs_to_fp16(const GGUFTensor& t) {
-    size_t fp16_bytes = t.n_elements * sizeof(uint16_t);
-    std::vector<uint8_t> buf(fp16_bytes);
-    dequant_iq4xs_to_fp16(t.data, reinterpret_cast<uint16_t*>(buf.data()), t.n_elements);
-    return buf;
-}
-
-// Load tensor, converting IQ4_XS to FP16 at load time
-static WeightRef weight_from_tensor_convert(const GGUFFile& gguf, const std::string& name,
-                                             std::vector<std::vector<uint8_t>>& converted_buffers) {
-    const auto& t = gguf.get_tensor(name);
-    // IQ4_XS: use native format with dp4a GEMV kernel (no F16 conversion)
-    return weight_from_tensor(t);
-}
-
 std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     auto model = std::make_unique<Model>();
 
-    // Open GGUF
     model->gguf = GGUFFile::open(gguf_path);
     model->config = model->gguf->build_config();
     const auto& cfg = model->config;
@@ -135,9 +51,8 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
         model->config.tie_word_embeddings = true;
     }
 
-    // Helper: load tensor with automatic IQ4_XS → FP16 conversion
     auto load = [&](const std::string& name) -> WeightRef {
-        return weight_from_tensor_convert(gguf, name, model->converted_buffers_);
+        return weight_from_tensor(gguf, name);
     };
 
     // Per-layer weights
@@ -183,207 +98,7 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     return model;
 }
 
-// ============================================================
-// MTP weight loading (GWMT binary format)
-// ============================================================
-
-void Model::load_mtp(const std::string& mtp_path) {
-    std::ifstream f(mtp_path, std::ios::binary);
-    GWEN_CHECK(f.is_open(), ("Failed to open MTP file: " + mtp_path).c_str());
-
-    // Read header
-    char magic[4];
-    f.read(magic, 4);
-    GWEN_CHECK(memcmp(magic, "GWMT", 4) == 0, "Invalid MTP file magic (expected GWMT)");
-
-    uint32_t version, n_tensors;
-    f.read(reinterpret_cast<char*>(&version), 4);
-    f.read(reinterpret_cast<char*>(&n_tensors), 4);
-    GWEN_CHECK(version >= 1 && version <= 4, "Unsupported MTP file version (expected 1-4)");
-
-    GWEN_LOG("Loading MTP weights: %u tensors from %s\n", n_tensors, mtp_path.c_str());
-
-    // Read tensors
-    mtp_host_buffers.resize(n_tensors);
-    size_t total_bytes = 0;
-
-    for (uint32_t i = 0; i < n_tensors; i++) {
-        // Read name
-        uint32_t name_len;
-        f.read(reinterpret_cast<char*>(&name_len), 4);
-        std::string name(name_len, '\0');
-        f.read(name.data(), name_len);
-
-        // Read dtype, ndims, shape
-        uint32_t dtype, ndims;
-        f.read(reinterpret_cast<char*>(&dtype), 4);
-        f.read(reinterpret_cast<char*>(&ndims), 4);
-        std::vector<uint64_t> shape(ndims);
-        f.read(reinterpret_cast<char*>(shape.data()), ndims * 8);
-
-        // Read data
-        uint64_t data_size;
-        f.read(reinterpret_cast<char*>(&data_size), 8);
-        mtp_host_buffers[i].resize(data_size);
-        f.read(reinterpret_cast<char*>(mtp_host_buffers[i].data()), data_size);
-
-        // Compute n_elements
-        size_t n_elements = 1;
-        for (auto s : shape) n_elements *= s;
-
-        // Build WeightRef
-        WeightRef w;
-        w.host_data = mtp_host_buffers[i].data();
-        if (dtype == 0)      w.type = GGMLType::F32;
-        else if (dtype == 1) w.type = GGMLType::F16;
-        else if (dtype == 8) w.type = GGMLType::Q8_0;
-        else GWEN_CHECK(false, "Unsupported MTP weight dtype");
-        w.n_elements = n_elements;
-        w.size_bytes = data_size;
-        w.shape = shape;
-
-        total_bytes += data_size;
-
-        // Map to MTP weight fields by name
-        if (name == "mtp.fc.weight") {
-            mtp.fc = w;
-        } else if (name == "mtp.pre_fc_norm_embedding.weight") {
-            mtp.pre_fc_norm_embed = w;
-        } else if (name == "mtp.pre_fc_norm_hidden.weight") {
-            mtp.pre_fc_norm_hidden = w;
-        } else if (name == "mtp.layers.0.self_attn.q_proj.weight") {
-            mtp.layer.attn_q = w;
-        } else if (name == "mtp.layers.0.self_attn.k_proj.weight") {
-            mtp.layer.attn_k = w;
-        } else if (name == "mtp.layers.0.self_attn.v_proj.weight") {
-            mtp.layer.attn_v = w;
-        } else if (name == "mtp.layers.0.self_attn.o_proj.weight") {
-            mtp.layer.attn_output = w;
-        } else if (name == "mtp.layers.0.self_attn.q_norm.weight") {
-            mtp.layer.attn_q_norm = w;
-        } else if (name == "mtp.layers.0.self_attn.k_norm.weight") {
-            mtp.layer.attn_k_norm = w;
-        } else if (name == "mtp.layers.0.input_layernorm.weight") {
-            mtp.layer.attn_norm = w;
-        } else if (name == "mtp.layers.0.post_attention_layernorm.weight") {
-            mtp.layer.post_attn_norm = w;
-        } else if (name == "mtp.layers.0.mlp.gate_proj.weight") {
-            mtp.layer.ffn_gate = w;
-        } else if (name == "mtp.layers.0.mlp.up_proj.weight") {
-            mtp.layer.ffn_up = w;
-        } else if (name == "mtp.layers.0.mlp.down_proj.weight") {
-            mtp.layer.ffn_down = w;
-        } else if (name == "mtp.norm.weight") {
-            mtp.output_norm = w;
-        } else if (name == "mtp.lm_head.weight") {
-            // Reduced lm_head from fine-tuning — wire into reduced_lm_head
-            reduced_lm_head.weights = w;
-            reduced_lm_head.type = w.type;
-            // For FP16: row_bytes = n_embed * 2
-            if (w.type == GGMLType::F16) {
-                reduced_lm_head.row_bytes = config.n_embed * 2;
-            }
-        } else {
-            fprintf(stderr, "  Warning: unknown MTP tensor: %s\n", name.c_str());
-        }
-
-#ifdef GWEN_DEBUG
-        fprintf(stderr, "  %-50s [", name.c_str());
-        for (uint32_t d = 0; d < ndims; d++) {
-            if (d > 0) fprintf(stderr, ", ");
-            fprintf(stderr, "%lu", shape[d]);
-        }
-        const char* dtype_str = "???";
-        if (dtype == 0) dtype_str = "F32";
-        else if (dtype == 1) dtype_str = "F16";
-        else if (dtype == 8) dtype_str = "Q8_0";
-        fprintf(stderr, "] %s  %.1f KB\n", dtype_str, data_size / 1024.0f);
-#endif
-    }
-
-    has_mtp = true;
-    GWEN_LOG("MTP weights loaded: %.1f MB total\n", total_bytes / 1024.0 / 1024.0);
-
-    // v3+ footer: restricted vocab mapping [K, restricted_ids[K]]
-    if (version >= 3 && f.peek() != EOF) {
-        uint32_t K;
-        f.read(reinterpret_cast<char*>(&K), 4);
-        if (K > 0) {
-            reduced_lm_head.token_ids.resize(K);
-            f.read(reinterpret_cast<char*>(reduced_lm_head.token_ids.data()), K * sizeof(int32_t));
-            reduced_lm_head.K = K;
-            // lm_head weights are in MTP tensors (mtp.lm_head.weight), FP16
-            // The reduced_lm_head.weights will be set during upload from the MTP lm_head tensor
-            has_reduced_lm_head = true;
-            GWEN_LOG("GWMT v%u: restricted vocab K=%u embedded in MTP file\n", version, K);
-        }
-
-        // v4 footer: has_idk flag
-        if (version >= 4 && f.peek() != EOF) {
-            uint8_t flag;
-            f.read(reinterpret_cast<char*>(&flag), 1);
-            reduced_lm_head.has_idk = (flag != 0);
-            if (reduced_lm_head.has_idk) {
-                GWEN_LOG("GWMT v4: IDK token enabled (index %u maps to -1)\n", K);
-            }
-        }
-    }
-}
-
-// ============================================================
-// Reduced LM head loading (GWRL binary format)
-// ============================================================
-
-void Model::load_reduced_lm_head(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    GWEN_CHECK(f.is_open(), ("Failed to open reduced LM head file: " + path).c_str());
-
-    // Read header
-    char magic[4];
-    f.read(magic, 4);
-    GWEN_CHECK(memcmp(magic, "GWRL", 4) == 0, "Invalid reduced LM head file magic (expected GWRL)");
-
-    uint32_t version, K, n_embed, ggml_type, row_bytes;
-    f.read(reinterpret_cast<char*>(&version), 4);
-    GWEN_CHECK(version == 1, "Unsupported GWRL version");
-
-    f.read(reinterpret_cast<char*>(&K), 4);
-    f.read(reinterpret_cast<char*>(&n_embed), 4);
-    f.read(reinterpret_cast<char*>(&ggml_type), 4);
-    f.read(reinterpret_cast<char*>(&row_bytes), 4);
-
-    GWEN_LOG("Loading reduced LM head: %u tokens, %u embed, type=%u, %u bytes/row\n",
-           K, n_embed, ggml_type, row_bytes);
-
-    // Read token ID mapping
-    reduced_lm_head.token_ids.resize(K);
-    f.read(reinterpret_cast<char*>(reduced_lm_head.token_ids.data()), K * sizeof(int32_t));
-
-    // Read weight data
-    size_t weight_bytes = (size_t)K * row_bytes;
-    reduced_lm_head.host_buffer.resize(weight_bytes);
-    f.read(reinterpret_cast<char*>(reduced_lm_head.host_buffer.data()), weight_bytes);
-
-    // Set up WeightRef
-    reduced_lm_head.weights.host_data = reduced_lm_head.host_buffer.data();
-    reduced_lm_head.weights.type = static_cast<GGMLType>(ggml_type);
-    reduced_lm_head.weights.n_elements = (size_t)K * n_embed;
-    reduced_lm_head.weights.size_bytes = weight_bytes;
-    reduced_lm_head.weights.shape = {n_embed, K};  // GGML convention
-    reduced_lm_head.K = K;
-    reduced_lm_head.row_bytes = row_bytes;
-    reduced_lm_head.type = static_cast<GGMLType>(ggml_type);
-
-    has_reduced_lm_head = true;
-    GWEN_LOG("Reduced LM head loaded: %u tokens, %.1f MB (%.1fx reduction)\n",
-           K, weight_bytes / 1024.0 / 1024.0,
-           (float)config.n_vocab / K);
-}
-
 // Upload all weight tensors to GPU
-// Forward declarations for dequant kernels
-void gwen_dequant(const void* src, half* dst, int n, GGMLType type, cudaStream_t stream);
-
 static void upload_weight(CudaAllocator& alloc, WeightRef& w) {
     if (w.host_data && w.size_bytes > 0 && !w.on_device()) {
         w.device_data = alloc.upload(w.host_data, w.size_bytes);
@@ -429,37 +144,6 @@ void Model::upload_weights(CudaAllocator& allocator) {
             upload_weight(allocator, w.ffn_down);
         }
     }
-
-    // Upload reduced LM head if loaded
-    if (has_reduced_lm_head) {
-        upload_weight(allocator, reduced_lm_head.weights);
-        // Upload token ID mapping to device
-        size_t ids_bytes = reduced_lm_head.K * sizeof(int32_t);
-        reduced_lm_head.d_token_ids = static_cast<int*>(allocator.upload(
-            reduced_lm_head.token_ids.data(), ids_bytes));
-        GWEN_LOG("Reduced LM head uploaded: %.1f MB weights + %.1f KB token map\n",
-               reduced_lm_head.weights.size_bytes / 1024.0 / 1024.0,
-               ids_bytes / 1024.0);
-    }
-
-    // Upload MTP weights if loaded
-    if (has_mtp) {
-        upload_weight(allocator, mtp.fc);
-        upload_weight(allocator, mtp.pre_fc_norm_embed);
-        upload_weight(allocator, mtp.pre_fc_norm_hidden);
-        upload_weight(allocator, mtp.layer.attn_norm);
-        upload_weight(allocator, mtp.layer.attn_q);
-        upload_weight(allocator, mtp.layer.attn_k);
-        upload_weight(allocator, mtp.layer.attn_v);
-        upload_weight(allocator, mtp.layer.attn_q_norm);
-        upload_weight(allocator, mtp.layer.attn_k_norm);
-        upload_weight(allocator, mtp.layer.attn_output);
-        upload_weight(allocator, mtp.layer.post_attn_norm);
-        upload_weight(allocator, mtp.layer.ffn_gate);
-        upload_weight(allocator, mtp.layer.ffn_up);
-        upload_weight(allocator, mtp.layer.ffn_down);
-        upload_weight(allocator, mtp.output_norm);
-    }
 }
 
 void Model::print_info() const {
@@ -486,14 +170,12 @@ void Model::print_info() const {
     fprintf(stderr, "Tie embeddings: %s\n", config.tie_word_embeddings ? "yes" : "no");
     fprintf(stderr, "RMSNorm eps: %e\n", config.rms_norm_eps);
 
-    // Print layer pattern
     fprintf(stderr, "\nLayer pattern: ");
     for (uint32_t i = 0; i < config.n_layers; i++) {
         fprintf(stderr, "%c", config.is_full_attention_layer(i) ? 'A' : 'D');
     }
     fprintf(stderr, "\n");
 
-    // Weight summary
     size_t total_bytes = token_embd.size_bytes + output_norm.size_bytes +
                          (config.tie_word_embeddings ? 0 : output_weight.size_bytes);
     for (auto& layer : layers) {

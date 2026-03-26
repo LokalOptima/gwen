@@ -85,7 +85,7 @@ echo ""
 # ncu requires running the app — use short generation (5 tokens) to keep profile fast
 $NCU_CMD \
     "$GWEN" --model "$MODEL" \
-    --no-mtp --greedy --max-predict 5 \
+    --greedy --max-predict 5 \
     "1 2 3 4 5 6 7 8" 2>/dev/null
 
 echo ""

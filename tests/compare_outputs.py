@@ -78,7 +78,6 @@ def run_gwen(prompt: str, n_predict: int = N_PREDICT) -> dict:
     cmd = [
         str(GWEN_BIN),
         "--model", str(MODEL_PATH),
-        "--no-mtp",
         "--greedy",
         "--max-predict", str(n_predict),
         prompt,

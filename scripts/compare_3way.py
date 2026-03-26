@@ -31,7 +31,6 @@ def run_gwen():
     cmd = [
         "flock", "--shared", "/tmp/gpu.lock",
         GWEN_BIN, GWEN_MODEL,
-        "--no-mtp",
         "--max-predict", str(MAX_TOKENS),
         "--greedy",
         CHATML,  # Pass the full ChatML prompt directly (no template)

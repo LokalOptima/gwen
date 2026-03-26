@@ -129,7 +129,7 @@ for idx in $(seq 0 $STEP $((N_POS - 2))); do
   EXPECTED_REST="${GOLDEN_TEXT:$POS}"
 
   # Run GWEN: feed prefix as prompt, predict 1 token
-  GWEN_OUT=$("$GWEN" --model "$MODEL" --no-mtp --greedy --max-predict 1 "$PREFIX" 2>/dev/null) || true
+  GWEN_OUT=$("$GWEN" --model "$MODEL" --greedy --max-predict 1 "$PREFIX" 2>/dev/null) || true
   GWEN_CONTINUATION="${GWEN_OUT#"$PREFIX"}"
 
   # Check: does the golden continuation start with what GWEN predicted?
@@ -162,7 +162,7 @@ for i in $(seq 0 $((${#PROMPTS[@]}-1))); do
     continue
   fi
   expected=$(cat "$golden")
-  actual=$("$GWEN" --model "$MODEL" --no-mtp --greedy --max-predict "$N_PREDICT" "$prompt" 2>/dev/null) || true
+  actual=$("$GWEN" --model "$MODEL" --greedy --max-predict "$N_PREDICT" "$prompt" 2>/dev/null) || true
 
   if [ "$actual" = "$expected" ]; then
     pass "prompt $i: '${prompt:0:40}'"
@@ -200,7 +200,7 @@ echo "-- 5. Determinism (3 runs) --"
 PREV=""
 ALL_SAME=1
 for run in 1 2 3; do
-  out=$("$GWEN" --model "$MODEL" --no-mtp --greedy --max-predict 20 "The meaning of life is" 2>/dev/null) || true
+  out=$("$GWEN" --model "$MODEL" --greedy --max-predict 20 "The meaning of life is" 2>/dev/null) || true
   if [ -n "$PREV" ] && [ "$out" != "$PREV" ]; then
     ALL_SAME=0
   fi

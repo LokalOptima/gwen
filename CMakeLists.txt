@@ -77,14 +77,11 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/src/server.cpp)
         ${CMAKE_SOURCE_DIR}/third_party/cpp-httplib)
 endif()
 
-# --- Micro-benchmarks ---
-
 # --- Kernel tests ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests/test_kernels.cu)
     add_executable(test_kernels tests/test_kernels.cu)
     target_link_libraries(test_kernels gwen_core)
 endif()
-
 
 # --- Benchmark (llama-bench replica) ---
 if(EXISTS ${CMAKE_SOURCE_DIR}/bench/gwen_bench.cu)
@@ -99,4 +96,3 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/bench/profile_forward.cu)
     target_link_libraries(profile_forward gwen_core)
     set_target_properties(profile_forward PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
-

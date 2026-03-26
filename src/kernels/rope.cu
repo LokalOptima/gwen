@@ -142,7 +142,7 @@ kernel_embed_lookup_fp8(const uint8_t* __restrict__ table,
     }
 }
 
-// FP16 embedding lookup (GWFP4 path — embeddings stored as FP16)
+// FP16 embedding lookup (embeddings stored as FP16)
 __global__ void __launch_bounds__(256)
 kernel_embed_lookup_fp16(const half* __restrict__ table,
                          const int* __restrict__ d_token_id,
@@ -154,7 +154,7 @@ kernel_embed_lookup_fp16(const half* __restrict__ table,
     }
 }
 
-// F32 embedding lookup (GWFP4 path — embeddings stored as F32)
+// F32 embedding lookup (embeddings stored as F32)
 __global__ void __launch_bounds__(256)
 kernel_embed_lookup_f32(const float* __restrict__ table,
                         const int* __restrict__ d_token_id,

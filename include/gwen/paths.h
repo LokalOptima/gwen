@@ -16,7 +16,6 @@ static constexpr const char* RELEASE_BASE =
 
 // Default filenames
 static constexpr const char* DEFAULT_MODEL = "Qwen3.5-9B-UD-Q4_K_XL.gguf";
-static constexpr const char* DEFAULT_MTP   = "mtp_v6_sparse64.bin";
 
 inline std::string cache_dir() {
     const char* xdg = getenv("XDG_CACHE_HOME");
@@ -58,19 +57,6 @@ inline void ensure_file(const std::string& path, const char* url) {
 
 inline std::string default_model_path() {
     return cache_dir() + "/" + DEFAULT_MODEL;
-}
-
-inline std::string default_mtp_path() {
-    return cache_dir() + "/" + DEFAULT_MTP;
-}
-
-// Ensure default weights exist, downloading if needed.
-inline void ensure_default_weights(const std::string& model_path,
-                                   const std::string& mtp_path) {
-    std::string model_url = std::string(RELEASE_BASE) + "/" + DEFAULT_MODEL;
-    std::string mtp_url   = std::string(RELEASE_BASE) + "/" + DEFAULT_MTP;
-    ensure_file(model_path, model_url.c_str());
-    ensure_file(mtp_path, mtp_url.c_str());
 }
 
 }  // namespace gwen
