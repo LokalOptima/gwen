@@ -44,7 +44,7 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     if (output_tensor) {
         model->output_weight = weight_from_tensor(*output_tensor);
         model->config.tie_word_embeddings = false;
-        fprintf(stderr, "  output.weight: [%lu, %lu] %s (separate lm_head)\n",
+        GWEN_LOG("  output.weight: [%lu, %lu] %s (separate lm_head)\n",
                 output_tensor->shape[0], output_tensor->shape[1],
                 ggml_type_name(output_tensor->type));
     } else {

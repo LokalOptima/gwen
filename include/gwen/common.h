@@ -101,7 +101,8 @@ struct ModelConfig {
     uint32_t ssm_n_v_heads   = 16;      // DeltaNet V heads (linear_num_value_heads)
     uint32_t ssm_inner_size  = 2048;    // DeltaNet hidden (= n_v_heads * state_size)
     uint32_t full_attn_interval = 4;    // every 4th layer is full attention
-    uint32_t eos_token_id    = 248046;
+    uint32_t eos_token_id    = 248046;  // <|im_end|> — ChatML end-of-turn
+    uint32_t eot_token_id    = 248044;  // <|endoftext|> — hard stop
     uint32_t pad_token_id    = 248055;
     uint32_t context_length  = 262144;
     bool     tie_word_embeddings = true;  // false for 9B+ (separate output.weight)

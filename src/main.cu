@@ -66,28 +66,63 @@ int main(int argc, char** argv) {
     // Build prompt and tokenize
     std::string prompt = opts.build_prompt();
     auto prompt_tokens = tokenizer->encode(prompt);
-    fprintf(stderr, "Prompt tokens (%zu): ", prompt_tokens.size());
-    for (size_t i = 0; i < prompt_tokens.size(); i++) fprintf(stderr, "%d ", prompt_tokens[i]);
-    fprintf(stderr, "\n");
+
+    if (opts.debug) {
+        fprintf(stderr, "Prompt tokens (%zu): ", prompt_tokens.size());
+        for (size_t i = 0; i < prompt_tokens.size(); i++) fprintf(stderr, "%d ", prompt_tokens[i]);
+        fprintf(stderr, "\n");
+        printf("%s", prompt.c_str());
+        fflush(stdout);
+    }
 
     // Allocate inference state
     InferenceState state;
     state.allocate(model->config, allocator);
     state.allocate_prefill(model->config, allocator, 4096);
 
-    // Generate with streaming output: print prompt first, then each token as it's generated
-    printf("%s", prompt.c_str());
-    fflush(stdout);
-
+    // Stream tokens — in debug mode print everything, otherwise skip think block and stop tokens
+    bool in_think = opts.reason && !opts.raw && !opts.debug;
+    std::string think_buf;
     auto on_token = [&](int token_id) {
-        printf("%s", tokenizer->decode(token_id).c_str());
-        fflush(stdout);
+        std::string text = tokenizer->decode(token_id);
+        if (in_think) {
+            think_buf += text;
+            static constexpr const char* THINK_CLOSE = "</think>";
+            auto pos = think_buf.find(THINK_CLOSE);
+            if (pos != std::string::npos) {
+                in_think = false;
+                std::string after = think_buf.substr(pos + strlen(THINK_CLOSE));
+                size_t start = after.find_first_not_of("\n\r");
+                if (start != std::string::npos) {
+                    printf("%s", after.substr(start).c_str());
+                    fflush(stdout);
+                }
+            }
+        } else if (token_id != (int)model->config.eos_token_id &&
+                   token_id != (int)model->config.eot_token_id) {
+            printf("%s", text.c_str());
+            fflush(stdout);
+        }
     };
+
+    // Build sampling params based on mode
+    auto sampling = opts.greedy  ? SamplingParams::greedy_mode() :
+                    opts.reason  ? SamplingParams::qwen_thinking() :
+                                   SamplingParams::qwen_default();
+
+    if (opts.debug) {
+        if (sampling.greedy) {
+            fprintf(stderr, "Sampling: greedy\n");
+        } else {
+            fprintf(stderr, "Sampling: temp=%.1f top_k=%d top_p=%.2f presence_penalty=%.1f\n",
+                    sampling.temperature, sampling.top_k, sampling.top_p, sampling.presence_penalty);
+        }
+    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
     auto output_tokens = state.generate(*model, prompt_tokens, opts.n_predict,
-                                        opts.greedy, 1.0f, opts.teacher_tokens, on_token);
+                                        sampling, opts.teacher_tokens, on_token);
 
     GWEN_CHECK_CUDA(cudaDeviceSynchronize());
     auto t1 = std::chrono::high_resolution_clock::now();

@@ -314,6 +314,7 @@ ModelConfig GGUFFile::build_config() const {
     cfg.rope_dim        = get_u32("qwen35.rope.dimension_count", 64);
     cfg.context_length  = get_u32("qwen35.context_length", 262144);
     cfg.eos_token_id    = get_u32("tokenizer.ggml.eos_token_id", 248046);
+    cfg.eot_token_id    = get_u32("tokenizer.ggml.eot_token_id", 248044);
     cfg.pad_token_id    = get_u32("tokenizer.ggml.padding_token_id", 248055);
 
     // Vocab size from embedding tensor

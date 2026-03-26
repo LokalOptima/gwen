@@ -1769,6 +1769,9 @@ __global__ void kernel_confidence_gate(const float* __restrict__ logits,
     }
 }
 
+// Max top-K for sampling (CPU-side heap)
+constexpr int MAX_TOPK = 64;
+
 // Batch KV cache store: copy N tokens of K and V into cache at positions pos_offset..pos_offset+N-1
 // Grid: (ceil(kv_dim/256), N)
 __global__ void __launch_bounds__(256)
@@ -1893,6 +1896,10 @@ void InferenceState::allocate(const ModelConfig& cfg, CudaAllocator& alloc, int 
     d_argmax_token = static_cast<int*>(a(sizeof(int)));
     argmax_partial_max = static_cast<float*>(a(ARGMAX_BLOCKS * sizeof(float)));
     argmax_partial_idx = static_cast<int*>(a(ARGMAX_BLOCKS * sizeof(int)));
+
+    // Sampling scratch (host-side)
+    h_logits.resize(cfg.n_vocab);
+    h_token_counts.assign(cfg.n_vocab, 0);
     // d_token_id layout: [token_id, pos] — 2 ints
     d_token_id = static_cast<int*>(a(2 * sizeof(int)));
     d_pos = d_token_id + 1;
@@ -3257,26 +3264,133 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
 }
 
 // ============================================================
+// Sampling: logits_f → token ID
+// ============================================================
+
+int InferenceState::sample(const ModelConfig& cfg, const SamplingParams& params) {
+    if (params.greedy) {
+        // Already computed by forward_body() in the CUDA graph
+        int token;
+        GWEN_CHECK_CUDA(cudaMemcpy(&token, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost));
+        return token;
+    }
+
+    int n = cfg.n_vocab;
+    int K = std::min({params.top_k, n, (int)MAX_TOPK});
+
+    // D2H copy: 248K × 4B = ~1MB, takes ~20µs over PCIe
+    GWEN_CHECK_CUDA(cudaMemcpy(h_logits.data(), logits_f, n * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Fused single pass: penalty + temperature + top-K min-heap
+    // One sequential scan through logits — cache-friendly, no indirection
+    float inv_temp = 1.0f / params.temperature;
+    float heap_vals[MAX_TOPK];
+    int heap_ids[MAX_TOPK];
+    int heap_size = 0;
+    float heap_min = -FLT_MAX;
+
+    for (int i = 0; i < n; i++) {
+        float v = h_logits[i];
+        if (h_token_counts[i] > 0) v -= params.presence_penalty;
+        v *= inv_temp;
+
+        if (heap_size < K) {
+            // Fill phase: insert into heap
+            heap_vals[heap_size] = v;
+            heap_ids[heap_size] = i;
+            heap_size++;
+            if (heap_size == K) {
+                // Find the minimum to enable fast rejection
+                heap_min = heap_vals[0];
+                for (int j = 1; j < K; j++)
+                    if (heap_vals[j] < heap_min) heap_min = heap_vals[j];
+            }
+        } else if (v > heap_min) {
+            // Replace minimum element
+            int min_pos = 0;
+            for (int j = 1; j < K; j++)
+                if (heap_vals[j] < heap_vals[min_pos]) min_pos = j;
+            heap_vals[min_pos] = v;
+            heap_ids[min_pos] = i;
+            // Update minimum
+            heap_min = heap_vals[0];
+            for (int j = 1; j < K; j++)
+                if (heap_vals[j] < heap_min) heap_min = heap_vals[j];
+        }
+    }
+
+    // Sort top-K descending for top-p cumulative sum
+    for (int a = 0; a < heap_size - 1; a++) {
+        for (int b = a + 1; b < heap_size; b++) {
+            if (heap_vals[b] > heap_vals[a]) {
+                float tv = heap_vals[a]; heap_vals[a] = heap_vals[b]; heap_vals[b] = tv;
+                int ti = heap_ids[a]; heap_ids[a] = heap_ids[b]; heap_ids[b] = ti;
+            }
+        }
+    }
+
+    // Softmax over top-K
+    float max_val = heap_vals[0];
+    float sum = 0;
+    for (int i = 0; i < heap_size; i++) {
+        heap_vals[i] = expf(heap_vals[i] - max_val);
+        sum += heap_vals[i];
+    }
+    for (int i = 0; i < heap_size; i++) heap_vals[i] /= sum;
+
+    // Top-P filter
+    int cutoff = heap_size;
+    float cumsum = 0;
+    for (int i = 0; i < heap_size; i++) {
+        cumsum += heap_vals[i];
+        if (cumsum >= params.top_p) {
+            cutoff = i + 1;
+            break;
+        }
+    }
+
+    // Renormalize and categorical sample
+    sum = 0;
+    for (int i = 0; i < cutoff; i++) sum += heap_vals[i];
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float r = dist(rng);
+    float acc = 0;
+    for (int i = 0; i < cutoff; i++) {
+        acc += heap_vals[i];
+        if (acc >= r) return heap_ids[i];
+    }
+    return heap_ids[cutoff - 1];
+}
+
+// ============================================================
 // Generation loop
 // ============================================================
 
 std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& prompt_tokens,
-                                           int n_predict, bool greedy, float temperature,
+                                           int n_predict, const SamplingParams& params,
                                            const std::vector<int>& teacher_tokens,
                                            std::function<void(int)> on_token) {
+    if (n_predict < 0) n_predict = model.config.context_length;
     std::vector<int> output_tokens;
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
+    // Reset token counts for presence penalty
+    if (!params.greedy) {
+        reset_sampling();
+    }
+
     // Prefill: process all prompt tokens at once
     if (max_prefill > 0 && (int)prompt_tokens.size() <= max_prefill) {
-        int next = forward_prefill(model, prompt_tokens);
+        forward_prefill(model, prompt_tokens);
+        int next = sample(model.config, params);
         output_tokens.push_back(next);
     } else {
         // Fallback: sequential processing
         for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-            int next = forward(model, prompt_tokens[i]);
+            forward(model, prompt_tokens[i]);
             if (i == (int)prompt_tokens.size() - 1) {
+                int next = sample(model.config, params);
                 output_tokens.push_back(next);
             }
         }
@@ -3321,8 +3435,15 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
             input_token = output_tokens.back();
         }
 
-        int next = forward(model, input_token);
+        forward(model, input_token);
+        int next = sample(model.config, params);
         output_tokens.push_back(next);
+
+        // Update token counts for presence penalty
+        if (!params.greedy) {
+            h_token_counts[next]++;
+        }
+
         if (on_token) on_token(next);
 
         if (dump_logits) {
@@ -3350,7 +3471,8 @@ std::vector<int> InferenceState::generate(Model& model, const std::vector<int>& 
             fwrite(hl.data(), sizeof(float), model.config.n_vocab, logits_bin_fp);
         }
 
-        if (!teacher_forcing && next == (int)model.config.eos_token_id) break;
+        if (!teacher_forcing && (next == (int)model.config.eos_token_id ||
+                                  next == (int)model.config.eot_token_id)) break;
     }
     if (logits_bin_fp) fclose(logits_bin_fp);
 

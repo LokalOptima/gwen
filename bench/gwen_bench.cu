@@ -120,22 +120,24 @@ static std::string model_description(const std::string& path, const ModelConfig&
 struct BenchTest {
     int n_prompt;
     int n_gen;
+    bool sampling;  // true = run sampling after each forward()
     std::vector<double> samples_ns;
 
     std::string test_label() const {
         std::string label;
         if (n_prompt > 0) label += "pp" + std::to_string(n_prompt);
         if (n_prompt > 0 && n_gen > 0) label += "+";
-        if (n_gen > 0) label += "tg" + std::to_string(n_gen);
+        if (n_gen > 0) {
+            label += "tg" + std::to_string(n_gen);
+            if (sampling) label += "-sampled";
+        }
         return label;
     }
 
     int measured_tokens() const {
-        // pp measures prompt throughput, tg measures decode throughput
-        // When both are set, we report combined but that's unusual
         if (n_prompt > 0 && n_gen == 0) return n_prompt;
         if (n_prompt == 0 && n_gen > 0) return n_gen;
-        return n_prompt + n_gen;  // combined
+        return n_prompt + n_gen;
     }
 
     double mean_tps() const {
@@ -234,15 +236,20 @@ int main(int argc, char** argv) {
             BenchTest{n_prompt, n_gen, {}}.test_label().c_str(), reps);
 
     // ---- Build test list ----
-    // Like llama-bench: separate pp and tg tests
+    // Like llama-bench: separate pp and tg tests, plus sampled tg
     std::vector<BenchTest> tests;
     if (n_prompt > 0 && n_gen > 0) {
-        // Separate tests for pp and tg (like llama-bench default)
-        tests.push_back({n_prompt, 0, {}});
-        tests.push_back({0, n_gen, {}});
+        tests.push_back({n_prompt, 0, false, {}});
+        tests.push_back({0, n_gen, false, {}});
+        tests.push_back({0, n_gen, true, {}});
+    } else if (n_gen > 0) {
+        tests.push_back({n_prompt, n_gen, false, {}});
+        tests.push_back({n_prompt, n_gen, true, {}});
     } else {
-        tests.push_back({n_prompt, n_gen, {}});
+        tests.push_back({n_prompt, n_gen, false, {}});
     }
+
+    auto sampling = SamplingParams::qwen_default();
 
     // ---- Run benchmarks ----
     int n_vocab = model->config.n_vocab;
@@ -291,12 +298,18 @@ int main(int argc, char** argv) {
             }
 
             if (test.n_gen > 0) {
+                if (test.sampling) {
+                    state.reset_sampling();
+                }
                 int token = 151643;
                 for (int i = 0; i < test.n_gen; i++) {
                     state.forward(*model, token);
-                    token = std::rand() % n_vocab;
+                    if (test.sampling) {
+                        token = state.sample(model->config, sampling);
+                    } else {
+                        token = std::rand() % n_vocab;
+                    }
                 }
-                // forward() already synchronizes, but be explicit
                 GWEN_CHECK_CUDA(cudaDeviceSynchronize());
             }
 

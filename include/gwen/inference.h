@@ -5,6 +5,7 @@
 #include "gwen/memory.h"
 #include <cuda_runtime.h>
 #include <functional>
+#include <random>
 
 namespace gwen {
 
@@ -25,6 +26,20 @@ struct KVCache {
     int max_seq;
     int n_kv_heads;
     int head_dim;
+};
+
+// Sampling parameters
+struct SamplingParams {
+    float temperature = 0.7f;
+    float top_p = 0.8f;
+    int top_k = 20;
+    float presence_penalty = 1.5f;
+    bool greedy = false;
+
+    // Qwen3.5 recommended presets
+    static SamplingParams qwen_default()  { return {0.7f, 0.8f,  20, 1.5f, false}; }
+    static SamplingParams qwen_thinking() { return {1.0f, 0.95f, 20, 1.5f, false}; }
+    static SamplingParams greedy_mode()   { return {1.0f, 1.0f,   1, 0.0f, true}; }
 };
 
 // Complete inference state
@@ -72,6 +87,11 @@ struct InferenceState {
     int* d_argmax_token = nullptr;
     float* argmax_partial_max = nullptr; // [256] scratch for multi-block argmax
     int* argmax_partial_idx = nullptr;   // [256] scratch for multi-block argmax
+
+    // Sampling buffers (host-side — CPU sampling is faster than GPU for K=20)
+    std::vector<float> h_logits;       // [n_vocab] host logits copy
+    std::vector<int> h_token_counts;   // [n_vocab] presence count per token
+    std::mt19937 rng{std::random_device{}()};  // host-side RNG for sampling
     int* d_pos = nullptr;          // device-side position (for CUDA graph)
     int* d_token_id = nullptr;     // device-side token ID (for CUDA graph)
     int pos = 0;                   // current position in sequence
@@ -107,6 +127,9 @@ struct InferenceState {
     // Reset all recurrent state (DeltaNet S/conv, KV caches, position counters)
     void reset_state();
 
+    // Reset sampling state (token counts for presence penalty)
+    void reset_sampling() { std::fill(h_token_counts.begin(), h_token_counts.end(), 0); }
+
     // Extract hidden states for all tokens via prefill (resets state first)
     void extract_hidden(Model& model, const std::vector<int>& tokens, void* output_host);
 
@@ -119,12 +142,14 @@ struct InferenceState {
     // Process all prompt tokens at once (prefill), return last token's prediction
     int forward_prefill(Model& model, const std::vector<int>& tokens);
 
-    // Generate tokens (standard greedy)
+    // Sample a token from logits_f using the given sampling parameters
+    int sample(const ModelConfig& cfg, const SamplingParams& params);
+
+    // Generate tokens
     // teacher_tokens: if non-empty, feed these tokens as input instead of own predictions
-    //                 (for teacher-forced comparison against a reference engine)
     // on_token: if non-null, called with each generated token ID for streaming output
     std::vector<int> generate(Model& model, const std::vector<int>& prompt_tokens,
-                              int n_predict, bool greedy = true, float temperature = 1.0f,
+                              int n_predict, const SamplingParams& params = {},
                               const std::vector<int>& teacher_tokens = {},
                               std::function<void(int)> on_token = nullptr);
 };
