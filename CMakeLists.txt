@@ -38,7 +38,7 @@ if(GWEN_SOURCES)
     find_package(CUDAToolkit REQUIRED)
     add_library(gwen_core STATIC ${GWEN_SOURCES})
     target_include_directories(gwen_core PUBLIC include)
-    target_link_libraries(gwen_core CUDA::cublas)
+    # No external CUDA libs — only cudart (CUTLASS is header-only)
     set_target_properties(gwen_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 

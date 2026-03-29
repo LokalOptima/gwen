@@ -110,7 +110,7 @@ struct InferenceState {
     half* prefill_out = nullptr;     // [max_prefill, n_embed]
     half* prefill_norm = nullptr;    // [max_prefill, n_embed]
     void* mmq_scratch = nullptr;
-    void* cublas_handle = nullptr;
+    void* cutlass_workspace = nullptr;
     half* prefill_ffn_gate = nullptr;
     half* prefill_ffn_up = nullptr;
     half* prefill_ffn_out = nullptr;

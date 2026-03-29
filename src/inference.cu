@@ -3,13 +3,53 @@
 #include "gwen/ggml_quants.h"
 
 #include <cuda_fp8.h>  // __nv_fp8_e4m3 used in DeltaNet alpha/beta FP8 projections
-#include <cublas_v2.h>
+// CUTLASS 2.x FP16 GEMM (mma.sync tensor cores, SM_120 backward-compatible)
+#include "cutlass/gemm/device/gemm.h"
+#include "cutlass/numeric_types.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/threadblock/threadblock_swizzle.h"
 #include <cfloat>
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
 
 namespace gwen {
+
+// ============================================================
+// CUTLASS FP16 GEMM for prefill (replaces cuBLAS)
+// ============================================================
+// 64x64x32 tile, 4 stages, split-K serial, mma.sync m16n8k16
+// 80 registers (no spills), 33 KB smem per block
+using CutlassPrefillGemm = cutlass::gemm::device::Gemm<
+    cutlass::half_t, cutlass::layout::RowMajor,     // A = W [M,K] row-major
+    cutlass::half_t, cutlass::layout::ColumnMajor,   // B = X [K,N] col-major
+    cutlass::half_t, cutlass::layout::ColumnMajor,   // C = Y [M,N] col-major
+    float,                                            // Accumulator
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<32, 32, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<cutlass::half_t, 8, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    4, 8, 8, true>;
+
+static void cutlass_gemm_f16(const half* W, const half* X, half* Y,
+                              int M, int K, int N, void* workspace, cudaStream_t stream) {
+    using E = cutlass::half_t;
+    CutlassPrefillGemm gemm;
+    CutlassPrefillGemm::Arguments args(
+        {M, N, K},
+        {reinterpret_cast<const E*>(W), K},
+        {reinterpret_cast<const E*>(X), K},
+        {reinterpret_cast<E*>(Y), M},
+        {reinterpret_cast<E*>(Y), M},
+        {1.0f, 0.0f},
+        5  // split-K slices
+    );
+    gemm.initialize(args, workspace);
+    gemm.run(stream);
+}
 
 // ============================================================
 // DeltaNet decode kernel: state update + query (Delta Rule)
@@ -1990,8 +2030,10 @@ void InferenceState::allocate_prefill(const ModelConfig& cfg, CudaAllocator& all
                                 cfg.ssm_qkv_dim()});
     size_t scratch_size = gwen_gemm_mmq_scratch_size(max_K, max_tokens);
     mmq_scratch = a(scratch_size);
-    // cuBLAS handle for F16 GEMM
-    cublasCreate(reinterpret_cast<cublasHandle_t*>(&cublas_handle));
+    // CUTLASS split-K semaphore workspace: sizeof(int) * ceil(M/tile_M) * ceil(N/tile_N)
+    // tile_M=tile_N=64, split_K=5. Largest M is n_ff, N is max_tokens.
+    size_t cutlass_ws = sizeof(int) * ((cfg.n_ff + 63) / 64) * ((max_tokens + 63) / 64);
+    cutlass_workspace = a(cutlass_ws);
     // Flash attention F32 scratch buffer
     size_t fa_scratch_size = (size_t)max_tokens * cfg.n_head * cfg.head_dim * sizeof(float);
     prefill_fa_scratch = static_cast<float*>(a(fa_scratch_size));
@@ -2965,25 +3007,17 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     int* d_token_ids = d_prefill_tokens;
     GWEN_CHECK_CUDA(cudaMemcpyAsync(d_token_ids, tokens.data(), N * sizeof(int), cudaMemcpyHostToDevice, compute_stream));
 
-    // GEMM helper: routes to MMQ (K-quant) or cuBLAS (F16)
+    // GEMM helper: routes to MMQ (K-quant) or CUTLASS (F16)
     auto do_gemm = [&](const WeightRef& w, const half* X, half* Y) {
         int M = (int)w.shape[0];
         int K = (int)w.shape[1];
         if (is_kquant_type(w.type)) {
             gwen_gemm_mmq(w.device_data, w.type, X, Y, mmq_scratch, M, K, N, s);
         } else if (w.type == GGMLType::F16) {
-            // cuBLAS FP16 GEMM for IQ4_XS→F16 converted weights
-            // Y[M,N] = W[M,K] @ X[K,N] where X is [N,K] row-major (= [K,N] col-major)
-            cublasHandle_t handle = reinterpret_cast<cublasHandle_t>(cublas_handle);
-            cublasSetStream(handle, s);
-            __half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
-            cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                        M, N, K,
-                        &alpha_h,
-                        static_cast<const __half*>(w.device_data), K,  // W^T: [K,M] → [M,K] after transpose
-                        X, K,                                           // X: [K,N] col-major
-                        &beta_h,
-                        Y, M);                                          // Y: [M,N] col-major
+            // CUTLASS FP16 GEMM with tensor cores (mma.sync)
+            // Y[M,N] = W[M,K] @ X[K,N], W row-major, X col-major, Y col-major
+            cutlass_gemm_f16(static_cast<const half*>(w.device_data), X, Y,
+                             M, K, N, cutlass_workspace, s);
         } else {
             GWEN_CHECK(false, "Unsupported weight type for prefill GEMM");
         }
@@ -3246,8 +3280,11 @@ int InferenceState::forward_prefill(Model& model, const std::vector<int>& tokens
     gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
                       x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
-    // 4. LM Head GEMV on last token
-    gemv_dispatch(lm_head_weight(model), x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s);
+    // 4. LM Head GEMV on last token (dp4a path for K-quant weights)
+    const bool use_dp4a = is_kquant_type(lm_head_weight(model).type);
+    if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+    gemv_dispatch(lm_head_weight(model), x_norm, logits_h, cfg.n_vocab, cfg.n_embed, s,
+                  use_dp4a ? x_q8_a : nullptr);
 
     int logit_blocks = (cfg.n_vocab + 255) / 256;
     kernel_half_to_float<<<logit_blocks, 256, 0, s>>>(logits_h, logits_f, cfg.n_vocab);
