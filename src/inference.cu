@@ -2155,11 +2155,13 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             const auto& w = layer.deltanet;
             auto& state = deltanet_states[dn_state_idx++];
 
-            // RMSNorm: FP16 input → FP16 x_norm
-            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-            // Quantize x_norm to Q8_1 for dp4a GEMV path
-            if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // RMSNorm (+ fused Q8_1 quantize for dp4a path)
+            if (use_dp4a)
+                gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                                            x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            else
+                gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                                  x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             // QKV + gate projections
             gemv_dispatch(w.attn_qkv, x_norm, qkv, w.attn_qkv.shape[0], w.attn_qkv.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
@@ -2273,11 +2275,13 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             }
 #endif
 
-            // FFN: RMSNorm FP16→FP16, GEMV gate/up, SwiGLU, GEMV down
-            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-            // Quantize x_norm for FFN gate/up dp4a
-            if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // FFN: RMSNorm (+ fused Q8_1), GEMV gate/up, SwiGLU (+ fused Q8_1), GEMV down
+            if (use_dp4a)
+                gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                                            x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            else
+                gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                                  x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
 #ifdef GWEN_DEBUG
             if (layer_idx <= 1) {
@@ -2307,9 +2311,11 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             }
 #endif
 
-            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
-            // Quantize ffn_out for ffn_down dp4a
-            if (use_dp4a) gwen_quantize_q8_1(ffn_out, x_q8_a, cfg.n_ff, s);
+            // Fused SwiGLU + Q8_1 quantize (dp4a) or plain SwiGLU (fallback)
+            if (use_dp4a)
+                gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_a, cfg.n_ff, s);
+            else
+                gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
 
 #ifdef GWEN_DEBUG
             if (layer_idx <= 1) {
@@ -2330,10 +2336,13 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
             const auto& w = layer.full_attn;
             auto& cache = kv_caches[kv_cache_idx++];
 
-            gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-            // Quantize x_norm for Q/K/V dp4a
-            if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // RMSNorm (+ fused Q8_1 quantize for dp4a path)
+            if (use_dp4a)
+                gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                                            x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            else
+                gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(w.attn_norm.device_data),
+                                  x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             gemv_dispatch(w.attn_q, x_norm, qkv, w.attn_q.shape[0], w.attn_q.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
             {
@@ -2379,18 +2388,21 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
                           w.attn_output.shape[0], w.attn_output.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
 
-            // FFN
-            gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
-                              x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-            // Quantize x_norm for FFN dp4a
-            if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+            // FFN: RMSNorm (+ fused Q8_1), GEMV gate/up, SwiGLU (+ fused Q8_1), GEMV down
+            if (use_dp4a)
+                gwen_rmsnorm_quantize_q8_1(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                                            x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+            else
+                gwen_rmsnorm_f32w(buf_b, static_cast<const float*>(w.post_attn_norm.device_data),
+                                  x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
             gemv_dispatch(w.ffn_gate, x_norm, ffn_gate, w.ffn_gate.shape[0], w.ffn_gate.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
             gemv_dispatch(w.ffn_up, x_norm, ffn_up, w.ffn_up.shape[0], w.ffn_up.shape[1], s,
                           use_dp4a ? x_q8_a : nullptr);
-            gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
-            // Quantize ffn_out for ffn_down dp4a
-            if (use_dp4a) gwen_quantize_q8_1(ffn_out, x_q8_a, cfg.n_ff, s);
+            if (use_dp4a)
+                gwen_swiglu_quantize_q8_1(ffn_gate, ffn_up, x_q8_a, cfg.n_ff, s);
+            else
+                gwen_swiglu(ffn_gate, ffn_up, ffn_out, cfg.n_ff, s);
             // FFN down + FP16 residual: buf_a = ffn_down(ffn_out) + buf_b
             gemv_dispatch_residual(w.ffn_down, ffn_out, buf_a, buf_b,
                           w.ffn_down.shape[0], w.ffn_down.shape[1], s,
@@ -2412,10 +2424,12 @@ void InferenceState::forward_body(Model& model, cudaStream_t s) {
     }
 
     // 3. LM Head + argmax
-    gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
-                      x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
-    // Quantize x_norm for LM head dp4a
-    if (use_dp4a) gwen_quantize_q8_1(x_norm, x_q8_a, cfg.n_embed, s);
+    if (use_dp4a)
+        gwen_rmsnorm_quantize_q8_1(buf_a, static_cast<const float*>(model.output_norm.device_data),
+                                    x_q8_a, x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
+    else
+        gwen_rmsnorm_f32w(buf_a, static_cast<const float*>(model.output_norm.device_data),
+                          x_norm, cfg.n_embed, cfg.rms_norm_eps, s);
 
 #ifdef GWEN_DEBUG
     {

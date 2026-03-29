@@ -92,11 +92,12 @@ kernel_rmsnorm_batched_f32w(const half* __restrict__ x, const float* __restrict_
 // ============================================================
 // Fused RMSNorm + Q8_1 Quantize (+ optional FP16 copy)
 // ============================================================
-// 256 threads (8 warps). dim=1024 → 4 elements per thread for RMS, 4 Q8_1 blocks per warp.
-// Phase 1: All 256 threads compute sum-of-squares, cross-warp reduce via shared memory
+// Templated on NW (number of warps): NW=8 for dim≤1024, NW=32 for larger.
+// Phase 1: All threads compute sum-of-squares, cross-warp reduce via shared memory
 // Phase 2: Each warp handles Q8_1 blocks: apply norm+weight, find amax, quantize
-// Optionally writes FP16 output (needed by kernel_compute_gate_beta for DeltaNet pre-norm)
-__global__ void __launch_bounds__(256)
+// Optionally writes FP16 output (needed by downstream FP16 consumers)
+template<int NW>
+__global__ void __launch_bounds__(NW * 32)
 kernel_rmsnorm_quantize_q8_1(const half* __restrict__ x,
                               const float* __restrict__ weight,
                               block_q8_1* __restrict__ y_q8,
@@ -106,9 +107,9 @@ kernel_rmsnorm_quantize_q8_1(const half* __restrict__ x,
     int warp_id = tid / 32;
     int lane = tid % 32;
 
-    // Phase 1: sum of squares (each thread handles dim/256 elements)
+    // Phase 1: sum of squares
     float sum_sq = 0.0f;
-    for (int i = tid; i < dim; i += 256) {
+    for (int i = tid; i < dim; i += NW * 32) {
         float val = __half2float(x[i]);
         sum_sq += val * val;
     }
@@ -119,16 +120,16 @@ kernel_rmsnorm_quantize_q8_1(const half* __restrict__ x,
         sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
 
     // Cross-warp reduction via shared memory
-    __shared__ float warp_sums[8];
+    __shared__ float warp_sums[NW];
     if (lane == 0) warp_sums[warp_id] = sum_sq;
     __syncthreads();
 
-    // Warp 0 reduces
+    // Warp 0 reduces (NW ≤ 32, fits in one warp)
     if (warp_id == 0) {
-        sum_sq = (lane < 8) ? warp_sums[lane] : 0.0f;
+        sum_sq = (lane < NW) ? warp_sums[lane] : 0.0f;
         #pragma unroll
-        for (int offset = 4; offset > 0; offset >>= 1)
-            sum_sq += __shfl_xor_sync(0xFF, sum_sq, offset);
+        for (int offset = NW / 2; offset > 0; offset >>= 1)
+            sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, offset);
     }
 
     // Broadcast rms_inv to all threads
@@ -138,9 +139,8 @@ kernel_rmsnorm_quantize_q8_1(const half* __restrict__ x,
     float rms_inv = s_rms_inv;
 
     // Phase 2: Each warp processes Q8_1 blocks
-    // dim=1024 → 32 blocks, 8 warps → 4 blocks per warp
     int n_blocks = dim / 32;
-    int blocks_per_warp = (n_blocks + 7) / 8;
+    int blocks_per_warp = (n_blocks + NW - 1) / NW;
 
     for (int bi = 0; bi < blocks_per_warp; bi++) {
         int blk_idx = warp_id * blocks_per_warp + bi;
@@ -176,8 +176,12 @@ kernel_rmsnorm_quantize_q8_1(const half* __restrict__ x,
 
 void gwen_rmsnorm_quantize_q8_1(const half* x, const float* weight, void* y_q8, half* y_fp16,
                                   int dim, float eps, cudaStream_t stream) {
-    kernel_rmsnorm_quantize_q8_1<<<1, 256, 0, stream>>>(
-        x, weight, static_cast<block_q8_1*>(y_q8), y_fp16, dim, eps);
+    auto q8 = static_cast<block_q8_1*>(y_q8);
+    // Scale thread count with dim: 8 warps for dim≤1024, 32 warps for larger
+    if (dim <= 1024)
+        kernel_rmsnorm_quantize_q8_1<8><<<1, 256, 0, stream>>>(x, weight, q8, y_fp16, dim, eps);
+    else
+        kernel_rmsnorm_quantize_q8_1<32><<<1, 1024, 0, stream>>>(x, weight, q8, y_fp16, dim, eps);
     GWEN_CHECK_CUDA(cudaGetLastError());
 }
 
