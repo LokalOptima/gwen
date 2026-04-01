@@ -3,8 +3,7 @@
 # Usage: ./scripts/bench_mtp.sh [n_tokens] [runs_per_prompt]
 set -euo pipefail
 
-MODEL="${HOME}/models/gguf/Qwen3.5-0.8B-Base-Q4_K_M-patched.gguf"
-MTP="train/runs/mtp_v6_base_k4096/mtp_finetuned.bin"
+MODEL="$HOME/.cache/gwen/Qwen3.5-0.8B-Base-Q4_K_M.gguf"
 GWEN="./build/gwen"
 N=${1:-200}
 RUNS=${2:-3}
@@ -33,7 +32,7 @@ declare -a LABELS=(
 
 echo "================================================================"
 echo "  GWEN Speculative Decode Benchmark"
-echo "  Model: Qwen3.5-0.8B-Base-Q4_K_M-patched | MTP: K=4096 fine-tuned"
+echo "  Model: Qwen3.5-0.8B-Base-Q4_K_M | MTP: default"
 echo "  n_predict=$N, runs=$RUNS per prompt"
 echo "================================================================"
 echo ""
@@ -52,8 +51,8 @@ for i in "${!PROMPTS[@]}"; do
     # Baseline (average of $RUNS)
     base_sum=0
     for r in $(seq 1 $RUNS); do
-        tps=$(flock --shared /tmp/gpu.lock "$GWEN" --model "$MODEL" \
-              --prompt "$prompt" --n-predict "$N" --greedy --benchmark 2>&1 \
+        tps=$(flock --shared /tmp/gpu.lock "$GWEN" --model "$MODEL" --no-mtp \
+              "$prompt" --max-predict "$N" --greedy --benchmark 2>&1 \
               | grep -oP '"decode_tok_per_s": \K[0-9.]+')
         base_sum=$(echo "$base_sum + $tps" | bc)
     done
@@ -63,8 +62,8 @@ for i in "${!PROMPTS[@]}"; do
     mtp_sum=0
     accept=""
     for r in $(seq 1 $RUNS); do
-        out=$(flock --shared /tmp/gpu.lock "$GWEN" --model "$MODEL" --mtp "$MTP" \
-              --prompt "$prompt" --n-predict "$N" --greedy --benchmark 2>&1)
+        out=$(flock --shared /tmp/gpu.lock "$GWEN" --model "$MODEL" \
+              "$prompt" --max-predict "$N" --greedy --benchmark 2>&1)
         tps=$(echo "$out" | grep -oP '"decode_tok_per_s": \K[0-9.]+')
         mtp_sum=$(echo "$mtp_sum + $tps" | bc)
         [ -z "$accept" ] && accept=$(echo "$out" | grep -oP '[0-9.]+(?=% acceptance)') || true

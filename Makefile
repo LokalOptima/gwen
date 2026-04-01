@@ -5,7 +5,7 @@ N         ?= 100
 # ── Build ────────────────────────────────────────────────────────────
 BUILD_DIR := build
 
-.PHONY: all clean run bench info test
+.PHONY: all clean run bench bench-quick info test
 
 all: $(BUILD_DIR)/gwen
 
@@ -22,7 +22,10 @@ run: $(BUILD_DIR)/gwen
 
 # ── Benchmark ────────────────────────────────────────────────────────
 bench: $(BUILD_DIR)/gwen
-	$(BUILD_DIR)/gwen "$(PROMPT)" --max-predict $(N) --greedy --benchmark
+	./scripts/bench.sh
+
+bench-quick: $(BUILD_DIR)/gwen
+	./scripts/bench.sh --quick
 
 # ── Utility ──────────────────────────────────────────────────────────
 info: $(BUILD_DIR)/gwen

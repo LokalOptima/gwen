@@ -8,8 +8,8 @@
 set -euo pipefail
 
 GWEN="./build/gwen"
-LLAMA_BENCH="${HOME}/git/llama.cpp/build/bin/llama-bench"
-LLAMA_MODEL="${HOME}/models/gguf/Qwen3.5-0.8B-Base-Q4_K_M.gguf"
+LLAMA_BENCH="llama-bench"
+LLAMA_MODEL="$HOME/.cache/gwen/Qwen3.5-0.8B-Base-Q4_K_M.gguf"
 RUNS=5
 LENGTHS="128 256 512"
 GWEN_ONLY=false
