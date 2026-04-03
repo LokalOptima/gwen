@@ -1,6 +1,29 @@
 #include "concat.cuh"
 
 // contiguous kernels
+
+// Flat 1D kernel for dim0 concat — efficient when ne0 is small (avoids launching ne1*ne2 blocks with low utilization)
+static __global__ void concat_f32_dim0_flat(const float * x, const float * y, float * dst,
+                                            const int ne0, const int ne00, const int ne1, const int elems_per_slice) {
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= elems_per_slice) {
+        return;
+    }
+
+    const int i2 = blockIdx.y;
+    const int i1 = idx / ne0;
+    const int i0 = idx % ne0;
+
+    const int offset_dst = i2 * ne0 * ne1 + i1 * ne0 + i0;
+
+    if (i0 < ne00) {
+        dst[offset_dst] = x[i2 * ne00 * ne1 + i1 * ne00 + i0];
+    } else {
+        const int ne10 = ne0 - ne00;
+        dst[offset_dst] = y[i2 * ne10 * ne1 + i1 * ne10 + (i0 - ne00)];
+    }
+}
+
 static __global__ void concat_f32_dim0(const float * x, const float * y, float * dst, const int ne0, const int ne00) {
     int nidx = threadIdx.x + blockIdx.x * blockDim.x;
     if (nidx >= ne0) {
@@ -83,7 +106,16 @@ static void concat_f32_cuda(const float * x, const float * y, float * dst, int n
     int num_blocks = (ne0 + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
     dim3 gridDim(num_blocks, ne1, ne2);
     if (dim == 0) {
-        concat_f32_dim0<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne00);
+        // For small ne0, the standard grid (1, ne1, ne2) launches too many blocks with low utilization.
+        // Use a flat 1D grid instead: each thread handles one element across the ne0*ne1 plane.
+        if (ne0 <= CUDA_CONCAT_BLOCK_SIZE) {
+            const int elems_per_slice = ne0 * ne1;
+            const int num_blocks_flat = (elems_per_slice + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+            dim3 grid_flat(num_blocks_flat, ne2, 1);
+            concat_f32_dim0_flat<<<grid_flat, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne00, ne1, elems_per_slice);
+        } else {
+            concat_f32_dim0<<<gridDim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne0, ne00);
+        }
         return;
     }
     if (dim == 1) {
