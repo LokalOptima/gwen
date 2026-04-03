@@ -4,6 +4,12 @@
 
 llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
+
+    if (params.gtype == LLM_GRAPH_TYPE_MTP) {
+        build_mtp();
+        return;
+    }
+
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -71,6 +77,9 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
     cur = inpL;
+
+    // Save pre-norm hidden state for MTP
+    res->t_hidden_prenorm = cur;
 
     // Final norm
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -381,4 +390,159 @@ ggml_tensor * llm_build_qwen35::build_layer_ffn(ggml_tensor * cur, const int il)
     cb(cur, "ffn_out", il);
 
     return cur;
+}
+
+ggml_tensor * llm_build_qwen35::build_layer_attn_no_cache(
+        llm_graph_input_attn_no_cache * inp,
+        ggml_tensor *                   cur,
+        ggml_tensor *                   inp_pos,
+        int *                           sections,
+        int                             il) {
+    // Same as build_layer_attn but with no-cache attention
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    // Q+gate joint projection
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+    cb(Qcur_full, "Qcur_full", il);
+
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+    cb(Qcur, "Qcur_reshaped", il);
+
+    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Qcur, "Qcur_normed", il);
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    cb(Vcur, "Vcur", il);
+
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    cb(Kcur, "Kcur_normed", il);
+
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+        ggml_element_size(Qcur_full) * n_embd_head * 2,
+        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+        ggml_element_size(Qcur_full) * n_embd_head);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+    cb(gate, "gate_reshaped", il);
+
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+    // RoPE
+    Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+
+    cb(Qcur, "Qcur", il);
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
+
+    // No-cache attention
+    const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    cur = build_attn(inp, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    cb(cur, "attn_pregate", il);
+
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
+    cb(gate_sigmoid, "gate_sigmoid", il);
+
+    cur = ggml_mul(ctx0, cur, gate_sigmoid);
+    cb(cur, "attn_gated", il);
+
+    cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+    cb(cur, "attn_output", il);
+
+    return cur;
+}
+
+void llm_build_qwen35::build_mtp() {
+    const int mtp_il = hparams.n_layer; // MTP layer index (= 24 for Qwen3.5-0.8B)
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    // --- Inputs ---
+
+    // Token embedding (standard path)
+    ggml_tensor * tok_embd = build_inp_embd(model.tok_embd);
+    cb(tok_embd, "mtp.tok_embd", -1);
+
+    // Hidden state input (set externally before graph evaluation)
+    ggml_tensor * hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+    ggml_set_input(hidden);
+    ggml_set_name(hidden, "mtp_hidden_state");
+    // Store in t_hidden_prenorm so caller can find and fill it
+    res->t_hidden_prenorm = hidden;
+
+    // Position input (for RoPE in MTP attention)
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    // No-cache attention input (simple causal mask)
+    auto * inp_attn = build_attn_inp_no_cache();
+
+    // --- MTP forward pass ---
+
+    // RMSNorm both inputs
+    ggml_tensor * norm_embd = build_norm(tok_embd, model.layers[mtp_il].nextn.enorm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(norm_embd, "mtp.norm_embd", mtp_il);
+
+    ggml_tensor * norm_hidden = build_norm(hidden, model.layers[mtp_il].nextn.hnorm, nullptr, LLM_NORM_RMS, mtp_il);
+    cb(norm_hidden, "mtp.norm_hidden", mtp_il);
+
+    // Concat [norm_embd || norm_hidden] → [2*n_embd, n_tokens]
+    ggml_tensor * concat = ggml_concat(ctx0, norm_embd, norm_hidden, 0);
+    cb(concat, "mtp.concat", mtp_il);
+
+    // FC projection → [n_embd, n_tokens]
+    ggml_tensor * cur = build_lora_mm(model.layers[mtp_il].nextn.eh_proj, concat);
+    cb(cur, "mtp.fc_out", mtp_il);
+
+    // --- One full-attention layer + FFN ---
+    {
+        ggml_tensor * inpSA = cur;
+
+        cur = build_norm(cur, model.layers[mtp_il].attn_norm, nullptr, LLM_NORM_RMS, mtp_il);
+        cb(cur, "attn_norm", mtp_il);
+
+        ggml_build_forward_expand(gf, cur);
+
+        cur = build_layer_attn_no_cache(inp_attn, cur, inp_pos, sections, mtp_il);
+
+        // Residual
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, "attn_residual", mtp_il);
+
+        ggml_tensor * ffn_residual = cur;
+
+        ggml_tensor * attn_post_norm = build_norm(cur, model.layers[mtp_il].attn_post_norm, nullptr, LLM_NORM_RMS, mtp_il);
+        cb(attn_post_norm, "attn_post_norm", mtp_il);
+
+        cur = build_layer_ffn(attn_post_norm, mtp_il);
+        cb(cur, "ffn_out", mtp_il);
+
+        cur = ggml_add(ctx0, cur, ffn_residual);
+        cb(cur, "post_ffn", mtp_il);
+    }
+
+    // --- Output: shared head norm + LM head ---
+    cur = build_norm(cur, model.layers[mtp_il].nextn.shared_head_norm, nullptr, LLM_NORM_RMS, -1);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    // Shared LM head
+    cur = build_lora_mm(model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
 }

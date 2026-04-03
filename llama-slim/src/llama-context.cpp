@@ -405,6 +405,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
+    gf_res_mtp.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -1234,6 +1235,120 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+int llama_context::decode_mtp(llama_token token, llama_pos pos) {
+    const auto & hparams = model.hparams;
+    const auto & vocab   = model.vocab;
+    const int64_t n_embd  = hparams.n_embd;
+    const int64_t n_vocab = vocab.n_tokens();
+
+    if (hparams.nextn_predict_layers == 0) {
+        LLAMA_LOG_ERROR("%s: model has no MTP layers\n", __func__);
+        return -1;
+    }
+
+    // 1. Synchronize and read hidden state from previous decode's graph result
+    ggml_backend_sched_synchronize(sched.get());
+
+    auto * t_hidden_src = gf_res_prev->t_hidden_prenorm;
+    if (!t_hidden_src) {
+        LLAMA_LOG_ERROR("%s: no hidden state from previous decode\n", __func__);
+        return -1;
+    }
+
+    // Copy hidden state to CPU buffer
+    std::vector<float> hidden_buf(n_embd);
+    ggml_backend_tensor_get(t_hidden_src, hidden_buf.data(), 0, n_embd * sizeof(float));
+
+    // 2. Build a 1-token ubatch
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch.n_tokens = 1;
+    batch.token[0]    = token;
+    batch.pos[0]      = pos;
+    batch.n_seq_id[0] = 1;
+    batch.seq_id[0][0] = 0;
+    batch.logits[0]   = 1;
+
+    llama_ubatch ubatch;
+    ubatch.n_tokens     = 1;
+    ubatch.n_seq_tokens = 1;
+    ubatch.n_seqs       = 1;
+    ubatch.n_seqs_unq   = 1;
+    ubatch.token        = batch.token;
+    ubatch.embd         = nullptr;
+    ubatch.pos          = batch.pos;
+    ubatch.n_seq_id     = batch.n_seq_id;
+    ubatch.seq_id       = batch.seq_id;
+    ubatch.seq_id_unq   = batch.seq_id[0];
+    ubatch.output       = batch.logits;
+
+    int32_t seq_idx[LLAMA_MAX_SEQ] = {};
+    ubatch.seq_idx = seq_idx;
+
+    // 3. Build/reuse MTP graph (uses gf_res_mtp, separate from gf_res_prev)
+    auto * res = gf_res_mtp.get();
+
+    n_outputs = 1;
+
+    const auto gparams = graph_params(res, ubatch, nullptr, LLM_GRAPH_TYPE_MTP);
+
+    // MTP graph uses its own result, but shares the backend scheduler.
+    // Need to reset scheduler since we're switching from main graph to MTP graph.
+    res->reset();
+    ggml_backend_sched_reset(sched.get());
+
+    auto * gf = model.build_graph(gparams);
+    if (!gf) {
+        LLAMA_LOG_ERROR("%s: failed to build MTP graph\n", __func__);
+        llama_batch_free(batch);
+        return -1;
+    }
+
+    if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        LLAMA_LOG_ERROR("%s: failed to allocate MTP graph\n", __func__);
+        llama_batch_free(batch);
+        return -1;
+    }
+
+    // 4. Set inputs: token, position, attention mask
+    res->set_inputs(&ubatch);
+
+    // 5. Set the hidden state input
+    // The MTP graph builder stores the hidden input tensor in res->t_hidden_prenorm
+    if (res->t_hidden_prenorm) {
+        ggml_backend_tensor_set(res->t_hidden_prenorm, hidden_buf.data(), 0, n_embd * sizeof(float));
+    }
+
+    // 6. Compute
+    const auto status = graph_compute(gf, false);
+    if (status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: MTP graph compute failed\n", __func__);
+        llama_batch_free(batch);
+        return -1;
+    }
+
+    // 7. Extract logits to the output buffer
+    auto * t_logits = res->get_logits();
+    if (t_logits && logits.data) {
+        if (output_reserve(1) < 1) {
+            LLAMA_LOG_ERROR("%s: could not reserve output buffer\n", __func__);
+            llama_batch_free(batch);
+            return -1;
+        }
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_vocab * sizeof(float));
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
+    n_outputs = 1;
+
+    // Reset scheduler back so the next main decode can rebuild its graph
+    // (the scheduler was reset for MTP, invalidating the main graph)
+    gf_res_prev->reset();
+
+    llama_batch_free(batch);
+    return 0;
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -3438,6 +3553,13 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_mtp(
+        llama_context * ctx,
+          llama_token   token,
+            llama_pos   pos) {
+    return ctx->decode_mtp(token, pos);
 }
 
 //

@@ -943,6 +943,16 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Run MTP (Multi-Token Prediction) draft head using the hidden state from the last llama_decode() call.
+    // Produces draft logits accessible via llama_get_logits().
+    // token: the accepted token sampled from the last decode's logits
+    // pos: the position for this MTP computation
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_decode_mtp(
+            struct llama_context * ctx,
+                   llama_token     token,
+                   llama_pos       pos);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

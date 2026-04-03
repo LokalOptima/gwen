@@ -529,6 +529,14 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     }
                 }
 
+                // Set hparams for MTP layers (same architecture as full-attention layers)
+                for (uint32_t i = hparams.n_layer; i < hparams.n_layer + hparams.nextn_predict_layers; ++i) {
+                    hparams.n_head_arr[i]          = hparams.n_head_arr[0];
+                    hparams.n_head_kv_arr[i]       = hparams.n_head_kv_arr[0];
+                    hparams.n_ff_arr[i]            = hparams.n_ff_arr[0];
+                    hparams.recurrent_layer_arr[i] = false;  // MTP layers are always full attention
+                }
+
                 switch (hparams.n_layer) {
                     case 24: type = hparams.n_embd == 1024 ? LLM_TYPE_0_8B : LLM_TYPE_2B; break;
                     case 32: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_9B; break;
@@ -1467,17 +1475,19 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             GGML_ABORT("fatal error");
     }
 
-    // add on pooling layer
-    llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
+    if (params.gtype != LLM_GRAPH_TYPE_MTP) {
+        // add on pooling layer
+        llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
-    // add backend sampling layers (if any)
-    llm->build_sampling();
+        // add backend sampling layers (if any)
+        llm->build_sampling();
 
-    // if the gguf model was converted with --sentence-transformers-dense-modules
-    // there will be two additional dense projection layers
-    // dense linear projections are applied after pooling
-    // TODO: move reranking logic here and generalize
-    llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+        // if the gguf model was converted with --sentence-transformers-dense-modules
+        // there will be two additional dense projection layers
+        // dense linear projections are applied after pooling
+        // TODO: move reranking logic here and generalize
+        llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+    }
 
     llm->res->set_outputs();
 

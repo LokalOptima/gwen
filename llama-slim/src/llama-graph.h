@@ -31,6 +31,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    LLM_GRAPH_TYPE_MTP,
 };
 
 enum llm_ffn_op_type {
@@ -656,11 +657,12 @@ public:
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
-    ggml_tensor * t_inp_tokens  = nullptr;
-    ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
-    ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_embd        = nullptr;
-    ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_inp_tokens     = nullptr;
+    ggml_tensor * t_inp_embd       = nullptr; // [n_embd_inp, n_tokens]
+    ggml_tensor * t_logits         = nullptr;
+    ggml_tensor * t_embd           = nullptr;
+    ggml_tensor * t_embd_pooled    = nullptr;
+    ggml_tensor * t_hidden_prenorm = nullptr; // [n_embd, n_outputs] pre-output-norm hidden state (for MTP)
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

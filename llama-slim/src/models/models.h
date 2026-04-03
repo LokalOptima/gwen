@@ -63,8 +63,17 @@ struct llm_build_delta_net_base : public llm_graph_context {
 struct llm_build_qwen35 : public llm_build_delta_net_base {
     llm_build_qwen35(const llama_model & model, const llm_graph_params & params);
 private:
+    void build_mtp();
+
     ggml_tensor * build_layer_attn(
     llm_graph_input_attn_kv * inp_attn,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                        int * sections,
+                        int   il);
+
+    ggml_tensor * build_layer_attn_no_cache(
+    llm_graph_input_attn_no_cache * inp_attn,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                         int * sections,

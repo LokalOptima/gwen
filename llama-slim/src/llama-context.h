@@ -129,6 +129,13 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    // Evaluate MTP draft head using the hidden state from the last decode() call.
+    // token: the accepted token sampled from the last decode's logits
+    // pos: the position for this MTP computation
+    // After this call, llama_get_logits(ctx) contains the draft logits.
+    // Returns 0 on success, negative on error.
+    int decode_mtp(llama_token token, llama_pos pos);
+
     //
     // state save/load
     //
@@ -333,6 +340,7 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_mtp;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)
