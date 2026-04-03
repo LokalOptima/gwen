@@ -732,11 +732,14 @@ int64_t llm_graph_result::get_max_nodes() const {
 }
 
 void llm_graph_result::reset() {
-    t_inp_tokens  = nullptr;
-    t_inp_embd    = nullptr;
-    t_logits      = nullptr;
-    t_embd        = nullptr;
-    t_embd_pooled = nullptr;
+    t_inp_tokens     = nullptr;
+    t_inp_embd       = nullptr;
+    t_logits         = nullptr;
+    t_embd           = nullptr;
+    t_embd_pooled    = nullptr;
+    t_hidden_prenorm = nullptr;
+    t_mtp_argmax     = nullptr;
+    t_verify_argmax  = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -774,6 +777,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_verify_argmax != nullptr) {
+        ggml_set_output(t_verify_argmax);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -1947,28 +1953,43 @@ void llm_graph_input_mtp_kv::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask) {
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
         float * data = (float *) self_kq_mask->data;
-        // All positions unmasked (n_kv = mtp_kv_pos + 1, so all are valid)
-        for (int i = 0; i < n_kv; i++) {
+        // Fixed-size mask: unmask filled positions [0..mtp_kv_pos], mask the rest to -inf
+        for (int i = 0; i <= mtp_kv_pos; i++) {
             data[i] = 0.0f;
         }
+        for (int i = mtp_kv_pos + 1; i < n_kv; i++) {
+            data[i] = -INFINITY;
+        }
+    }
+
+    if (write_idx) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(write_idx->buffer));
+        int64_t * data = (int64_t *) write_idx->data;
+        data[0] = mtp_kv_pos;
     }
 }
 
 bool llm_graph_input_mtp_kv::can_reuse(const llm_graph_params & params) {
-    // Dynamic n_kv changes every call (= mtp_kv_pos + 1), so graph topology changes.
-    // Cannot reuse.
-    GGML_UNUSED(params);
-    return false;
+    // Fixed topology: n_kv never changes. Only mtp_kv_pos changes (updated here for set_input).
+    if (n_kv != params.mtp_n_kv) {
+        return false;
+    }
+    mtp_kv_pos = params.mtp_kv_pos;
+    return true;
 }
 
 llm_graph_input_mtp_kv * llm_graph_context::build_attn_inp_mtp_kv() const {
-    const int32_t n_kv = mtp_kv_pos + 1;
-    auto inp = std::make_unique<llm_graph_input_mtp_kv>(hparams, cparams, n_kv, mtp_kv_pos);
+    // Use fixed n_kv (= mtp_n_kv) so graph topology is constant across calls.
+    auto inp = std::make_unique<llm_graph_input_mtp_kv>(hparams, cparams, mtp_n_kv, mtp_kv_pos);
 
-    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, 1, 1);
+    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, mtp_n_kv, 1, 1, 1);
     ggml_set_input(inp->self_kq_mask);
 
     inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+
+    // Write index for ggml_set_rows (runtime KV cache write position)
+    inp->write_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, 1);
+    ggml_set_input(inp->write_idx);
 
     return (llm_graph_input_mtp_kv *) res->add_input(std::move(inp));
 }

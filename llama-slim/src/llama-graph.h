@@ -282,7 +282,9 @@ public:
     const llama_cparams cparams;
 };
 
-// MTP KV cache attention input: simple causal mask for MTP's own KV cache
+// MTP KV cache attention input: fixed-topology mask + write index for MTP's own KV cache.
+// Uses fixed n_kv (= mtp_n_kv from params) so graph topology never changes, enabling reuse.
+// Unused KV positions are masked to -inf; write position is a runtime I64 input tensor.
 class llm_graph_input_mtp_kv : public llm_graph_input_i {
 public:
     llm_graph_input_mtp_kv(
@@ -304,12 +306,12 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, 1, 1, 1]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, 1, 1, 1]
-    ggml_tensor * write_idx        = nullptr; // I64 [1] — KV cache write position
+    ggml_tensor * write_idx        = nullptr; // I64 [1] — KV cache write position (runtime)
 
     const llama_hparams hparams;
     const llama_cparams cparams;
-    int32_t n_kv;       // fixed graph topology size (= n_ctx)
-    int32_t mtp_kv_pos; // runtime: current write position
+    int32_t n_kv;       // fixed graph topology size (= mtp_n_kv)
+    int32_t mtp_kv_pos; // runtime: current write position (updated in can_reuse)
 };
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
@@ -700,6 +702,8 @@ public:
     ggml_tensor * t_embd           = nullptr;
     ggml_tensor * t_embd_pooled    = nullptr;
     ggml_tensor * t_hidden_prenorm = nullptr; // [n_embd, n_outputs] pre-output-norm hidden state (for MTP)
+    ggml_tensor * t_mtp_argmax    = nullptr; // [1] I32 — GPU-side argmax of MTP logits
+    ggml_tensor * t_verify_argmax = nullptr; // [n_outputs] I32 — GPU-side argmax of main model logits
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;

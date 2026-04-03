@@ -956,6 +956,15 @@ extern "C" {
                    llama_token     token,
                    llama_pos       pos);
 
+    // Get the GPU-side argmax result from the last decode_mtp call.
+    // Returns the token ID (greedy draft), or -1 if not available.
+    LLAMA_API llama_token llama_mtp_get_argmax(struct llama_context * ctx);
+
+    // Argmax-only mode: decode() extracts GPU-computed argmax (n_outputs × 4 bytes)
+    // instead of full logits (n_outputs × n_vocab × 4 bytes). Use llama_get_argmax_ith().
+    LLAMA_API void llama_set_argmax_only(struct llama_context * ctx, bool v);
+    LLAMA_API llama_token llama_get_argmax_ith(struct llama_context * ctx, int32_t i);
+
     // Save/restore recurrent state snapshot for MTP speculation rollback.
     // Replaces seq_cp/seq_rm to avoid destabilizing the recurrent state head,
     // which enables graph reuse for the verify decode.

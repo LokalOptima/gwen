@@ -300,7 +300,9 @@ llama_context::llama_context(
         const uint32_t mtp_il = hparams.n_layer;
         const uint32_t n_embd_k_gqa_mtp = hparams.n_embd_k_gqa(mtp_il);
         const uint32_t n_embd_v_gqa_mtp = hparams.n_embd_v_gqa(mtp_il);
-        const uint32_t n_ctx_mtp = cparams.n_ctx;
+        // MTP KV cache doesn't need to be as large as the main context.
+        // Cap at 1024 — MTP only caches tokens from current generation.
+        const uint32_t n_ctx_mtp = std::min(cparams.n_ctx, (uint32_t)1024);
 
         // KV cache: 2 tensors (K + V)
         // Hidden state: 1 tensor (persistent GPU buffer for hidden state transfer)
@@ -945,6 +947,13 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+llama_token llama_context::get_argmax_ith(int32_t i) const {
+    if (i < 0 || i >= (int32_t)last_argmax.size()) {
+        return -1;
+    }
+    return last_argmax[i];
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1366,7 +1375,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 int llama_context::decode_mtp(llama_token token, llama_pos pos) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
-    const int64_t n_embd  = hparams.n_embd;
     const int64_t n_vocab = vocab.n_tokens();
 
     if (hparams.nextn_predict_layers == 0) {
@@ -1378,9 +1386,10 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
     auto * mtp_sched_ptr = mtp_sched ? mtp_sched.get() : sched.get();
     const bool use_separate_sched = (mtp_sched != nullptr);
 
-    // 1. Synchronize main graph and copy hidden state GPU→GPU
-    ggml_backend_sched_synchronize(sched.get());
-
+    // Copy hidden state from main graph to MTP's persistent tensor.
+    // The caller must have synced the main scheduler before calling decode_mtp
+    // (e.g., via llama_get_argmax_ith which calls synchronize()).
+    // No explicit sched sync needed here — just the 4KB GPU→CPU→GPU copy (~2μs).
     auto * t_hidden_src = gf_res_prev->t_hidden_prenorm;
     if (!t_hidden_src) {
         LLAMA_LOG_ERROR("%s: no hidden state from previous decode\n", __func__);
@@ -1388,12 +1397,10 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
     }
 
     if (mtp_hidden_state) {
-        // Copy the last hidden state (last token in batch) to persistent GPU tensor.
-        // t_hidden_src is [n_embd, n_tokens] — we need the last row.
+        const int64_t n_embd = hparams.n_embd;
         const int64_t n_tokens_src = t_hidden_src->ne[1];
         const size_t offset = (n_tokens_src - 1) * t_hidden_src->nb[1];
         const size_t row_bytes = n_embd * sizeof(float);
-        // GPU→CPU→GPU for 4KB — negligible vs scheduler/graph overhead savings
         std::vector<float> hidden_buf(n_embd);
         ggml_backend_tensor_get(t_hidden_src, hidden_buf.data(), offset, row_bytes);
         ggml_backend_tensor_set(mtp_hidden_state, hidden_buf.data(), 0, row_bytes);
@@ -1409,10 +1416,13 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
     batch.logits[0]   = 1;
 
     llama_ubatch ubatch;
+    memset(&ubatch, 0, sizeof(ubatch));
+    ubatch.b_equal_seqs = 0; // disable equal_seqs to skip data ownership check in allow_reuse
     ubatch.n_tokens     = 1;
     ubatch.n_seq_tokens = 1;
     ubatch.n_seqs       = 1;
     ubatch.n_seqs_unq   = 1;
+    ubatch.n_pos        = 1;
     ubatch.token        = batch.token;
     ubatch.embd         = nullptr;
     ubatch.pos          = batch.pos;
@@ -1450,7 +1460,7 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
         /*.mtp_v_cache      =*/ mtp_v_cache,
         /*.mtp_hidden_state =*/ mtp_hidden_state,
         /*.mtp_kv_pos       =*/ mtp_kv_pos,
-        /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)cparams.n_ctx : 0,
+        /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)mtp_k_cache->ne[1] : 0,
     };
 
     auto * gf = res->get_gf();
@@ -1479,8 +1489,9 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
     // 4. Set inputs: token, position, attention mask, KV write index
     res->set_inputs(&ubatch);
 
-    // 5. Set hidden state (fallback path for when persistent tensor is not available)
+    // Set hidden state (fallback path for when persistent tensor is not available)
     if (!mtp_hidden_state && res->t_hidden_prenorm) {
+        const int64_t n_embd = hparams.n_embd;
         std::vector<float> hidden_buf(n_embd);
         ggml_backend_tensor_get(t_hidden_src, hidden_buf.data(), 0, n_embd * sizeof(float));
         ggml_backend_tensor_set(res->t_hidden_prenorm, hidden_buf.data(), 0, n_embd * sizeof(float));
@@ -1507,26 +1518,36 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
             return -1;
         }
     }
-
-    // 7. Extract logits to the output buffer
-    auto * t_logits = res->get_logits();
-    if (t_logits && logits.data) {
-        if (output_reserve(1) < 1) {
-            LLAMA_LOG_ERROR("%s: could not reserve output buffer\n", __func__);
-            llama_batch_free(batch);
-            return -1;
-        }
-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(mtp_sched_ptr, t_logits);
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_vocab * sizeof(float));
+    // 7. Extract argmax result (4 bytes) instead of full logits (1MB)
+    auto * t_argmax = res->t_mtp_argmax;
+    if (t_argmax) {
+        int32_t argmax_result = -1;
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(mtp_sched_ptr, t_argmax);
+        ggml_backend_tensor_get_async(backend_res, t_argmax, &argmax_result, 0, sizeof(int32_t));
         ggml_backend_sched_synchronize(mtp_sched_ptr);
+        mtp_last_argmax = argmax_result;
+    } else {
+        // Fallback: extract full logits (legacy path)
+        auto * t_logits = res->get_logits();
+        if (t_logits && logits.data) {
+            if (output_reserve(1) < 1) {
+                LLAMA_LOG_ERROR("%s: could not reserve output buffer\n", __func__);
+                llama_batch_free(batch);
+                return -1;
+            }
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(mtp_sched_ptr, t_logits);
+            ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_vocab * sizeof(float));
+            ggml_backend_sched_synchronize(mtp_sched_ptr);
+            mtp_last_argmax = -1; // signal caller to use logits
+        }
     }
-
     n_outputs = 1;
 
     // Advance MTP KV cache position
     if (mtp_k_cache) {
         mtp_kv_pos++;
     }
+
 
     // NOTE: No gf_res_prev->reset() — main graph stays valid for reuse!
     // This is the key optimization: separate scheduler means MTP doesn't invalidate main graph.
@@ -2165,8 +2186,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
-        // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        // extract logits (or argmax only)
+        if (argmax_only && res->t_verify_argmax && n_outputs > 0) {
+            // Fast path: extract GPU-computed argmax (n_outputs × 4 bytes) instead of full logits (n_outputs × n_vocab × 4 bytes)
+            last_argmax.resize(n_outputs_prev + n_outputs);
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_verify_argmax);
+            GGML_ASSERT(backend_res != nullptr);
+            ggml_backend_tensor_get_async(backend_res, res->t_verify_argmax, last_argmax.data() + n_outputs_prev, 0, n_outputs * sizeof(int32_t));
+        } else if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -2601,7 +2628,7 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_v_cache      =*/ mtp_v_cache,
         /*.mtp_hidden_state =*/ mtp_hidden_state,
         /*.mtp_kv_pos       =*/ mtp_kv_pos,
-        /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)cparams.n_ctx : 0,
+        /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)mtp_k_cache->ne[1] : 0,
     };
 }
 
@@ -3885,6 +3912,19 @@ int32_t llama_decode_mtp(
           llama_token   token,
             llama_pos   pos) {
     return ctx->decode_mtp(token, pos);
+}
+
+llama_token llama_mtp_get_argmax(llama_context * ctx) {
+    return ctx->get_mtp_argmax();
+}
+
+void llama_set_argmax_only(llama_context * ctx, bool v) {
+    ctx->set_argmax_only(v);
+}
+
+llama_token llama_get_argmax_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_argmax_ith(i);
 }
 
 int32_t llama_mtp_snapshot_save(llama_context * ctx) {

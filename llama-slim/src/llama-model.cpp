@@ -639,8 +639,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // For MTP models, tok_embd must be on GPU so the MTP graph stays on a single backend,
+    // enabling CUDA graph capture. The 199 MiB embedding table fits easily.
+    if (hparams.nextn_predict_layers > 0) {
+        pimpl->dev_input = get_layer_buft_list(0);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     const uint32_t n_layer_total = n_layer + hparams.nextn_predict_layers;

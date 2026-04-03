@@ -54,11 +54,15 @@ static void generate_mtp(
 
     if (llama_vocab_is_eog(vocab, accepted) || n_remain <= 0) return;
 
-    // Get first MTP draft
+    // Get first MTP draft (GPU-side argmax avoids 1MB logits transfer)
     llama_token draft = -1;
     if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-        draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+        draft = llama_mtp_get_argmax(ctx);
     }
+
+    // Enable argmax-only mode: decode() extracts GPU-computed argmax (8 bytes)
+    // instead of transferring full logits (2MB) per cycle.
+    llama_set_argmax_only(ctx, true);
 
     while (n_remain > 0) {
         if (llama_vocab_is_eog(vocab, accepted)) break;
@@ -70,14 +74,14 @@ static void generate_mtp(
             llama_decode(ctx, batch);
             llama_batch_free(batch);
 
-            accepted = greedy_argmax(llama_get_logits(ctx), n_vocab);
+            accepted = llama_get_argmax_ith(ctx, 0);
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
             --n_remain;
 
             if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-                draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+                draft = llama_mtp_get_argmax(ctx);
             } else {
                 draft = -1;
             }
@@ -95,14 +99,15 @@ static void generate_mtp(
         llama_decode(ctx, batch);
         llama_batch_free(batch);
 
-        const llama_token pred = greedy_argmax(llama_get_logits_ith(ctx, 0), n_vocab);
+        // GPU-side argmax: 8 bytes instead of 2MB logits transfer
+        const llama_token pred = llama_get_argmax_ith(ctx, 0);
 
         if (pred == draft) {
             // ACCEPT — snapshot is simply discarded
             mtp_accepted++;
             n_past += 2;
 
-            const llama_token pred_after_draft = greedy_argmax(llama_get_logits_ith(ctx, 1), n_vocab);
+            const llama_token pred_after_draft = llama_get_argmax_ith(ctx, 1);
 
             common_sampler_accept(smpl, accepted, true);
             common_sampler_accept(smpl, draft, true);
@@ -119,7 +124,7 @@ static void generate_mtp(
 
             accepted = pred_after_draft;
             if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-                draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+                draft = llama_mtp_get_argmax(ctx);
             } else {
                 draft = -1;
             }
@@ -146,12 +151,15 @@ static void generate_mtp(
             --n_remain;
 
             if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-                draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+                draft = llama_mtp_get_argmax(ctx);
             } else {
                 draft = -1;
             }
         }
     }
+
+    // Restore normal logits extraction for non-MTP callers
+    llama_set_argmax_only(ctx, false);
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -691,9 +699,6 @@ int main(int argc, char ** argv) {
 
     // MTP speculative decode state
     const bool use_mtp = llama_model_has_mtp(model) && !params.interactive;
-    const int n_vocab = llama_vocab_n_tokens(vocab);
-    llama_token mtp_draft = -1;          // pending draft from MTP
-    llama_token mtp_next_accepted = -1;  // carried-forward prediction (logits overwritten by decode_mtp)
     int mtp_accepted = 0;
     int mtp_rejected = 0;
     bool mtp_skip_decode = false;

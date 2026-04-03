@@ -143,6 +143,14 @@ struct llama_context {
     int mtp_snapshot_save();
     int mtp_snapshot_restore();
 
+    // GPU-side argmax result from the last decode_mtp call
+    llama_token get_mtp_argmax() const { return mtp_last_argmax; }
+
+    // GPU-side argmax from the last decode() call (main model).
+    // When argmax_only mode is active, decode() extracts argmax instead of full logits.
+    void set_argmax_only(bool v) { argmax_only = v; }
+    llama_token get_argmax_ith(int32_t i) const;
+
     //
     // state save/load
     //
@@ -356,6 +364,11 @@ private:
     ggml_tensor *           mtp_k_cache = nullptr;  // [n_embd_k_gqa, n_ctx] F16
     ggml_tensor *           mtp_v_cache = nullptr;  // [n_embd_v_gqa, n_ctx] F16
     int32_t                 mtp_kv_pos  = 0;        // next write position
+    int32_t                 mtp_last_argmax = -1;   // GPU-side argmax result from last decode_mtp
+
+    // argmax-only mode: when true, decode() extracts GPU argmax (8-12 bytes) instead of full logits (2MB)
+    bool                    argmax_only = false;
+    std::vector<int32_t>    last_argmax;            // [n_outputs] I32 from last decode() with argmax_only
 
     // MTP scheduling (separate scheduler to avoid invalidating main graph)
     ggml_backend_sched_ptr  mtp_sched;

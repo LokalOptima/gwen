@@ -93,7 +93,16 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    // GPU-side argmax: avoids transferring 248K×4B×n_outputs logits to CPU.
+    // Only added when MTP layers exist (speculation loop only needs argmax, not full logits).
+    if (hparams.nextn_predict_layers > 0) {
+        ggml_tensor * argmax = ggml_argmax(ctx0, cur);
+        ggml_set_name(argmax, "verify_argmax");
+        res->t_verify_argmax = argmax;
+        ggml_build_forward_expand(gf, argmax);
+    } else {
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_qkvz(
@@ -474,8 +483,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_mtp(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // Dynamic n_kv: only attend to filled positions (efficient for small generation lengths)
-    const int32_t n_kv = mtp_kv_pos + 1;
+    // Fixed n_kv for stable graph topology; unused positions masked to -inf
+    const int32_t n_kv = mtp_n_kv;
 
     // Q+gate joint projection
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
@@ -525,26 +534,19 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_mtp(
     ggml_build_forward_expand(gf, Kcur);
     ggml_build_forward_expand(gf, Vcur);
 
-    // --- Write K/V to persistent MTP cache at mtp_kv_pos ---
+    // --- Write K/V to MTP cache via ggml_set_rows (runtime write position) ---
     {
+        ggml_tensor * write_idx = inp_mtp_kv->get_write_idx();
+
         ggml_tensor * K_2d = ggml_reshape_2d(ctx0, Kcur, n_embd_k_gqa, 1);
         ggml_tensor * V_2d = ggml_reshape_2d(ctx0, Vcur, n_embd_v_gqa, 1);
 
-        ggml_tensor * k_slot = ggml_view_2d(ctx0, mtp_k_cache,
-            n_embd_k_gqa, 1,
-            mtp_k_cache->nb[1],
-            mtp_kv_pos * mtp_k_cache->nb[1]);
-
-        ggml_tensor * v_slot = ggml_view_2d(ctx0, mtp_v_cache,
-            n_embd_v_gqa, 1,
-            mtp_v_cache->nb[1],
-            mtp_kv_pos * mtp_v_cache->nb[1]);
-
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, K_2d, k_slot));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, V_2d, v_slot));
+        // set_rows: dst[write_idx[0]] = src[0]  (scatter single row)
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, mtp_k_cache, K_2d, write_idx));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, mtp_v_cache, V_2d, write_idx));
     }
 
-    // --- Read K/V cache [n_embd_head, n_head_kv, n_kv] ---
+    // --- Read full K/V cache [n_embd_head, n_head_kv, n_kv] (fixed size) ---
     ggml_tensor * K_full = ggml_view_3d(ctx0, mtp_k_cache,
         n_embd_head, n_head_kv, n_kv,
         n_embd_head * ggml_element_size(mtp_k_cache),
@@ -557,7 +559,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_mtp(
         mtp_v_cache->nb[1],
         0);
 
-    // Attention with MTP KV cache mask
+    // Attention with MTP KV cache mask (unused positions masked to -inf)
     const auto & kq_mask = inp_mtp_kv->get_kq_mask();
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -675,5 +677,12 @@ void llm_build_qwen35::build_mtp() {
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
-    ggml_build_forward_expand(gf, cur);
+    // GPU-side argmax: avoids transferring 248K×4B logits to CPU.
+    // Result is I32 [1] — just the token index.
+    ggml_tensor * argmax = ggml_argmax(ctx0, cur);
+    ggml_set_name(argmax, "mtp_argmax");
+    ggml_set_output(argmax);
+    res->t_mtp_argmax = argmax;
+
+    ggml_build_forward_expand(gf, argmax);
 }

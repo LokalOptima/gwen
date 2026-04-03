@@ -1,6 +1,46 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "vendors/cuda.h"
+
+// Q6_K get_rows kernel: dequantize selected rows entirely on GPU.
+// Grid: (n_superblocks_per_row, n_requested_rows, 1), Block: (64, 1, 1)
+// Each block dequantizes one QK_K=256 superblock from the selected row.
+template<typename dst_t>
+static __global__ void k_get_rows_q6_K(
+        const block_q6_K * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const size_t nb01, const size_t nb1, const int64_t ne12,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    const int sb    = blockIdx.x; // superblock index within row
+    const int i_row = blockIdx.y; // which requested row
+
+    // Decode row request index (supports batched get_rows)
+    const int i10 = i_row;  // simplified: no ne11/ne12 decomposition needed for embedding lookup
+    const int row_idx = src1[i10 * s10];
+
+    // Source: row row_idx, superblock sb
+    const block_q6_K * x = (const block_q6_K *)((const char *)src0 + (size_t)row_idx * nb01) + sb;
+
+    // Destination: row i_row, offset sb*QK_K
+    dst_t * y = (dst_t *)((char *)dst + (size_t)i_row * nb1) + sb * QK_K;
+
+    // Dequantize Q6_K superblock (64 threads, 4 elements each = 256 elements)
+    const int tid = threadIdx.x;
+    const int ip  = tid / 32;    // 0 or 1
+    const int il  = tid - 32*ip; // 0..31
+    const int is  = 8*ip + il/16;
+
+    const float d = x->d;
+    const uint8_t * ql = x->ql + 64*ip + il;
+    const uint8_t   qh = x->qh[32*ip + il];
+    const int8_t  * sc = x->scales + is;
+
+    y[128*ip + il +  0] = (dst_t)(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+    y[128*ip + il + 32] = (dst_t)(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+    y[128*ip + il + 64] = (dst_t)(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+    y[128*ip + il + 96] = (dst_t)(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+}
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -199,8 +239,21 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_Q6_K:
+            // K-quant get_rows: dequantize selected rows, fully on GPU (no host sync)
+            {
+                // Launch one block per (superblock, row_request) pair.
+                // Each block: 64 threads, dequantizes QK_K=256 elements.
+                const int64_t nb_per_row = ne00 / QK_K;
+                const int64_t n_rows = ne10 * ne11 * ne12;
+                const dim3 grid(nb_per_row, n_rows, 1);
+                k_get_rows_q6_K<<<grid, 64, 0, stream>>>(
+                    (const block_q6_K *)src0_d, src1_d, dst_d,
+                    ne00, nb01, nb1, ne12,
+                    nb10 / sizeof(int32_t), nb11 / sizeof(int32_t), nb12 / sizeof(int32_t));
+            }
+            break;
         default:
-            // TODO: k-quants
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
             break;
     }
