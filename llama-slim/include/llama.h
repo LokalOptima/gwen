@@ -943,6 +943,9 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Returns true if the model has MTP (Multi-Token Prediction) layers.
+    LLAMA_API bool llama_model_has_mtp(const struct llama_model * model);
+
     // Run MTP (Multi-Token Prediction) draft head using the hidden state from the last llama_decode() call.
     // Produces draft logits accessible via llama_get_logits().
     // token: the accepted token sampled from the last decode's logits

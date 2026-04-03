@@ -16,6 +16,143 @@
 #include <string>
 #include <vector>
 
+static llama_token greedy_argmax(const float * logits, int n_vocab) {
+    llama_token best = 0;
+    float best_val = logits[0];
+    for (int i = 1; i < n_vocab; i++) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+// MTP speculative decode: generates tokens using proven logic from test_mtp_speculative.
+// Returns tokens and updates n_past. Prints tokens as generated.
+static void generate_mtp(
+        llama_context * ctx,
+        const llama_vocab * vocab,
+        common_sampler * smpl,
+        int & n_past,
+        int & n_remain,
+        int & mtp_accepted,
+        int & mtp_rejected,
+        std::vector<llama_token> & output_tokens,
+        std::ostringstream & output_ss,
+        bool special) {
+
+    llama_memory_t mem = llama_get_memory(ctx);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    // Sample first accepted from prefill/previous decode logits
+    llama_token accepted = greedy_argmax(llama_get_logits(ctx), n_vocab);
+    common_sampler_accept(smpl, accepted, true);
+    output_tokens.push_back(accepted);
+    output_ss << common_token_to_piece(ctx, accepted, special);
+    --n_remain;
+
+    if (llama_vocab_is_eog(vocab, accepted) || n_remain <= 0) return;
+
+    // Get first MTP draft
+    llama_token draft = -1;
+    if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+        draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+    }
+
+    while (n_remain > 0) {
+        if (llama_vocab_is_eog(vocab, accepted)) break;
+
+        if (draft < 0 || draft == accepted) {
+            // No valid draft — single token decode
+            llama_batch batch = llama_batch_init(1, 0, 1);
+            common_batch_add(batch, accepted, n_past++, {0}, true);
+            llama_decode(ctx, batch);
+            llama_batch_free(batch);
+
+            accepted = greedy_argmax(llama_get_logits(ctx), n_vocab);
+            common_sampler_accept(smpl, accepted, true);
+            output_tokens.push_back(accepted);
+            output_ss << common_token_to_piece(ctx, accepted, special);
+            --n_remain;
+
+            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+                draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+            } else {
+                draft = -1;
+            }
+            continue;
+        }
+
+        // --- Speculative path ---
+        llama_memory_seq_cp(mem, 0, 1, 0, -1);
+
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        common_batch_add(batch, accepted, n_past, {0}, true);
+        common_batch_add(batch, draft, n_past + 1, {0}, true);
+        llama_decode(ctx, batch);
+        llama_batch_free(batch);
+
+        const llama_token pred = greedy_argmax(llama_get_logits_ith(ctx, 0), n_vocab);
+
+        if (pred == draft) {
+            // ACCEPT
+            mtp_accepted++;
+            n_past += 2;
+
+            const llama_token pred_after_draft = greedy_argmax(llama_get_logits_ith(ctx, 1), n_vocab);
+
+            common_sampler_accept(smpl, accepted, true);
+            common_sampler_accept(smpl, draft, true);
+            // Note: accepted was already accepted above for the first token,
+            // but subsequent accepts are for tokens that were carried forward
+            output_tokens.push_back(draft);
+            output_ss << common_token_to_piece(ctx, draft, special);
+            --n_remain;
+
+            if (n_remain > 0) {
+                common_sampler_accept(smpl, pred_after_draft, true);
+                output_tokens.push_back(pred_after_draft);
+                output_ss << common_token_to_piece(ctx, pred_after_draft, special);
+                --n_remain;
+            }
+
+            llama_memory_seq_rm(mem, 1, 0, -1);
+
+            accepted = pred_after_draft;
+            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+                draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+            } else {
+                draft = -1;
+            }
+        } else {
+            // REJECT
+            mtp_rejected++;
+
+            llama_memory_seq_rm(mem, 0, 0, -1);
+            llama_memory_seq_cp(mem, 1, 0, 0, -1);
+            llama_memory_seq_rm(mem, 1, 0, -1);
+
+            llama_batch batch2 = llama_batch_init(1, 0, 1);
+            common_batch_add(batch2, accepted, n_past++, {0}, true);
+            llama_decode(ctx, batch2);
+            llama_batch_free(batch2);
+
+            accepted = pred;
+            common_sampler_accept(smpl, accepted, true);
+            output_tokens.push_back(accepted);
+            output_ss << common_token_to_piece(ctx, accepted, special);
+            --n_remain;
+
+            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+                draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
+            } else {
+                draft = -1;
+            }
+        }
+    }
+}
+
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
 #include <unistd.h>
@@ -550,6 +687,15 @@ int main(int argc, char ** argv) {
     int n_past             = 0;
     int n_remain           = params.n_predict;
     int n_consumed         = 0;
+
+    // MTP speculative decode state
+    const bool use_mtp = llama_model_has_mtp(model) && !params.interactive;
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    llama_token mtp_draft = -1;          // pending draft from MTP
+    llama_token mtp_next_accepted = -1;  // carried-forward prediction (logits overwritten by decode_mtp)
+    int mtp_accepted = 0;
+    int mtp_rejected = 0;
+    bool mtp_skip_decode = false;
     int n_session_consumed = 0;
 
     std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
@@ -593,7 +739,7 @@ int main(int argc, char ** argv) {
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
-        if (!embd.empty()) {
+        if (!embd.empty() && !mtp_skip_decode) {
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
             // --prompt or --file which uses the same value.
             int max_embd_size = n_ctx - 4;
@@ -707,18 +853,33 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+        mtp_skip_decode = false;
 
         embd.clear();
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
 
+            if (use_mtp) {
+                // MTP speculative decode: run the entire generation loop
+                std::ostringstream mtp_ss;
+                generate_mtp(ctx, vocab, smpl, n_past, n_remain, mtp_accepted, mtp_rejected,
+                             output_tokens, mtp_ss, params.special);
+
+                // Print all generated text
+                const std::string mtp_text = mtp_ss.str();
+                LOG("%s", mtp_text.c_str());
+
+                if (params.conversation_mode && !waiting_for_first_input) {
+                    assistant_ss << mtp_text;
+                }
+
+                break;  // generation complete
+            }
+
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
-
-            common_sampler_accept(smpl, id, /* accept_grammar= */ true);
-
-            // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
-
+            common_sampler_accept(smpl, id, true);
             embd.push_back(id);
+            --n_remain;
 
             if (params.conversation_mode && !waiting_for_first_input && !llama_vocab_is_eog(vocab, id)) {
                 assistant_ss << common_token_to_piece(ctx, id, false);
@@ -726,9 +887,6 @@ int main(int argc, char ** argv) {
 
             // echo this to console
             input_echo = true;
-
-            // decrement remaining sampling budget
-            --n_remain;
 
             LOG_DBG("n_remain: %d\n", n_remain);
         } else {
@@ -993,6 +1151,12 @@ int main(int argc, char ** argv) {
 
     LOG("\n\n");
     common_perf_print(ctx, smpl);
+
+    if (use_mtp && (mtp_accepted + mtp_rejected) > 0) {
+        LOG_INF("MTP speculative decode: accepted %d, rejected %d, rate %.1f%%\n",
+            mtp_accepted, mtp_rejected,
+            100.0 * mtp_accepted / (mtp_accepted + mtp_rejected));
+    }
 
     llama_backend_free();
 

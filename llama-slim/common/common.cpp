@@ -1065,6 +1065,11 @@ common_init_result::common_init_result(common_params & params) :
 
     pimpl->model.reset(model);
 
+    // MTP speculative decode requires n_seq_max >= 2 for state rollback
+    if (llama_model_has_mtp(model) && cparams.n_seq_max < 2) {
+        cparams.n_seq_max = 2;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
