@@ -371,6 +371,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,   hparams.nextn_predict_layers, false);
+    // n_layer from GGUF includes MTP layers; subtract them so downstream code only sees real model layers
+    hparams.n_layer -= hparams.nextn_predict_layers;
     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
@@ -632,9 +635,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
-    pimpl->dev_layer.resize(n_layer);
+    const uint32_t n_layer_total = n_layer + hparams.nextn_predict_layers;
+    pimpl->dev_layer.resize(n_layer_total);
     for (int il = 0; il < n_layer; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+    }
+    // MTP layers use the same device as the last model layer
+    for (uint32_t il = n_layer; il < n_layer_total; ++il) {
+        pimpl->dev_layer[il] = get_layer_buft_list(n_layer - 1);
     }
 
     // assign the output layer
@@ -675,7 +683,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 tn, ne, flags);
         };
 
-        layers.resize(n_layer);
+        layers.resize(n_layer + hparams.nextn_predict_layers);
 
         // TODO: move to a separate function
         const auto tn = LLM_TN(arch);
@@ -744,6 +752,31 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                    }
+
+                    // Load MTP (NextN) layer tensors
+                    for (uint32_t i = 0; i < hparams.nextn_predict_layers; ++i) {
+                        const int mtp_bid = n_layer + i;
+                        auto & layer = layers[mtp_bid];
+
+                        // MTP-specific projection and normalization tensors
+                        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", mtp_bid), { n_embd * 2, n_embd }, 0);
+                        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", mtp_bid), { n_embd }, 0);
+                        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", mtp_bid), { n_embd }, 0);
+                        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", mtp_bid), { n_embd }, 0);
+
+                        // Full attention layer (MTP uses standard transformer)
+                        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", mtp_bid), { n_embd }, 0);
+                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", mtp_bid), { n_embd }, 0);
+                        layer.wq             = create_tensor(tn(LLM_TENSOR_ATTN_Q,         "weight", mtp_bid), { n_embd, n_embd_head_k * n_head * 2 }, 0);
+                        layer.wk             = create_tensor(tn(LLM_TENSOR_ATTN_K,         "weight", mtp_bid), { n_embd, n_embd_k_gqa }, 0);
+                        layer.wv             = create_tensor(tn(LLM_TENSOR_ATTN_V,         "weight", mtp_bid), { n_embd, n_embd_v_gqa }, 0);
+                        layer.wo             = create_tensor(tn(LLM_TENSOR_ATTN_OUT,       "weight", mtp_bid), { n_embd_head_k * n_head, n_embd }, 0);
+                        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,   "weight", mtp_bid), { n_embd_head_k }, 0);
+                        layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,   "weight", mtp_bid), { n_embd_head_k }, 0);
+                        layer.ffn_gate       = create_tensor(tn(LLM_TENSOR_FFN_GATE,       "weight", mtp_bid), { n_embd, n_ff }, 0);
+                        layer.ffn_down       = create_tensor(tn(LLM_TENSOR_FFN_DOWN,       "weight", mtp_bid), { n_ff, n_embd }, 0);
+                        layer.ffn_up         = create_tensor(tn(LLM_TENSOR_FFN_UP,         "weight", mtp_bid), { n_embd, n_ff }, 0);
                     }
                 } break;
             default:
