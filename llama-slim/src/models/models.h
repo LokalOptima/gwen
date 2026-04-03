@@ -79,6 +79,13 @@ private:
                         int * sections,
                         int   il);
 
+    ggml_tensor * build_layer_attn_mtp(
+       llm_graph_input_mtp_kv * inp_mtp_kv,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                        int * sections,
+                        int   il);
+
     ggml_tensor * build_layer_attn_linear(
          llm_graph_input_rs * inp,
                 ggml_tensor * cur,

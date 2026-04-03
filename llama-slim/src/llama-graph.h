@@ -282,6 +282,30 @@ public:
     const llama_cparams cparams;
 };
 
+// MTP KV cache attention input: simple causal mask for MTP's own KV cache
+class llm_graph_input_mtp_kv : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_kv(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            int32_t n_kv) :
+        hparams(hparams),
+        cparams(cparams),
+        n_kv(n_kv) {}
+    ~llm_graph_input_mtp_kv() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+
+    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, 1, 1, 1]
+    ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, 1, 1, 1]
+
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+    int32_t n_kv;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -558,6 +582,11 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // MTP KV cache (persistent GPU tensors, nullptr if no MTP)
+    ggml_tensor * mtp_k_cache = nullptr;
+    ggml_tensor * mtp_v_cache = nullptr;
+    int32_t       mtp_kv_pos  = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -744,6 +773,11 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // MTP KV cache (persistent GPU tensors, nullptr if no MTP)
+    ggml_tensor * mtp_k_cache;
+    ggml_tensor * mtp_v_cache;
+    int32_t       mtp_kv_pos;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -879,6 +913,7 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+    llm_graph_input_mtp_kv * build_attn_inp_mtp_kv(int32_t n_kv) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_no_cache * inp,

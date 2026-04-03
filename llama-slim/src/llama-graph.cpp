@@ -878,6 +878,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    mtp_k_cache      (params.mtp_k_cache),
+    mtp_v_cache      (params.mtp_v_cache),
+    mtp_kv_pos       (params.mtp_kv_pos),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1934,6 +1937,30 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     }
 
     return (llm_graph_input_attn_no_cache *) res->add_input(std::move(inp));
+}
+
+void llm_graph_input_mtp_kv::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (self_kq_mask) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+        float * data = (float *) self_kq_mask->data;
+        // Current MTP token can attend to all previous MTP tokens (all unmasked)
+        for (int i = 0; i < n_kv; i++) {
+            data[i] = 0.0f;
+        }
+    }
+}
+
+llm_graph_input_mtp_kv * llm_graph_context::build_attn_inp_mtp_kv(int32_t n_kv) const {
+    auto inp = std::make_unique<llm_graph_input_mtp_kv>(hparams, cparams, n_kv);
+
+    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, 1, 1);
+    ggml_set_input(inp->self_kq_mask);
+
+    inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+
+    return (llm_graph_input_mtp_kv *) res->add_input(std::move(inp));
 }
 
 ggml_tensor * llm_graph_context::build_attn(

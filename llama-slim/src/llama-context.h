@@ -343,6 +343,13 @@ private:
     llm_graph_result_ptr gf_res_mtp;
     llm_graph_result_ptr gf_res_reserve;
 
+    // MTP KV cache (separate from main model's KV cache)
+    ggml_context_ptr        mtp_kv_ctx;
+    ggml_backend_buffer_ptr mtp_kv_buf;
+    ggml_tensor *           mtp_k_cache = nullptr;  // [n_embd_k_gqa, n_ctx] F16
+    ggml_tensor *           mtp_v_cache = nullptr;  // [n_embd_v_gqa, n_ctx] F16
+    int32_t                 mtp_kv_pos  = 0;        // next write position
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

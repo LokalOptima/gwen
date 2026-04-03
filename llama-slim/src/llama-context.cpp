@@ -281,6 +281,39 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
+    // allocate MTP KV cache if model has MTP layers
+    if (!hparams.vocab_only && hparams.nextn_predict_layers > 0) {
+        const uint32_t mtp_il = hparams.n_layer;
+        const uint32_t n_embd_k_gqa_mtp = hparams.n_embd_k_gqa(mtp_il);
+        const uint32_t n_embd_v_gqa_mtp = hparams.n_embd_v_gqa(mtp_il);
+        const uint32_t n_ctx_mtp = cparams.n_ctx;
+
+        struct ggml_init_params params_kv = {
+            /*.mem_size   =*/ 2u * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        mtp_kv_ctx.reset(ggml_init(params_kv));
+
+        mtp_k_cache = ggml_new_tensor_2d(mtp_kv_ctx.get(), GGML_TYPE_F16, n_embd_k_gqa_mtp, n_ctx_mtp);
+        mtp_v_cache = ggml_new_tensor_2d(mtp_kv_ctx.get(), GGML_TYPE_F16, n_embd_v_gqa_mtp, n_ctx_mtp);
+        ggml_format_name(mtp_k_cache, "mtp_k_cache");
+        ggml_format_name(mtp_v_cache, "mtp_v_cache");
+
+        auto * dev = model.dev_layer(mtp_il);
+        auto buft = ggml_backend_dev_buffer_type(dev);
+
+        auto * buf = ggml_backend_alloc_ctx_tensors_from_buft(mtp_kv_ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate MTP KV cache");
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        mtp_kv_buf.reset(buf);
+
+        LLAMA_LOG_INFO("%s: MTP KV buffer size = %8.2f MiB\n", __func__,
+            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+    }
+
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
@@ -1343,6 +1376,11 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
 
     n_outputs = 1;
 
+    // Advance MTP KV cache position (only after successful eval)
+    if (mtp_k_cache) {
+        mtp_kv_pos++;
+    }
+
     // Reset scheduler back so the next main decode can rebuild its graph
     // (the scheduler was reset for MTP, invalidating the main graph)
     gf_res_prev->reset();
@@ -2277,6 +2315,9 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.mtp_k_cache =*/ mtp_k_cache,
+        /*.mtp_v_cache =*/ mtp_v_cache,
+        /*.mtp_kv_pos  =*/ mtp_kv_pos,
     };
 }
 
