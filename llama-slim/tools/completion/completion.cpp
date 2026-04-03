@@ -85,7 +85,9 @@ static void generate_mtp(
         }
 
         // --- Speculative path ---
-        llama_memory_seq_cp(mem, 0, 1, 0, -1);
+        // Snapshot recurrent state instead of seq_cp. This keeps the recurrent
+        // state head stable, enabling graph reuse for the 2-token verify batch.
+        llama_mtp_snapshot_save(ctx);
 
         llama_batch batch = llama_batch_init(2, 0, 1);
         common_batch_add(batch, accepted, n_past, {0}, true);
@@ -96,7 +98,7 @@ static void generate_mtp(
         const llama_token pred = greedy_argmax(llama_get_logits_ith(ctx, 0), n_vocab);
 
         if (pred == draft) {
-            // ACCEPT
+            // ACCEPT — snapshot is simply discarded
             mtp_accepted++;
             n_past += 2;
 
@@ -104,8 +106,6 @@ static void generate_mtp(
 
             common_sampler_accept(smpl, accepted, true);
             common_sampler_accept(smpl, draft, true);
-            // Note: accepted was already accepted above for the first token,
-            // but subsequent accepts are for tokens that were carried forward
             output_tokens.push_back(draft);
             output_ss << common_token_to_piece(ctx, draft, special);
             --n_remain;
@@ -117,8 +117,6 @@ static void generate_mtp(
                 --n_remain;
             }
 
-            llama_memory_seq_rm(mem, 1, 0, -1);
-
             accepted = pred_after_draft;
             if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
                 draft = greedy_argmax(llama_get_logits(ctx), n_vocab);
@@ -126,12 +124,15 @@ static void generate_mtp(
                 draft = -1;
             }
         } else {
-            // REJECT
+            // REJECT — restore recurrent state from snapshot
             mtp_rejected++;
 
-            llama_memory_seq_rm(mem, 0, 0, -1);
-            llama_memory_seq_cp(mem, 1, 0, 0, -1);
-            llama_memory_seq_rm(mem, 1, 0, -1);
+            llama_mtp_snapshot_restore(ctx);
+
+            // Remove KV cache entries written by the 2-token verify batch.
+            // After snapshot restore, recurrent state has pos < n_past,
+            // so seq_rm only affects the KV cache side.
+            llama_memory_seq_rm(mem, 0, n_past, -1);
 
             llama_batch batch2 = llama_batch_init(1, 0, 1);
             common_batch_add(batch2, accepted, n_past++, {0}, true);

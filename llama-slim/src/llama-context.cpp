@@ -5,6 +5,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -14,6 +17,17 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+
+// Helper to get the recurrent memory from either llama_memory_hybrid or llama_memory_hybrid_iswa
+static llama_memory_recurrent * get_mem_recr(llama_memory_i * mem) {
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_recr();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_recr();
+    }
+    return nullptr;
+}
 
 //
 // llama_context
@@ -281,15 +295,17 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
-    // allocate MTP KV cache if model has MTP layers
+    // allocate MTP KV cache + hidden state if model has MTP layers
     if (!hparams.vocab_only && hparams.nextn_predict_layers > 0) {
         const uint32_t mtp_il = hparams.n_layer;
         const uint32_t n_embd_k_gqa_mtp = hparams.n_embd_k_gqa(mtp_il);
         const uint32_t n_embd_v_gqa_mtp = hparams.n_embd_v_gqa(mtp_il);
         const uint32_t n_ctx_mtp = cparams.n_ctx;
 
+        // KV cache: 2 tensors (K + V)
+        // Hidden state: 1 tensor (persistent GPU buffer for hidden state transfer)
         struct ggml_init_params params_kv = {
-            /*.mem_size   =*/ 2u * ggml_tensor_overhead(),
+            /*.mem_size   =*/ 3u * ggml_tensor_overhead(),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -297,8 +313,10 @@ llama_context::llama_context(
 
         mtp_k_cache = ggml_new_tensor_2d(mtp_kv_ctx.get(), GGML_TYPE_F16, n_embd_k_gqa_mtp, n_ctx_mtp);
         mtp_v_cache = ggml_new_tensor_2d(mtp_kv_ctx.get(), GGML_TYPE_F16, n_embd_v_gqa_mtp, n_ctx_mtp);
+        mtp_hidden_state = ggml_new_tensor_2d(mtp_kv_ctx.get(), GGML_TYPE_F32, hparams.n_embd, 1);
         ggml_format_name(mtp_k_cache, "mtp_k_cache");
         ggml_format_name(mtp_v_cache, "mtp_v_cache");
+        ggml_format_name(mtp_hidden_state, "mtp_hidden_state");
 
         auto * dev = model.dev_layer(mtp_il);
         auto buft = ggml_backend_dev_buffer_type(dev);
@@ -310,7 +328,7 @@ llama_context::llama_context(
         ggml_backend_buffer_clear(buf, 0);
         mtp_kv_buf.reset(buf);
 
-        LLAMA_LOG_INFO("%s: MTP KV buffer size = %8.2f MiB\n", __func__,
+        LLAMA_LOG_INFO("%s: MTP KV+hidden buffer size = %8.2f MiB\n", __func__,
             ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
     }
 
@@ -382,6 +400,81 @@ llama_context::llama_context(
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+            }
+        }
+
+        // Create separate scheduler for MTP to avoid invalidating main graph
+        if (hparams.nextn_predict_layers > 0 && mtp_hidden_state) {
+            const size_t mtp_max_nodes = 512; // MTP graph is small (1 layer)
+            mtp_sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                mtp_max_nodes, false, cparams.op_offload));
+            LLAMA_LOG_INFO("%s: MTP scheduler created (separate from main)\n", __func__);
+        }
+
+        // Allocate MTP recurrent state snapshot buffers for speculation rollback.
+        // These mirror the recurrent memory's s_l/r_l tensors on GPU. Using GPU D2D
+        // copies (~0.04ms) instead of seq_cp/seq_rm keeps the recurrent state head
+        // stable, enabling graph reuse for the verify decode (saves ~5ms).
+        if (hparams.nextn_predict_layers > 0 && memory) {
+            auto * mem_recr = get_mem_recr(memory.get());
+            if (mem_recr) {
+                const int32_t n_layer = hparams.n_layer_total();
+
+                // Count how many tensors we need (only recurrent layers have r_l/s_l)
+                uint32_t n_snap_tensors = 0;
+                for (int32_t il = 0; il < n_layer; il++) {
+                    if (mem_recr->r_l[il]) n_snap_tensors++;
+                    if (mem_recr->s_l[il]) n_snap_tensors++;
+                }
+
+                if (n_snap_tensors > 0) {
+                    struct ggml_init_params params_snap = {
+                        /*.mem_size   =*/ n_snap_tensors * ggml_tensor_overhead(),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    mtp_rs_snapshot.ctx.reset(ggml_init(params_snap));
+
+                    mtp_rs_snapshot.s_snap.resize(n_layer, nullptr);
+                    mtp_rs_snapshot.r_snap.resize(n_layer, nullptr);
+
+                    for (int32_t il = 0; il < n_layer; il++) {
+                        if (mem_recr->s_l[il]) {
+                            auto * src = mem_recr->s_l[il];
+                            auto * snap = ggml_new_tensor_1d(mtp_rs_snapshot.ctx.get(),
+                                src->type, ggml_nelements(src));
+                            ggml_format_name(snap, "snap_s_l%d", il);
+                            mtp_rs_snapshot.s_snap[il] = snap;
+                        }
+                        if (mem_recr->r_l[il]) {
+                            auto * src = mem_recr->r_l[il];
+                            auto * snap = ggml_new_tensor_1d(mtp_rs_snapshot.ctx.get(),
+                                src->type, ggml_nelements(src));
+                            ggml_format_name(snap, "snap_r_l%d", il);
+                            mtp_rs_snapshot.r_snap[il] = snap;
+                        }
+                    }
+
+                    // Allocate on the same device as the recurrent state (GPU)
+                    auto * dev = model.dev_layer(0);  // recurrent layers are on the same device
+                    auto buft = ggml_backend_dev_buffer_type(dev);
+                    auto * buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                        mtp_rs_snapshot.ctx.get(), buft);
+                    if (!buf) {
+                        throw std::runtime_error("failed to allocate MTP snapshot buffers");
+                    }
+                    ggml_backend_buffer_clear(buf, 0);
+                    mtp_rs_snapshot.buf.reset(buf);
+
+                    // Pre-allocate cell backup storage
+                    mtp_rs_snapshot.cells.resize(mem_recr->size);
+
+                    LLAMA_LOG_INFO("%s: MTP snapshot buffer size = %8.2f MiB (%u tensors)\n",
+                        __func__,
+                        ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
+                        n_snap_tensors);
+                }
             }
         }
     }
@@ -1281,7 +1374,11 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
         return -1;
     }
 
-    // 1. Synchronize and read hidden state from previous decode's graph result
+    // Use separate MTP scheduler to avoid invalidating main graph
+    auto * mtp_sched_ptr = mtp_sched ? mtp_sched.get() : sched.get();
+    const bool use_separate_sched = (mtp_sched != nullptr);
+
+    // 1. Synchronize main graph and copy hidden state GPU→GPU
     ggml_backend_sched_synchronize(sched.get());
 
     auto * t_hidden_src = gf_res_prev->t_hidden_prenorm;
@@ -1290,9 +1387,17 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
         return -1;
     }
 
-    // Copy hidden state to CPU buffer
-    std::vector<float> hidden_buf(n_embd);
-    ggml_backend_tensor_get(t_hidden_src, hidden_buf.data(), 0, n_embd * sizeof(float));
+    if (mtp_hidden_state) {
+        // Copy the last hidden state (last token in batch) to persistent GPU tensor.
+        // t_hidden_src is [n_embd, n_tokens] — we need the last row.
+        const int64_t n_tokens_src = t_hidden_src->ne[1];
+        const size_t offset = (n_tokens_src - 1) * t_hidden_src->nb[1];
+        const size_t row_bytes = n_embd * sizeof(float);
+        // GPU→CPU→GPU for 4KB — negligible vs scheduler/graph overhead savings
+        std::vector<float> hidden_buf(n_embd);
+        ggml_backend_tensor_get(t_hidden_src, hidden_buf.data(), offset, row_bytes);
+        ggml_backend_tensor_set(mtp_hidden_state, hidden_buf.data(), 0, row_bytes);
+    }
 
     // 2. Build a 1-token ubatch
     llama_batch batch = llama_batch_init(1, 0, 1);
@@ -1319,46 +1424,88 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
     int32_t seq_idx[LLAMA_MAX_SEQ] = {};
     ubatch.seq_idx = seq_idx;
 
-    // 3. Build/reuse MTP graph (uses gf_res_mtp, separate from gf_res_prev)
+    // 3. Build/reuse MTP graph
     auto * res = gf_res_mtp.get();
 
     n_outputs = 1;
 
-    const auto gparams = graph_params(res, ubatch, nullptr, LLM_GRAPH_TYPE_MTP);
+    // Build gparams with MTP scheduler
+    llm_graph_params gparams = {
+        /*.arch        =*/ model.arch,
+        /*.hparams     =*/ model.hparams,
+        /*.cparams     =*/ cparams,
+        /*.ubatch      =*/ ubatch,
+        /*.gtype       =*/ LLM_GRAPH_TYPE_MTP,
+        /*.sched       =*/ mtp_sched_ptr,
+        /*.backend_cpu =*/ backend_cpu,
+        /*.cvec        =*/ cvec.get(),
+        /*.loras       =*/ loras.get(),
+        /*.mctx        =*/ nullptr,
+        /*.cross       =*/ &cross,
+        /*.samplers    =*/ {},
+        /*.n_outputs   =*/ n_outputs,
+        /*.cb          =*/ graph_get_cb(),
+        /*.res         =*/ res,
+        /*.mtp_k_cache      =*/ mtp_k_cache,
+        /*.mtp_v_cache      =*/ mtp_v_cache,
+        /*.mtp_hidden_state =*/ mtp_hidden_state,
+        /*.mtp_kv_pos       =*/ mtp_kv_pos,
+        /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)cparams.n_ctx : 0,
+    };
 
-    // MTP graph uses its own result, but shares the backend scheduler.
-    // Need to reset scheduler since we're switching from main graph to MTP graph.
-    res->reset();
-    ggml_backend_sched_reset(sched.get());
+    auto * gf = res->get_gf();
 
-    auto * gf = model.build_graph(gparams);
-    if (!gf) {
-        LLAMA_LOG_ERROR("%s: failed to build MTP graph\n", __func__);
-        llama_batch_free(batch);
-        return -1;
+    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+        // Fast path: reuse existing graph, just update inputs
+    } else {
+        // Build new graph (first call, or topology changed)
+        res->reset();
+        ggml_backend_sched_reset(mtp_sched_ptr);
+
+        gf = model.build_graph(gparams);
+        if (!gf) {
+            LLAMA_LOG_ERROR("%s: failed to build MTP graph\n", __func__);
+            llama_batch_free(batch);
+            return -1;
+        }
+
+        if (!ggml_backend_sched_alloc_graph(mtp_sched_ptr, gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate MTP graph\n", __func__);
+            llama_batch_free(batch);
+            return -1;
+        }
     }
 
-    if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-        LLAMA_LOG_ERROR("%s: failed to allocate MTP graph\n", __func__);
-        llama_batch_free(batch);
-        return -1;
-    }
-
-    // 4. Set inputs: token, position, attention mask
+    // 4. Set inputs: token, position, attention mask, KV write index
     res->set_inputs(&ubatch);
 
-    // 5. Set the hidden state input
-    // The MTP graph builder stores the hidden input tensor in res->t_hidden_prenorm
-    if (res->t_hidden_prenorm) {
+    // 5. Set hidden state (fallback path for when persistent tensor is not available)
+    if (!mtp_hidden_state && res->t_hidden_prenorm) {
+        std::vector<float> hidden_buf(n_embd);
+        ggml_backend_tensor_get(t_hidden_src, hidden_buf.data(), 0, n_embd * sizeof(float));
         ggml_backend_tensor_set(res->t_hidden_prenorm, hidden_buf.data(), 0, n_embd * sizeof(float));
     }
 
-    // 6. Compute
-    const auto status = graph_compute(gf, false);
-    if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR("%s: MTP graph compute failed\n", __func__);
-        llama_batch_free(batch);
-        return -1;
+    // 6. Compute using MTP scheduler
+    {
+        int n_threads = cparams.n_threads;
+        if (backend_cpu != nullptr) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+            if (set_threadpool_fn) {
+                set_threadpool_fn(backend_cpu, threadpool);
+            }
+        }
+        for (const auto & set_n_threads_fn : set_n_threads_fns) {
+            set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+        }
+
+        auto compute_status = ggml_backend_sched_graph_compute_async(mtp_sched_ptr, res->get_gf());
+        if (compute_status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: MTP graph compute failed\n", __func__);
+            llama_batch_free(batch);
+            return -1;
+        }
     }
 
     // 7. Extract logits to the output buffer
@@ -1369,23 +1516,158 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
             llama_batch_free(batch);
             return -1;
         }
-        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+        ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(mtp_sched_ptr, t_logits);
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_vocab * sizeof(float));
-        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_synchronize(mtp_sched_ptr);
     }
 
     n_outputs = 1;
 
-    // Advance MTP KV cache position (only after successful eval)
+    // Advance MTP KV cache position
     if (mtp_k_cache) {
         mtp_kv_pos++;
     }
 
-    // Reset scheduler back so the next main decode can rebuild its graph
-    // (the scheduler was reset for MTP, invalidating the main graph)
-    gf_res_prev->reset();
+    // NOTE: No gf_res_prev->reset() — main graph stays valid for reuse!
+    // This is the key optimization: separate scheduler means MTP doesn't invalidate main graph.
+    if (!use_separate_sched) {
+        // Fallback: if sharing scheduler, must invalidate main graph
+        gf_res_prev->reset();
+    }
 
     llama_batch_free(batch);
+    return 0;
+}
+
+int llama_context::mtp_snapshot_save() {
+    auto * mem_recr = get_mem_recr(memory.get());
+    if (!mem_recr) {
+        LLAMA_LOG_ERROR("%s: model does not use hybrid/recurrent memory\n", __func__);
+        return -1;
+    }
+    const int32_t n_layer = model.hparams.n_layer_total();
+
+    if (mtp_rs_snapshot.s_snap.empty()) {
+        LLAMA_LOG_ERROR("%s: snapshot buffers not allocated\n", __func__);
+        return -1;
+    }
+
+    // Get the CUDA backend for async copies (first non-CPU backend)
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+
+    // Copy GPU state tensors: s_l and r_l for all recurrent layers
+    // Use async copies to avoid per-tensor synchronization (36 syncs → 1 sync)
+    for (int32_t il = 0; il < n_layer; il++) {
+        if (mtp_rs_snapshot.s_snap[il] && mem_recr->s_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mem_recr->s_l[il], mtp_rs_snapshot.s_snap[il]);
+            } else {
+                ggml_backend_tensor_copy(mem_recr->s_l[il], mtp_rs_snapshot.s_snap[il]);
+            }
+        }
+        if (mtp_rs_snapshot.r_snap[il] && mem_recr->r_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mem_recr->r_l[il], mtp_rs_snapshot.r_snap[il]);
+            } else {
+                ggml_backend_tensor_copy(mem_recr->r_l[il], mtp_rs_snapshot.r_snap[il]);
+            }
+        }
+    }
+    // No explicit sync needed — subsequent compute on the same CUDA stream
+    // is implicitly ordered after these async copies.
+
+    // Save CPU-side metadata
+    mtp_rs_snapshot.head = mem_recr->head;
+    mtp_rs_snapshot.used = mem_recr->used;
+    mtp_rs_snapshot.rs_z = mem_recr->rs_z;
+
+    for (uint32_t i = 0; i < mem_recr->size; i++) {
+        auto & dst = mtp_rs_snapshot.cells[i];
+        auto & src = mem_recr->cells[i];
+        dst.pos    = src.pos;
+        dst.src    = src.src;
+        dst.src0   = src.src0;
+        dst.tail   = src.tail;
+        dst.seq_id = src.seq_id;
+    }
+
+    // Save MTP KV position
+    mtp_rs_snapshot.saved_mtp_kv_pos = mtp_kv_pos;
+
+    mtp_rs_snapshot.valid = true;
+    return 0;
+}
+
+int llama_context::mtp_snapshot_restore() {
+    if (!mtp_rs_snapshot.valid) {
+        LLAMA_LOG_ERROR("%s: no valid snapshot to restore\n", __func__);
+        return -1;
+    }
+
+    auto * mem_recr = get_mem_recr(memory.get());
+    if (!mem_recr) {
+        LLAMA_LOG_ERROR("%s: model does not use hybrid/recurrent memory\n", __func__);
+        return -1;
+    }
+    const int32_t n_layer = model.hparams.n_layer_total();
+
+    // Get the CUDA backend for async copies
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+
+    // Restore GPU state tensors (async + single sync)
+    for (int32_t il = 0; il < n_layer; il++) {
+        if (mtp_rs_snapshot.s_snap[il] && mem_recr->s_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mtp_rs_snapshot.s_snap[il], mem_recr->s_l[il]);
+            } else {
+                ggml_backend_tensor_copy(mtp_rs_snapshot.s_snap[il], mem_recr->s_l[il]);
+            }
+        }
+        if (mtp_rs_snapshot.r_snap[il] && mem_recr->r_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mtp_rs_snapshot.r_snap[il], mem_recr->r_l[il]);
+            } else {
+                ggml_backend_tensor_copy(mtp_rs_snapshot.r_snap[il], mem_recr->r_l[il]);
+            }
+        }
+    }
+    // No explicit sync needed — same CUDA stream ordering as save.
+
+    // Restore CPU-side metadata
+    mem_recr->head = mtp_rs_snapshot.head;
+    mem_recr->used = mtp_rs_snapshot.used;
+    mem_recr->rs_z = mtp_rs_snapshot.rs_z;
+
+    for (uint32_t i = 0; i < mem_recr->size; i++) {
+        auto & dst = mem_recr->cells[i];
+        auto & src = mtp_rs_snapshot.cells[i];
+        dst.pos    = src.pos;
+        dst.src    = src.src;
+        dst.src0   = src.src0;
+        dst.tail   = src.tail;
+        dst.seq_id = src.seq_id;
+    }
+
+    // Restore MTP KV position
+    mtp_kv_pos = mtp_rs_snapshot.saved_mtp_kv_pos;
+
+    mtp_rs_snapshot.valid = false;
     return 0;
 }
 
@@ -2315,9 +2597,11 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
-        /*.mtp_k_cache =*/ mtp_k_cache,
-        /*.mtp_v_cache =*/ mtp_v_cache,
-        /*.mtp_kv_pos  =*/ mtp_kv_pos,
+        /*.mtp_k_cache      =*/ mtp_k_cache,
+        /*.mtp_v_cache      =*/ mtp_v_cache,
+        /*.mtp_hidden_state =*/ mtp_hidden_state,
+        /*.mtp_kv_pos       =*/ mtp_kv_pos,
+        /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)cparams.n_ctx : 0,
     };
 }
 
@@ -3601,6 +3885,14 @@ int32_t llama_decode_mtp(
           llama_token   token,
             llama_pos   pos) {
     return ctx->decode_mtp(token, pos);
+}
+
+int32_t llama_mtp_snapshot_save(llama_context * ctx) {
+    return ctx->mtp_snapshot_save();
+}
+
+int32_t llama_mtp_snapshot_restore(llama_context * ctx) {
+    return ctx->mtp_snapshot_restore();
 }
 
 //

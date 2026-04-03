@@ -956,6 +956,12 @@ extern "C" {
                    llama_token     token,
                    llama_pos       pos);
 
+    // Save/restore recurrent state snapshot for MTP speculation rollback.
+    // Replaces seq_cp/seq_rm to avoid destabilizing the recurrent state head,
+    // which enables graph reuse for the verify decode.
+    LLAMA_API int32_t llama_mtp_snapshot_save(struct llama_context * ctx);
+    LLAMA_API int32_t llama_mtp_snapshot_restore(struct llama_context * ctx);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

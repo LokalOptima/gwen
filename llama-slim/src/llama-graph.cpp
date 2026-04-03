@@ -880,7 +880,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     mtp_k_cache      (params.mtp_k_cache),
     mtp_v_cache      (params.mtp_v_cache),
+    mtp_hidden_state (params.mtp_hidden_state),
     mtp_kv_pos       (params.mtp_kv_pos),
+    mtp_n_kv         (params.mtp_n_kv),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1945,15 +1947,23 @@ void llm_graph_input_mtp_kv::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask) {
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
         float * data = (float *) self_kq_mask->data;
-        // Current MTP token can attend to all previous MTP tokens (all unmasked)
+        // All positions unmasked (n_kv = mtp_kv_pos + 1, so all are valid)
         for (int i = 0; i < n_kv; i++) {
             data[i] = 0.0f;
         }
     }
 }
 
-llm_graph_input_mtp_kv * llm_graph_context::build_attn_inp_mtp_kv(int32_t n_kv) const {
-    auto inp = std::make_unique<llm_graph_input_mtp_kv>(hparams, cparams, n_kv);
+bool llm_graph_input_mtp_kv::can_reuse(const llm_graph_params & params) {
+    // Dynamic n_kv changes every call (= mtp_kv_pos + 1), so graph topology changes.
+    // Cannot reuse.
+    GGML_UNUSED(params);
+    return false;
+}
+
+llm_graph_input_mtp_kv * llm_graph_context::build_attn_inp_mtp_kv() const {
+    const int32_t n_kv = mtp_kv_pos + 1;
+    auto inp = std::make_unique<llm_graph_input_mtp_kv>(hparams, cparams, n_kv, mtp_kv_pos);
 
     inp->self_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, 1, 1);
     ggml_set_input(inp->self_kq_mask);

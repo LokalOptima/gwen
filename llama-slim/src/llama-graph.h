@@ -288,22 +288,28 @@ public:
     llm_graph_input_mtp_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            int32_t n_kv) :
+            int32_t n_kv,
+            int32_t mtp_kv_pos) :
         hparams(hparams),
         cparams(cparams),
-        n_kv(n_kv) {}
+        n_kv(n_kv),
+        mtp_kv_pos(mtp_kv_pos) {}
     ~llm_graph_input_mtp_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_write_idx() const { return write_idx; }
 
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, 1, 1, 1]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, 1, 1, 1]
+    ggml_tensor * write_idx        = nullptr; // I64 [1] — KV cache write position
 
     const llama_hparams hparams;
     const llama_cparams cparams;
-    int32_t n_kv;
+    int32_t n_kv;       // fixed graph topology size (= n_ctx)
+    int32_t mtp_kv_pos; // runtime: current write position
 };
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
@@ -582,10 +588,12 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
-    // MTP KV cache (persistent GPU tensors, nullptr if no MTP)
-    ggml_tensor * mtp_k_cache = nullptr;
-    ggml_tensor * mtp_v_cache = nullptr;
-    int32_t       mtp_kv_pos  = 0;
+    // MTP (persistent GPU tensors, nullptr if no MTP)
+    ggml_tensor * mtp_k_cache      = nullptr;
+    ggml_tensor * mtp_v_cache      = nullptr;
+    ggml_tensor * mtp_hidden_state = nullptr; // [n_embd, 1] F32 persistent
+    int32_t       mtp_kv_pos       = 0;
+    int32_t       mtp_n_kv         = 0;       // fixed KV size for graph reuse (= n_ctx)
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -773,10 +781,12 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
-    // MTP KV cache (persistent GPU tensors, nullptr if no MTP)
+    // MTP (persistent GPU tensors, nullptr if no MTP)
     ggml_tensor * mtp_k_cache;
     ggml_tensor * mtp_v_cache;
+    ggml_tensor * mtp_hidden_state;
     int32_t       mtp_kv_pos;
+    int32_t       mtp_n_kv;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -913,7 +923,7 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
-    llm_graph_input_mtp_kv * build_attn_inp_mtp_kv(int32_t n_kv) const;
+    llm_graph_input_mtp_kv * build_attn_inp_mtp_kv() const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_no_cache * inp,

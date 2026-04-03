@@ -474,7 +474,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_mtp(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    const int32_t n_kv = mtp_kv_pos + 1; // include current token
+    // Dynamic n_kv: only attend to filled positions (efficient for small generation lengths)
+    const int32_t n_kv = mtp_kv_pos + 1;
 
     // Q+gate joint projection
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
@@ -543,7 +544,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_mtp(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, V_2d, v_slot));
     }
 
-    // --- Read full K/V cache [n_embd_head, n_head_kv, n_kv] ---
+    // --- Read K/V cache [n_embd_head, n_head_kv, n_kv] ---
     ggml_tensor * K_full = ggml_view_3d(ctx0, mtp_k_cache,
         n_embd_head, n_head_kv, n_kv,
         n_embd_head * ggml_element_size(mtp_k_cache),
@@ -589,12 +590,19 @@ void llm_build_qwen35::build_mtp() {
     ggml_tensor * tok_embd = build_inp_embd(model.tok_embd);
     cb(tok_embd, "mtp.tok_embd", -1);
 
-    // Hidden state input (set externally before graph evaluation)
-    ggml_tensor * hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
-    ggml_set_input(hidden);
-    ggml_set_name(hidden, "mtp_hidden_state");
-    // Store in t_hidden_prenorm so caller can find and fill it
-    res->t_hidden_prenorm = hidden;
+    // Hidden state input: view of persistent GPU tensor (filled by GPU→GPU copy before compute)
+    ggml_tensor * hidden;
+    if (mtp_hidden_state) {
+        hidden = ggml_view_2d(ctx0, mtp_hidden_state, n_embd, 1,
+            n_embd * ggml_element_size(mtp_hidden_state), 0);
+        ggml_set_name(hidden, "mtp_hidden_view");
+    } else {
+        // Fallback: scheduler-allocated input (for reservation/testing without persistent state)
+        hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+        ggml_set_input(hidden);
+        ggml_set_name(hidden, "mtp_hidden_state");
+        res->t_hidden_prenorm = hidden;
+    }
 
     // Position input (for RoPE in MTP attention)
     ggml_tensor * inp_pos = build_inp_pos();
@@ -604,7 +612,7 @@ void llm_build_qwen35::build_mtp() {
     llm_graph_input_mtp_kv        * inp_mtp_kv = nullptr;
     llm_graph_input_attn_no_cache * inp_attn   = nullptr;
     if (use_mtp_kv) {
-        inp_mtp_kv = build_attn_inp_mtp_kv(mtp_kv_pos + 1);
+        inp_mtp_kv = build_attn_inp_mtp_kv();
     } else {
         inp_attn = build_attn_inp_no_cache();
     }

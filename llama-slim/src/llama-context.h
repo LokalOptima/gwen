@@ -10,6 +10,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -135,6 +136,12 @@ struct llama_context {
     // After this call, llama_get_logits(ctx) contains the draft logits.
     // Returns 0 on success, negative on error.
     int decode_mtp(llama_token token, llama_pos pos);
+
+    // Snapshot/restore recurrent state for MTP speculation rollback.
+    // Replaces seq_cp/seq_rm to keep recurrent state head stable → enables graph reuse.
+    // Returns 0 on success, negative on error.
+    int mtp_snapshot_save();
+    int mtp_snapshot_restore();
 
     //
     // state save/load
@@ -349,6 +356,36 @@ private:
     ggml_tensor *           mtp_k_cache = nullptr;  // [n_embd_k_gqa, n_ctx] F16
     ggml_tensor *           mtp_v_cache = nullptr;  // [n_embd_v_gqa, n_ctx] F16
     int32_t                 mtp_kv_pos  = 0;        // next write position
+
+    // MTP scheduling (separate scheduler to avoid invalidating main graph)
+    ggml_backend_sched_ptr  mtp_sched;
+    ggml_context_ptr        mtp_hidden_ctx;
+    ggml_backend_buffer_ptr mtp_hidden_buf;
+    ggml_tensor *           mtp_hidden_state = nullptr; // [n_embd, 1] F32 persistent on GPU (matches t_hidden_prenorm layout)
+
+    // MTP recurrent state snapshot (for speculation rollback without seq_cp/seq_rm)
+    // Eliminates graph rebuild (~5ms) by keeping recurrent state head stable.
+    struct mtp_rs_snapshot_t {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        std::vector<ggml_tensor *> s_snap;  // per-layer S state snapshot (matching s_l layout)
+        std::vector<ggml_tensor *> r_snap;  // per-layer R state snapshot (matching r_l layout)
+        // CPU-side recurrent memory metadata backup
+        uint32_t head = 0;
+        uint32_t used = 0;
+        int32_t  rs_z = -1;
+        struct cell_backup {
+            llama_pos pos = -1;
+            int32_t   src = -1;
+            int32_t   src0 = -1;
+            int32_t   tail = -1;
+            std::set<llama_seq_id> seq_id;
+        };
+        std::vector<cell_backup> cells;
+        int32_t saved_mtp_kv_pos = 0;  // MTP KV position at snapshot time
+        bool valid = false;
+    };
+    mtp_rs_snapshot_t mtp_rs_snapshot;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
