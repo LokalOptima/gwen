@@ -370,6 +370,12 @@ private:
     bool                    argmax_only = false;
     std::vector<int32_t>    last_argmax;            // [n_outputs] I32 from last decode() with argmax_only
 
+    // MTP restricted LM head (reduced vocab for faster draft argmax)
+    ggml_context_ptr        mtp_lm_ctx;
+    ggml_backend_buffer_ptr mtp_lm_buf;
+    ggml_tensor *           mtp_lm_head = nullptr;      // [n_embd, mtp_n_vocab] Q6_K — restricted output weights
+    std::vector<int32_t>    mtp_token_ids;              // [mtp_n_vocab] mapping: restricted index → full vocab ID
+
     // MTP scheduling (separate scheduler to avoid invalidating main graph)
     ggml_backend_sched_ptr  mtp_sched;
     ggml_context_ptr        mtp_hidden_ctx;

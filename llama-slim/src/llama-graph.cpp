@@ -887,6 +887,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mtp_k_cache      (params.mtp_k_cache),
     mtp_v_cache      (params.mtp_v_cache),
     mtp_hidden_state (params.mtp_hidden_state),
+    mtp_lm_head      (params.mtp_lm_head),
     mtp_kv_pos       (params.mtp_kv_pos),
     mtp_n_kv         (params.mtp_n_kv),
     samplers         (params.samplers),

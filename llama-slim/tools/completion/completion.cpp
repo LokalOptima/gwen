@@ -42,7 +42,6 @@ static void generate_mtp(
         std::ostringstream & output_ss,
         bool special) {
 
-    llama_memory_t mem = llama_get_memory(ctx);
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     // Sample first accepted from prefill/previous decode logits
@@ -88,22 +87,28 @@ static void generate_mtp(
             continue;
         }
 
-        // --- Speculative path ---
-        // Snapshot recurrent state instead of seq_cp. This keeps the recurrent
-        // state head stable, enabling graph reuse for the 2-token verify batch.
+        // --- Speculative path (2-token verify) ---
+        // Decode [accepted, draft] in a single 2-token batch. This amortizes
+        // weight reads across 2 tokens (~1.3× cost of 1-token decode).
+        // Requires: mmvf ne11<=2 fix + flash attention disabled (both ensure
+        // bit-identical results for position 0 vs 1-token decode).
+
+        // Snapshot DeltaNet recurrent state before 2-token decode.
+        // On rejection, we restore this and re-decode just accepted.
         llama_mtp_snapshot_save(ctx);
 
-        llama_batch batch = llama_batch_init(2, 0, 1);
-        common_batch_add(batch, accepted, n_past, {0}, true);
-        common_batch_add(batch, draft, n_past + 1, {0}, true);
-        llama_decode(ctx, batch);
-        llama_batch_free(batch);
+        {
+            llama_batch batch = llama_batch_init(2, 0, 1);
+            common_batch_add(batch, accepted, n_past, {0}, true);
+            common_batch_add(batch, draft, n_past + 1, {0}, true);
+            llama_decode(ctx, batch);
+            llama_batch_free(batch);
+        }
 
-        // GPU-side argmax: 8 bytes instead of 2MB logits transfer
         const llama_token pred = llama_get_argmax_ith(ctx, 0);
 
         if (pred == draft) {
-            // ACCEPT — snapshot is simply discarded
+            // ACCEPT — both tokens are in KV cache and DeltaNet state
             mtp_accepted++;
             n_past += 2;
 
@@ -129,22 +134,22 @@ static void generate_mtp(
                 draft = -1;
             }
         } else {
-            // REJECT — restore recurrent state from snapshot
+            // REJECT — undo draft: restore DeltaNet state, remove draft from KV cache
             mtp_rejected++;
 
             llama_mtp_snapshot_restore(ctx);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, n_past + 2);
 
-            // Remove KV cache entries written by the 2-token verify batch.
-            // After snapshot restore, recurrent state has pos < n_past,
-            // so seq_rm only affects the KV cache side.
-            llama_memory_seq_rm(mem, 0, n_past, -1);
+            // Re-decode just accepted to update state correctly
+            {
+                llama_batch batch = llama_batch_init(1, 0, 1);
+                common_batch_add(batch, accepted, n_past, {0}, true);
+                llama_decode(ctx, batch);
+                llama_batch_free(batch);
+            }
+            n_past++;
 
-            llama_batch batch2 = llama_batch_init(1, 0, 1);
-            common_batch_add(batch2, accepted, n_past++, {0}, true);
-            llama_decode(ctx, batch2);
-            llama_batch_free(batch2);
-
-            accepted = pred;
+            accepted = llama_get_argmax_ith(ctx, 0);
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
@@ -698,7 +703,7 @@ int main(int argc, char ** argv) {
     int n_consumed         = 0;
 
     // MTP speculative decode state
-    const bool use_mtp = llama_model_has_mtp(model) && !params.interactive;
+    const bool use_mtp = llama_model_has_mtp(model) && !params.interactive && !getenv("LLAMA_NO_MTP");
     int mtp_accepted = 0;
     int mtp_rejected = 0;
     bool mtp_skip_decode = false;

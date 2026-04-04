@@ -332,6 +332,65 @@ llama_context::llama_context(
 
         LLAMA_LOG_INFO("%s: MTP KV+hidden buffer size = %8.2f MiB\n", __func__,
             ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+
+        // Load restricted LM head for MTP draft (reduced vocab → faster argmax)
+        const char * lm_head_path = getenv("LLAMA_MTP_LM_HEAD");
+        if (lm_head_path) {
+            FILE * f = fopen(lm_head_path, "rb");
+            if (!f) {
+                LLAMA_LOG_WARN("%s: could not open MTP LM head: %s\n", __func__, lm_head_path);
+            } else {
+                char magic[4];
+                uint32_t version, K, n_embed, gtype, row_bytes;
+                fread(magic, 1, 4, f);
+                fread(&version, 4, 1, f);
+                fread(&K, 4, 1, f);
+                fread(&n_embed, 4, 1, f);
+                fread(&gtype, 4, 1, f);
+                fread(&row_bytes, 4, 1, f);
+
+                if (memcmp(magic, "GWRL", 4) != 0 || version != 1) {
+                    LLAMA_LOG_WARN("%s: invalid MTP LM head file format\n", __func__);
+                    fclose(f);
+                } else if (n_embed != hparams.n_embd) {
+                    LLAMA_LOG_WARN("%s: MTP LM head n_embed mismatch: %u vs %u\n", __func__, n_embed, hparams.n_embd);
+                    fclose(f);
+                } else {
+                    // Read token ID mapping
+                    mtp_token_ids.resize(K);
+                    fread(mtp_token_ids.data(), sizeof(int32_t), K, f);
+
+                    // Create tensor for restricted weights
+                    struct ggml_init_params params_lm = {
+                        /*.mem_size   =*/ ggml_tensor_overhead(),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    mtp_lm_ctx.reset(ggml_init(params_lm));
+
+                    // Q6_K tensor: [n_embed, K] — same layout as model.output but fewer rows
+                    mtp_lm_head = ggml_new_tensor_2d(mtp_lm_ctx.get(), (ggml_type)gtype, n_embed, K);
+                    ggml_format_name(mtp_lm_head, "mtp_lm_head");
+
+                    auto * lm_buf = ggml_backend_alloc_ctx_tensors_from_buft(mtp_lm_ctx.get(), buft);
+                    if (!lm_buf) {
+                        LLAMA_LOG_WARN("%s: failed to allocate MTP LM head buffer\n", __func__);
+                        mtp_lm_head = nullptr;
+                        mtp_token_ids.clear();
+                    } else {
+                        // Read Q6_K weight data and upload to GPU
+                        std::vector<uint8_t> weight_data(K * row_bytes);
+                        fread(weight_data.data(), 1, K * row_bytes, f);
+                        ggml_backend_tensor_set(mtp_lm_head, weight_data.data(), 0, K * row_bytes);
+                        mtp_lm_buf.reset(lm_buf);
+
+                        LLAMA_LOG_INFO("%s: MTP restricted LM head: %u tokens, %.1f MiB\n",
+                            __func__, K, ggml_backend_buffer_get_size(lm_buf) / 1024.0 / 1024.0);
+                    }
+                    fclose(f);
+                }
+            }
+        }
     }
 
     // init backends
@@ -1459,6 +1518,7 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
         /*.mtp_k_cache      =*/ mtp_k_cache,
         /*.mtp_v_cache      =*/ mtp_v_cache,
         /*.mtp_hidden_state =*/ mtp_hidden_state,
+        /*.mtp_lm_head      =*/ mtp_lm_head,
         /*.mtp_kv_pos       =*/ mtp_kv_pos,
         /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)mtp_k_cache->ne[1] : 0,
     };
@@ -1525,7 +1585,13 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(mtp_sched_ptr, t_argmax);
         ggml_backend_tensor_get_async(backend_res, t_argmax, &argmax_result, 0, sizeof(int32_t));
         ggml_backend_sched_synchronize(mtp_sched_ptr);
-        mtp_last_argmax = argmax_result;
+
+        // Map restricted vocab index back to full vocab ID
+        if (mtp_lm_head && argmax_result >= 0 && argmax_result < (int32_t)mtp_token_ids.size()) {
+            mtp_last_argmax = mtp_token_ids[argmax_result];
+        } else {
+            mtp_last_argmax = argmax_result;
+        }
     } else {
         // Fallback: extract full logits (legacy path)
         auto * t_logits = res->get_logits();
@@ -1602,9 +1668,6 @@ int llama_context::mtp_snapshot_save() {
             }
         }
     }
-    // No explicit sync needed — subsequent compute on the same CUDA stream
-    // is implicitly ordered after these async copies.
-
     // Save CPU-side metadata
     mtp_rs_snapshot.head = mem_recr->head;
     mtp_rs_snapshot.used = mem_recr->used;
@@ -1668,8 +1731,6 @@ int llama_context::mtp_snapshot_restore() {
             }
         }
     }
-    // No explicit sync needed — same CUDA stream ordering as save.
-
     // Restore CPU-side metadata
     mem_recr->head = mtp_rs_snapshot.head;
     mem_recr->used = mtp_rs_snapshot.used;
@@ -2627,6 +2688,7 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_k_cache      =*/ mtp_k_cache,
         /*.mtp_v_cache      =*/ mtp_v_cache,
         /*.mtp_hidden_state =*/ mtp_hidden_state,
+        /*.mtp_lm_head      =*/ mtp_lm_head,
         /*.mtp_kv_pos       =*/ mtp_kv_pos,
         /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)mtp_k_cache->ne[1] : 0,
     };

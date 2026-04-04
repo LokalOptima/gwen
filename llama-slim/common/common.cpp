@@ -1070,6 +1070,13 @@ common_init_result::common_init_result(common_params & params) :
         cparams.n_seq_max = 2;
     }
 
+    // MTP 2-token verify requires flash attention disabled: the fattn-vec (1-token)
+    // and fattn-tile (2-token) kernels produce different FP results, breaking
+    // bit-identical verification. FA also hurts decode perf on this model.
+    if (llama_model_has_mtp(model) && cparams.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters

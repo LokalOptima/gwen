@@ -594,6 +594,7 @@ struct llm_graph_params {
     ggml_tensor * mtp_k_cache      = nullptr;
     ggml_tensor * mtp_v_cache      = nullptr;
     ggml_tensor * mtp_hidden_state = nullptr; // [n_embd, 1] F32 persistent
+    ggml_tensor * mtp_lm_head      = nullptr; // [n_embd, K] Q6_K restricted output weights (nullptr → use full model.output)
     int32_t       mtp_kv_pos       = 0;
     int32_t       mtp_n_kv         = 0;       // fixed KV size for graph reuse (= n_ctx)
 
@@ -789,6 +790,7 @@ struct llm_graph_context {
     ggml_tensor * mtp_k_cache;
     ggml_tensor * mtp_v_cache;
     ggml_tensor * mtp_hidden_state;
+    ggml_tensor * mtp_lm_head;
     int32_t       mtp_kv_pos;
     int32_t       mtp_n_kv;
 

@@ -672,8 +672,14 @@ void llm_build_qwen35::build_mtp() {
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // Shared LM head
-    cur = build_lora_mm(model.output, cur);
+    // MTP LM head: use restricted vocab (50K rows) if available, else full vocab (248K rows).
+    // The restricted head is 5× smaller → 5× faster GEMV. The argmax index maps back to
+    // full vocab ID via mtp_token_ids[] in the context.
+    if (mtp_lm_head) {
+        cur = ggml_mul_mat(ctx0, mtp_lm_head, cur);
+    } else {
+        cur = build_lora_mm(model.output, cur);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

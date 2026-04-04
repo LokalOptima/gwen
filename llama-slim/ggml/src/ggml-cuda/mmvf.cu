@@ -814,7 +814,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return src0_small && ne11 <= 2;
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;
