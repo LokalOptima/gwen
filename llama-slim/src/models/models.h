@@ -36,6 +36,7 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 int           il);
 
     // use the ggml_gated_delta_net fused operator
+    // l2_norm_eps > 0: fuse L2 normalization of Q and K into the kernel
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -43,9 +44,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                      float   l2_norm_eps = 0.0f);
 
     // choose one of two implementations above based on the number of tokens
+    // l2_norm_eps > 0: fuse L2 normalization into the fused kernel
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -53,7 +56,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * g,
                 ggml_tensor * b,
                 ggml_tensor * s,
-                        int   il);
+                        int   il,
+                      float   l2_norm_eps = 0.0f);
 };
 
 //

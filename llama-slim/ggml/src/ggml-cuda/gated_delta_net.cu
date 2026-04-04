@@ -1,6 +1,6 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA>
+template <int S_v, bool KDA, bool L2_NORM>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -23,7 +23,8 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       sb3,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
-                                     float         scale) {
+                                     float         scale,
+                                     float         l2_eps) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -77,6 +78,27 @@ gated_delta_net_cuda(const float * q,
             const int i = r * warp_size + lane;
             k_reg[r] = k_t[i];
             q_reg[r] = q_t[i];
+        }
+
+        // Fused L2 normalization: normalize Q and K in-place
+        // Eliminates separate l2_norm kernel launches (2 per DeltaNet layer)
+        if constexpr (L2_NORM) {
+            float q_sq = 0.0f, k_sq = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                q_sq += q_reg[r] * q_reg[r];
+                k_sq += k_reg[r] * k_reg[r];
+            }
+            float q_sum = warp_reduce_sum<warp_size>(q_sq);
+            float k_sum = warp_reduce_sum<warp_size>(k_sq);
+            // PyTorch F.normalize: x / max(||x||, eps)
+            float q_inv = rsqrtf(fmaxf(q_sum, l2_eps * l2_eps));
+            float k_inv = rsqrtf(fmaxf(k_sum, l2_eps * l2_eps));
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                q_reg[r] *= q_inv;
+                k_reg[r] *= k_inv;
+            }
         }
 
         if constexpr (!KDA) {
@@ -158,7 +180,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <bool KDA>
+template <bool KDA, bool L2_NORM>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -168,7 +190,7 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, cudaStream_t stream) {
+        float scale, float l2_eps, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -178,35 +200,31 @@ static void launch_gated_delta_net(
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
-    int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-
     switch (S_v) {
         case 16:
-            gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
+            gated_delta_net_cuda<16, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
             break;
         case 32:
-            gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
+            gated_delta_net_cuda<32, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
             break;
-        case 64: {
-            gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
+        case 64:
+            gated_delta_net_cuda<64, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
             break;
-        }
-        case 128: {
-            gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
+        case 128:
+            gated_delta_net_cuda<128, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
             break;
-        }
         default:
             GGML_ABORT("fatal error");
             break;
@@ -272,15 +290,28 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    // Check op_params for fused L2 norm (non-zero eps signals "apply L2 norm to Q and K")
+    float l2_eps = 0.0f;
+    memcpy(&l2_eps, dst->op_params, sizeof(float));
+    const bool l2_norm = (l2_eps != 0.0f);
+
     cudaStream_t stream = ctx.stream();
 
-    if (kda) {
-        launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+    if (kda && l2_norm) {
+        launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+            sb1, sb2, sb3, neqk1, rq3, scale, l2_eps, stream);
+    } else if (kda) {
+        launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, 0.0f, stream);
+    } else if (l2_norm) {
+        launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, l2_eps, stream);
     } else {
-        launch_gated_delta_net<false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
+        launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+            sb1, sb2, sb3, neqk1, rq3, scale, 0.0f, stream);
     }
 }

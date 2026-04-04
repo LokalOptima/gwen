@@ -6194,6 +6194,21 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_l2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        float                 l2_norm_eps) {
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+    // Store L2 norm eps in op_params — non-zero signals "apply L2 norm to Q and K"
+    memcpy(result->op_params, &l2_norm_eps, sizeof(float));
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {

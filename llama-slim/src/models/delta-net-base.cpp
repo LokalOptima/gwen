@@ -376,7 +376,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        float         l2_norm_eps) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -397,7 +398,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    ggml_tensor * result;
+    if (l2_norm_eps > 0.0f) {
+        result = ggml_gated_delta_net_l2(ctx0, q, k, v, g, b, s, l2_norm_eps);
+    } else {
+        result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
+    }
     if (n_tokens == 1) {
         cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
     } else {
@@ -427,18 +433,19 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * g,
         ggml_tensor * b,
         ggml_tensor * s,
-        int           il) {
+        int           il,
+        float         l2_norm_eps) {
     const int64_t n_seq_tokens = q->ne[2];
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
-            return build_delta_net_fused(q, k, v, g, b, s, il);
+            return build_delta_net_fused(q, k, v, g, b, s, il, l2_norm_eps);
         }
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }
 
     if (cparams.fused_gdn_ch) {
-        return build_delta_net_fused(q, k, v, g, b, s, il);
+        return build_delta_net_fused(q, k, v, g, b, s, il, l2_norm_eps);
     }
 
     return build_delta_net_chunking(q, k, v, g, b, s, il);
