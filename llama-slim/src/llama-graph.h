@@ -598,6 +598,12 @@ struct llm_graph_params {
     int32_t       mtp_kv_pos       = 0;
     int32_t       mtp_n_kv         = 0;       // fixed KV size for graph reuse (= n_ctx)
 
+    // MTP intermediate state buffers for 2-token rollback (per-layer, nullptr if no MTP)
+    // Written by the DeltaNet kernel (S) and conv state graph nodes (R) during 2-token decode.
+    // On rejection, these provide the state after just the accepted token — no re-decode needed.
+    ggml_tensor ** mtp_intermediate_s = nullptr; // [n_layer] intermediate DeltaNet S state
+    ggml_tensor ** mtp_intermediate_r = nullptr; // [n_layer] intermediate conv R state
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -793,6 +799,10 @@ struct llm_graph_context {
     ggml_tensor * mtp_lm_head;
     int32_t       mtp_kv_pos;
     int32_t       mtp_n_kv;
+
+    // MTP intermediate state buffers (per-layer, nullptr if no MTP)
+    ggml_tensor ** mtp_intermediate_s;
+    ggml_tensor ** mtp_intermediate_r;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

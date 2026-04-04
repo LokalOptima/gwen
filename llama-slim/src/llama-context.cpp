@@ -536,6 +536,53 @@ llama_context::llama_context(
                         ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
                         n_snap_tensors);
                 }
+
+                // Allocate intermediate state buffers (same layout as snapshots)
+                // These are written by the graph during 2-token decode and used on reject
+                // to restore state to after-accepted-only, eliminating the 1.87ms re-decode.
+                if (n_snap_tensors > 0) {
+                    struct ggml_init_params params_inter = {
+                        /*.mem_size   =*/ n_snap_tensors * ggml_tensor_overhead(),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    mtp_intermediate.ctx.reset(ggml_init(params_inter));
+
+                    mtp_intermediate.s.resize(n_layer, nullptr);
+                    mtp_intermediate.r.resize(n_layer, nullptr);
+
+                    for (int32_t il = 0; il < n_layer; il++) {
+                        if (mem_recr->s_l[il]) {
+                            auto * src = mem_recr->s_l[il];
+                            auto * t = ggml_new_tensor_1d(mtp_intermediate.ctx.get(),
+                                src->type, ggml_nelements(src));
+                            ggml_format_name(t, "inter_s_l%d", il);
+                            mtp_intermediate.s[il] = t;
+                        }
+                        if (mem_recr->r_l[il]) {
+                            auto * src = mem_recr->r_l[il];
+                            auto * t = ggml_new_tensor_1d(mtp_intermediate.ctx.get(),
+                                src->type, ggml_nelements(src));
+                            ggml_format_name(t, "inter_r_l%d", il);
+                            mtp_intermediate.r[il] = t;
+                        }
+                    }
+
+                    auto * dev_inter = model.dev_layer(0);
+                    auto buft_inter = ggml_backend_dev_buffer_type(dev_inter);
+                    auto * buf_inter = ggml_backend_alloc_ctx_tensors_from_buft(
+                        mtp_intermediate.ctx.get(), buft_inter);
+                    if (!buf_inter) {
+                        throw std::runtime_error("failed to allocate MTP intermediate state buffers");
+                    }
+                    ggml_backend_buffer_clear(buf_inter, 0);
+                    mtp_intermediate.buf.reset(buf_inter);
+
+                    LLAMA_LOG_INFO("%s: MTP intermediate buffer size = %8.2f MiB (%u tensors)\n",
+                        __func__,
+                        ggml_backend_buffer_get_size(buf_inter) / 1024.0 / 1024.0,
+                        n_snap_tensors);
+                }
             }
         }
     }
@@ -1431,7 +1478,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     return res;
 }
 
-int llama_context::decode_mtp(llama_token token, llama_pos pos) {
+int llama_context::decode_mtp(llama_token token, llama_pos pos, int32_t hidden_idx) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
     const int64_t n_vocab = vocab.n_tokens();
@@ -1458,7 +1505,9 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
     if (mtp_hidden_state) {
         const int64_t n_embd = hparams.n_embd;
         const int64_t n_tokens_src = t_hidden_src->ne[1];
-        const size_t offset = (n_tokens_src - 1) * t_hidden_src->nb[1];
+        const int64_t idx = (hidden_idx >= 0) ? hidden_idx : (n_tokens_src - 1);
+        GGML_ASSERT(idx < n_tokens_src);
+        const size_t offset = idx * t_hidden_src->nb[1];
         const size_t row_bytes = n_embd * sizeof(float);
         std::vector<float> hidden_buf(n_embd);
         ggml_backend_tensor_get(t_hidden_src, hidden_buf.data(), offset, row_bytes);
@@ -1521,6 +1570,8 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos) {
         /*.mtp_lm_head      =*/ mtp_lm_head,
         /*.mtp_kv_pos       =*/ mtp_kv_pos,
         /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)mtp_k_cache->ne[1] : 0,
+        /*.mtp_intermediate_s =*/ mtp_intermediate.s.empty() ? nullptr : const_cast<ggml_tensor **>(mtp_intermediate.s.data()),
+        /*.mtp_intermediate_r =*/ mtp_intermediate.r.empty() ? nullptr : const_cast<ggml_tensor **>(mtp_intermediate.r.data()),
     };
 
     auto * gf = res->get_gf();
@@ -1750,6 +1801,122 @@ int llama_context::mtp_snapshot_restore() {
     mtp_kv_pos = mtp_rs_snapshot.saved_mtp_kv_pos;
 
     mtp_rs_snapshot.valid = false;
+    return 0;
+}
+
+int llama_context::mtp_intermediate_prefill() {
+    // Copy current s_l/r_l to intermediate buffers so that non-kv_head cells
+    // have valid state. The 2-token decode graph then overwrites the kv_head cell
+    // with the intermediate state (after token 0).
+    auto * mem_recr = get_mem_recr(memory.get());
+    if (!mem_recr) return -1;
+    if (mtp_intermediate.s.empty()) return -1;
+
+    const int32_t n_layer = model.hparams.n_layer_total();
+
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+
+    for (int32_t il = 0; il < n_layer; il++) {
+        if (mtp_intermediate.s[il] && mem_recr->s_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mem_recr->s_l[il], mtp_intermediate.s[il]);
+            } else {
+                ggml_backend_tensor_copy(mem_recr->s_l[il], mtp_intermediate.s[il]);
+            }
+        }
+        if (mtp_intermediate.r[il] && mem_recr->r_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mem_recr->r_l[il], mtp_intermediate.r[il]);
+            } else {
+                ggml_backend_tensor_copy(mem_recr->r_l[il], mtp_intermediate.r[il]);
+            }
+        }
+    }
+
+    return 0;
+}
+
+int llama_context::mtp_reject_fixup(llama_pos n_past) {
+    // After a 2-token decode at positions [n_past, n_past+1] where draft (pos n_past+1)
+    // was rejected, this function:
+    // 1. Restores S/R state to intermediate (after accepted only)
+    // 2. Fixes recurrent cell pos from n_past+1 → n_past so cell tracks accepted
+    // 3. Removes draft from attention KV cache
+
+    // Step 1: restore intermediate S/R state
+    int rc = mtp_intermediate_restore();
+    if (rc != 0) return rc;
+
+    // Step 2: fix recurrent cell pos BEFORE seq_rm (otherwise cell gets cleared entirely)
+    auto * mem_recr = get_mem_recr(memory.get());
+    if (mem_recr) {
+        for (uint32_t i = 0; i < mem_recr->size; i++) {
+            if (mem_recr->cells[i].pos == n_past + 1 && mem_recr->cells[i].seq_id.count(0)) {
+                mem_recr->cells[i].pos = n_past;
+                break;
+            }
+        }
+    }
+
+    // Step 3: remove only the draft position from memory (attention KV + recurrent)
+    // Since we fixed the cell's pos to n_past, the recurrent cell won't match [n_past+1, n_past+2)
+    // and only the attention KV entry at n_past+1 gets removed.
+    llama_memory_seq_rm(memory.get(), 0, n_past + 1, n_past + 2);
+
+    return 0;
+}
+
+int llama_context::mtp_intermediate_restore() {
+    auto * mem_recr = get_mem_recr(memory.get());
+    if (!mem_recr) {
+        LLAMA_LOG_ERROR("%s: model does not use hybrid/recurrent memory\n", __func__);
+        return -1;
+    }
+
+    if (mtp_intermediate.s.empty()) {
+        LLAMA_LOG_ERROR("%s: intermediate buffers not allocated\n", __func__);
+        return -1;
+    }
+
+    const int32_t n_layer = model.hparams.n_layer_total();
+
+    // Get GPU backend for async copies
+    ggml_backend_t gpu_backend = nullptr;
+    for (auto & backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            gpu_backend = backend.get();
+            break;
+        }
+    }
+
+    // Copy intermediate S and R state → current state (all async, single sync at end)
+    for (int32_t il = 0; il < n_layer; il++) {
+        if (mtp_intermediate.s[il] && mem_recr->s_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mtp_intermediate.s[il], mem_recr->s_l[il]);
+            } else {
+                ggml_backend_tensor_copy(mtp_intermediate.s[il], mem_recr->s_l[il]);
+            }
+        }
+        if (mtp_intermediate.r[il] && mem_recr->r_l[il]) {
+            if (gpu_backend) {
+                ggml_backend_tensor_copy_async(gpu_backend, gpu_backend,
+                    mtp_intermediate.r[il], mem_recr->r_l[il]);
+            } else {
+                ggml_backend_tensor_copy(mtp_intermediate.r[il], mem_recr->r_l[il]);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -2691,6 +2858,8 @@ llm_graph_params llama_context::graph_params(
         /*.mtp_lm_head      =*/ mtp_lm_head,
         /*.mtp_kv_pos       =*/ mtp_kv_pos,
         /*.mtp_n_kv         =*/ mtp_k_cache ? (int32_t)mtp_k_cache->ne[1] : 0,
+        /*.mtp_intermediate_s =*/ mtp_intermediate.s.empty() ? nullptr : const_cast<ggml_tensor **>(mtp_intermediate.s.data()),
+        /*.mtp_intermediate_r =*/ mtp_intermediate.r.empty() ? nullptr : const_cast<ggml_tensor **>(mtp_intermediate.r.data()),
     };
 }
 
@@ -3972,8 +4141,9 @@ int32_t llama_decode(
 int32_t llama_decode_mtp(
         llama_context * ctx,
           llama_token   token,
-            llama_pos   pos) {
-    return ctx->decode_mtp(token, pos);
+            llama_pos   pos,
+            int32_t     hidden_idx) {
+    return ctx->decode_mtp(token, pos, hidden_idx);
 }
 
 llama_token llama_mtp_get_argmax(llama_context * ctx) {
@@ -3995,6 +4165,18 @@ int32_t llama_mtp_snapshot_save(llama_context * ctx) {
 
 int32_t llama_mtp_snapshot_restore(llama_context * ctx) {
     return ctx->mtp_snapshot_restore();
+}
+
+int32_t llama_mtp_intermediate_prefill(llama_context * ctx) {
+    return ctx->mtp_intermediate_prefill();
+}
+
+int32_t llama_mtp_intermediate_restore(llama_context * ctx) {
+    return ctx->mtp_intermediate_restore();
+}
+
+int32_t llama_mtp_reject_fixup(llama_context * ctx, llama_pos n_past) {
+    return ctx->mtp_reject_fixup(n_past);
 }
 
 //

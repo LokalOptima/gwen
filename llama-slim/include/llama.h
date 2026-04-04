@@ -950,11 +950,13 @@ extern "C" {
     // Produces draft logits accessible via llama_get_logits().
     // token: the accepted token sampled from the last decode's logits
     // pos: the position for this MTP computation
+    // hidden_idx: which token's hidden state to use from the previous decode (-1 = last token)
     // Returns 0 on success.
     LLAMA_API int32_t llama_decode_mtp(
             struct llama_context * ctx,
                    llama_token     token,
-                   llama_pos       pos);
+                   llama_pos       pos,
+                   int32_t         hidden_idx = -1);
 
     // Get the GPU-side argmax result from the last decode_mtp call.
     // Returns the token ID (greedy draft), or -1 if not available.
@@ -970,6 +972,17 @@ extern "C" {
     // which enables graph reuse for the verify decode.
     LLAMA_API int32_t llama_mtp_snapshot_save(struct llama_context * ctx);
     LLAMA_API int32_t llama_mtp_snapshot_restore(struct llama_context * ctx);
+
+    // Pre-fill intermediate buffers with current state before a 2-token decode.
+    // The DeltaNet kernel then overwrites the active cell with intermediate state (after token 0).
+    LLAMA_API int32_t llama_mtp_intermediate_prefill(struct llama_context * ctx);
+
+    // Restore intermediate recurrent state (after token 0 of a 2-token decode).
+    // Eliminates the 1.87ms re-decode on speculation rejection.
+    LLAMA_API int32_t llama_mtp_intermediate_restore(struct llama_context * ctx);
+
+    // Full reject cleanup: restore intermediate S/R, fix recurrent cell pos, remove draft from KV.
+    LLAMA_API int32_t llama_mtp_reject_fixup(struct llama_context * ctx, llama_pos n_past);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

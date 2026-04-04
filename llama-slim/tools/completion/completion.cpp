@@ -92,10 +92,12 @@ static void generate_mtp(
         // weight reads across 2 tokens (~1.3× cost of 1-token decode).
         // Requires: mmvf ne11<=2 fix + flash attention disabled (both ensure
         // bit-identical results for position 0 vs 1-token decode).
-
-        // Snapshot DeltaNet recurrent state before 2-token decode.
-        // On rejection, we restore this and re-decode just accepted.
-        llama_mtp_snapshot_save(ctx);
+        //
+        // The DeltaNet kernel saves intermediate S state (after token 0) during the
+        // 2-token decode. On rejection, we restore this intermediate state instead of
+        // snapshot_restore + re-decode, saving ~1.87ms per rejection.
+        // Pre-fill intermediate buffers with current state so non-active cells are valid.
+        llama_mtp_intermediate_prefill(ctx);
 
         {
             llama_batch batch = llama_batch_init(2, 0, 1);
@@ -134,28 +136,23 @@ static void generate_mtp(
                 draft = -1;
             }
         } else {
-            // REJECT — undo draft: restore DeltaNet state, remove draft from KV cache
+            // REJECT — restore intermediate state (after accepted, before draft)
+            // No re-decode needed: intermediate S/R state was saved by the kernel.
             mtp_rejected++;
 
-            llama_mtp_snapshot_restore(ctx);
-            llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, n_past + 2);
-
-            // Re-decode just accepted to update state correctly
-            {
-                llama_batch batch = llama_batch_init(1, 0, 1);
-                common_batch_add(batch, accepted, n_past, {0}, true);
-                llama_decode(ctx, batch);
-                llama_batch_free(batch);
-            }
+            // Full reject cleanup: restore intermediate S/R, fix recurrent cell pos, remove draft from KV
+            llama_mtp_reject_fixup(ctx, n_past);
             n_past++;
 
-            accepted = llama_get_argmax_ith(ctx, 0);
+            // pred is the correct next token (argmax at position 0 of 2-token decode)
+            accepted = pred;
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
             --n_remain;
 
-            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+            // Use hidden_idx=0 to get token 0's hidden state from the 2-token decode
+            if (llama_decode_mtp(ctx, accepted, n_past, 0) == 0) {
                 draft = llama_mtp_get_argmax(ctx);
             } else {
                 draft = -1;

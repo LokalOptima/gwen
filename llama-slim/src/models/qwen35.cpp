@@ -366,6 +366,38 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
                 ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
                     kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
 
+    // For 2-token batches: save intermediate S and R state (after token 0, before token 1)
+    // for MTP speculation rollback without re-decode.
+    if (n_seq_tokens >= 2 && mtp_intermediate_s && mtp_intermediate_s[il]) {
+        // Intermediate S: the fused DeltaNet kernel writes it right after the final state in dst.
+        // new_state is a view of the kernel result tensor; intermediate state follows it.
+        ggml_tensor * result_raw = new_state->view_src;
+        GGML_ASSERT(result_raw != nullptr);
+        size_t istate_offset = new_state->view_offs + ggml_nbytes(new_state);
+        ggml_tensor * intermediate_s_view = ggml_view_1d(ctx0, result_raw,
+            hparams.n_embd_s() * n_seqs, istate_offset);
+
+        ggml_tensor * inter_s_target = ggml_view_1d(ctx0, mtp_intermediate_s[il],
+            hparams.n_embd_s() * n_seqs,
+            kv_head * hparams.n_embd_s() * ggml_element_size(mtp_intermediate_s[il]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, intermediate_s_view, inter_s_target));
+    }
+
+    if (n_seq_tokens >= 2 && mtp_intermediate_r && mtp_intermediate_r[il]) {
+        // Intermediate R (conv state): after processing token 0, the sliding window is
+        // conv_input[1 : kernel_size], instead of conv_input[n_tokens : n_tokens + kernel_size - 1].
+        const int64_t conv_elems_per_seq = (conv_kernel_size - 1) * conv_channels;
+        ggml_tensor * intermediate_conv = ggml_view_3d(ctx0, conv_input,
+            conv_kernel_size - 1, conv_channels, n_seqs,
+            conv_input->nb[1], conv_input->nb[2],
+            (n_seq_tokens - 1) * ggml_element_size(conv_input));
+
+        ggml_tensor * inter_r_target = ggml_view_1d(ctx0, mtp_intermediate_r[il],
+            conv_elems_per_seq * n_seqs,
+            kv_head * conv_elems_per_seq * ggml_element_size(mtp_intermediate_r[il]));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, intermediate_conv, inter_r_target));
+    }
+
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 

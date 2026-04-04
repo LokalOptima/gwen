@@ -135,13 +135,21 @@ struct llama_context {
     // pos: the position for this MTP computation
     // After this call, llama_get_logits(ctx) contains the draft logits.
     // Returns 0 on success, negative on error.
-    int decode_mtp(llama_token token, llama_pos pos);
+    int decode_mtp(llama_token token, llama_pos pos, int32_t hidden_idx = -1);
 
     // Snapshot/restore recurrent state for MTP speculation rollback.
     // Replaces seq_cp/seq_rm to keep recurrent state head stable → enables graph reuse.
     // Returns 0 on success, negative on error.
     int mtp_snapshot_save();
     int mtp_snapshot_restore();
+    int mtp_intermediate_prefill();  // copy current S/R → intermediate buffers (pre-fill before 2-token decode)
+    int mtp_intermediate_restore();  // copy intermediate S/R → current state (no re-decode)
+
+    // Full reject cleanup for 2-token speculation with intermediate state.
+    // 1. Restores intermediate S/R state (after accepted, before draft)
+    // 2. Fixes recurrent cell pos from n_past+1 → n_past (so cell survives seq_rm)
+    // 3. Removes draft from attention KV + any dangling recurrent entries
+    int mtp_reject_fixup(llama_pos n_past);
 
     // GPU-side argmax result from the last decode_mtp call
     llama_token get_mtp_argmax() const { return mtp_last_argmax; }
@@ -381,6 +389,17 @@ private:
     ggml_context_ptr        mtp_hidden_ctx;
     ggml_backend_buffer_ptr mtp_hidden_buf;
     ggml_tensor *           mtp_hidden_state = nullptr; // [n_embd, 1] F32 persistent on GPU (matches t_hidden_prenorm layout)
+
+    // MTP intermediate state buffers (for 2-token rollback without re-decode)
+    // Written by DeltaNet kernel (S) and conv state graph nodes (R) during 2-token decode.
+    // On rejection, copy intermediate → current state instead of snapshot_restore + re-decode.
+    struct mtp_intermediate_t {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        std::vector<ggml_tensor *> s;  // per-layer intermediate S state (after token 0)
+        std::vector<ggml_tensor *> r;  // per-layer intermediate R state (after token 0)
+    };
+    mtp_intermediate_t mtp_intermediate;
 
     // MTP recurrent state snapshot (for speculation rollback without seq_cp/seq_rm)
     // Eliminates graph rebuild (~5ms) by keeping recurrent state head stable.

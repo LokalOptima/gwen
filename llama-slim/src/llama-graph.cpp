@@ -890,6 +890,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mtp_lm_head      (params.mtp_lm_head),
     mtp_kv_pos       (params.mtp_kv_pos),
     mtp_n_kv         (params.mtp_n_kv),
+    mtp_intermediate_s(params.mtp_intermediate_s),
+    mtp_intermediate_r(params.mtp_intermediate_r),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

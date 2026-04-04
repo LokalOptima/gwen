@@ -34,11 +34,15 @@ gated_delta_net_cuda(const float * q,
     const uint32_t iq3 = fastdiv(sequence, rq3_magic);
 
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    const int64_t state_elems      = S_v * S_v * H * n_seqs;
     float *       attn_data        = dst;
     float *       state            = dst + attn_score_elems;
+    // When n_tokens >= 2, the output buffer has space for intermediate state after final state
+    float *       istate           = (n_tokens >= 2) ? (state + state_elems) : nullptr;
 
     const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
     state += state_offset;
+    if (istate) { istate += state_offset; }
     curr_state += state_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
@@ -131,6 +135,15 @@ gated_delta_net_cuda(const float * q,
 
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
+            }
+        }
+
+        // Save intermediate S state after token 0 (for MTP 2-token rollback)
+        if (t == 0 && istate != nullptr) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i            = r * warp_size + lane;
+                istate[col * S_v + i]  = s_shard[r];
             }
         }
 
