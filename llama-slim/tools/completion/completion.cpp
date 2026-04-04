@@ -109,7 +109,9 @@ static void generate_mtp(
         }
 
         // --- Speculative path (2-token verify) ---
-        llama_mtp_intermediate_prefill(ctx);
+        // Note: mtp_intermediate_prefill() removed — the fused DeltaNet kernel
+        // already saves post-token-0 intermediate state as part of the compute graph
+        // (gated_delta_net_cuda writes istate, graph copies to mtp_intermediate_s/r).
 
         {
             llama_batch batch = llama_batch_init(2, 0, 1);

@@ -3028,7 +3028,12 @@ static bool ggml_cuda_graph_node_properties_match(ggml_tensor * node, ggml_cuda_
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Combine first node pointer with graph size so different batch sizes
+    // (e.g. 1-token vs 2-token in speculative decode) get separate graph
+    // instances instead of oscillating warmup resets.
+    uintptr_t key = reinterpret_cast<uintptr_t>(cgraph->nodes[0]);
+    key ^= static_cast<uintptr_t>(cgraph->n_nodes) * UINT64_C(0x9e3779b97f4a7c15);
+    return reinterpret_cast<const void *>(key);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <unistd.h>
 
 // Helper to get the recurrent memory from either llama_memory_hybrid or llama_memory_hybrid_iswa
 static llama_memory_recurrent * get_mem_recr(llama_memory_i * mem) {
@@ -334,7 +335,19 @@ llama_context::llama_context(
             ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
 
         // Load restricted LM head for MTP draft (reduced vocab → faster argmax)
+        // Try env var first, then default path
         const char * lm_head_path = getenv("LLAMA_MTP_LM_HEAD");
+        std::string lm_head_default;
+        if (!lm_head_path) {
+            const char * home = getenv("HOME");
+            if (home) {
+                lm_head_default = std::string(home) + "/.cache/gwen/lm_head_top50000.bin";
+                if (access(lm_head_default.c_str(), R_OK) == 0) {
+                    lm_head_path = lm_head_default.c_str();
+                    LLAMA_LOG_INFO("%s: using default MTP LM head: %s\n", __func__, lm_head_path);
+                }
+            }
+        }
         if (lm_head_path) {
             FILE * f = fopen(lm_head_path, "rb");
             if (!f) {
@@ -1629,6 +1642,7 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos, int32_t hidden_i
             return -1;
         }
     }
+
     // 7. Extract argmax result (4 bytes) instead of full logits (1MB)
     auto * t_argmax = res->t_mtp_argmax;
     if (t_argmax) {
