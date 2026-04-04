@@ -7,16 +7,21 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
 BUILD_DIR="$SCRIPT_DIR/../llama-slim/build"
 COMPLETION="$BUILD_DIR/bin/llama-completion"
 BENCH="$BUILD_DIR/bin/llama-bench"
-MODEL_BASE="$HOME/.cache/gwen/Qwen3.5-0.8B-Base-Q4_K_M.gguf"
-MODEL_MTP="$HOME/.cache/gwen/Qwen3.5-0.8B-Base-mtp-Q4_K_M.gguf"
 N=${1:-200}
 
 for f in "$COMPLETION" "$BENCH"; do
     if [ ! -x "$f" ]; then
         echo "ERROR: $(basename $f) not found at $f" >&2
+        exit 1
+    fi
+done
+for f in "$MODEL_BASE" "$MODEL_MTP"; do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: model not found: $f" >&2
         exit 1
     fi
 done

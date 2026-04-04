@@ -7,9 +7,15 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
 GWEN="./build/gwen"
 LLAMA_BENCH="llama-bench"
-LLAMA_MODEL="$HOME/.cache/gwen/Qwen3.5-0.8B-Base-Q4_K_M.gguf"
+LLAMA_MODEL="${LLAMA_MODEL:-$MODEL_BASE}"
+if [ ! -f "$LLAMA_MODEL" ]; then
+    echo "ERROR: model not found: $LLAMA_MODEL" >&2
+    exit 1
+fi
 RUNS=5
 LENGTHS="128 256 512"
 GWEN_ONLY=false

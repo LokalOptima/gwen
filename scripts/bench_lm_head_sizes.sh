@@ -7,9 +7,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/config.sh"
 BUILD_DIR="$SCRIPT_DIR/../llama-slim/build"
 COMPLETION="$BUILD_DIR/bin/llama-completion"
-MODEL_MTP="$HOME/.cache/gwen/Qwen3.5-0.8B-Base-mtp-Q4_K_M.gguf"
 N=200
 
 if [ ! -x "$COMPLETION" ]; then
