@@ -6,6 +6,7 @@
 #include "llama.h"
 #include "chat.h"
 
+#include <chrono>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -43,6 +44,9 @@ static void generate_mtp(
         bool special) {
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
+    const int initial_output_size = (int)output_tokens.size();
+    double mtp_draft_ms_total = 0.0;
+    double main_decode_ms_total = 0.0;
 
     // Sample first accepted from prefill/previous decode logits
     llama_token accepted = greedy_argmax(llama_get_logits(ctx), n_vocab);
@@ -55,13 +59,20 @@ static void generate_mtp(
 
     // Get first MTP draft (GPU-side argmax avoids 1MB logits transfer)
     llama_token draft = -1;
-    if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-        draft = llama_mtp_get_argmax(ctx);
+    {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+            draft = llama_mtp_get_argmax(ctx);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
 
     // Enable argmax-only mode: decode() extracts GPU-computed argmax (8 bytes)
     // instead of transferring full logits (2MB) per cycle.
     llama_set_argmax_only(ctx, true);
+
+    auto t_decode_start = std::chrono::high_resolution_clock::now();
 
     while (n_remain > 0) {
         if (llama_vocab_is_eog(vocab, accepted)) break;
@@ -70,7 +81,12 @@ static void generate_mtp(
             // No valid draft — single token decode
             llama_batch batch = llama_batch_init(1, 0, 1);
             common_batch_add(batch, accepted, n_past++, {0}, true);
-            llama_decode(ctx, batch);
+            {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                llama_decode(ctx, batch);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                main_decode_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            }
             llama_batch_free(batch);
 
             accepted = llama_get_argmax_ith(ctx, 0);
@@ -79,31 +95,32 @@ static void generate_mtp(
             output_ss << common_token_to_piece(ctx, accepted, special);
             --n_remain;
 
-            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-                draft = llama_mtp_get_argmax(ctx);
-            } else {
-                draft = -1;
+            {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+                    draft = llama_mtp_get_argmax(ctx);
+                } else {
+                    draft = -1;
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
             continue;
         }
 
         // --- Speculative path (2-token verify) ---
-        // Decode [accepted, draft] in a single 2-token batch. This amortizes
-        // weight reads across 2 tokens (~1.3× cost of 1-token decode).
-        // Requires: mmvf ne11<=2 fix + flash attention disabled (both ensure
-        // bit-identical results for position 0 vs 1-token decode).
-        //
-        // The DeltaNet kernel saves intermediate S state (after token 0) during the
-        // 2-token decode. On rejection, we restore this intermediate state instead of
-        // snapshot_restore + re-decode, saving ~1.87ms per rejection.
-        // Pre-fill intermediate buffers with current state so non-active cells are valid.
         llama_mtp_intermediate_prefill(ctx);
 
         {
             llama_batch batch = llama_batch_init(2, 0, 1);
             common_batch_add(batch, accepted, n_past, {0}, true);
             common_batch_add(batch, draft, n_past + 1, {0}, true);
-            llama_decode(ctx, batch);
+            {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                llama_decode(ctx, batch);
+                auto t1 = std::chrono::high_resolution_clock::now();
+                main_decode_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            }
             llama_batch_free(batch);
         }
 
@@ -130,35 +147,54 @@ static void generate_mtp(
             }
 
             accepted = pred_after_draft;
-            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-                draft = llama_mtp_get_argmax(ctx);
-            } else {
-                draft = -1;
+            {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+                    draft = llama_mtp_get_argmax(ctx);
+                } else {
+                    draft = -1;
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
         } else {
             // REJECT — restore intermediate state (after accepted, before draft)
-            // No re-decode needed: intermediate S/R state was saved by the kernel.
             mtp_rejected++;
 
-            // Full reject cleanup: restore intermediate S/R, fix recurrent cell pos, remove draft from KV
             llama_mtp_reject_fixup(ctx, n_past);
             n_past++;
 
-            // pred is the correct next token (argmax at position 0 of 2-token decode)
             accepted = pred;
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
             --n_remain;
 
-            // Use hidden_idx=0 to get token 0's hidden state from the 2-token decode
-            if (llama_decode_mtp(ctx, accepted, n_past, 0) == 0) {
-                draft = llama_mtp_get_argmax(ctx);
-            } else {
-                draft = -1;
+            {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                if (llama_decode_mtp(ctx, accepted, n_past, 0) == 0) {
+                    draft = llama_mtp_get_argmax(ctx);
+                } else {
+                    draft = -1;
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
             }
         }
     }
+
+    auto t_decode_end = std::chrono::high_resolution_clock::now();
+    double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+    int n_generated = (int)output_tokens.size() - initial_output_size;
+    int n_mtp_calls = mtp_accepted + mtp_rejected;
+    fprintf(stderr, "MTP_STATS: {\"n_tokens\": %d, \"decode_ms\": %.1f, \"tok_per_s\": %.1f, "
+        "\"mtp_draft_ms\": %.1f, \"mtp_draft_avg_ms\": %.2f, \"main_decode_ms\": %.1f, "
+        "\"accepted\": %d, \"rejected\": %d, \"accept_rate\": %.1f}\n",
+        n_generated, decode_ms, n_generated > 0 ? n_generated * 1000.0 / decode_ms : 0.0,
+        mtp_draft_ms_total, n_mtp_calls > 0 ? mtp_draft_ms_total / n_mtp_calls : 0.0,
+        main_decode_ms_total,
+        mtp_accepted, mtp_rejected,
+        (mtp_accepted + mtp_rejected) > 0 ? 100.0 * mtp_accepted / (mtp_accepted + mtp_rejected) : 0.0);
 
     // Restore normal logits extraction for non-MTP callers
     llama_set_argmax_only(ctx, false);
