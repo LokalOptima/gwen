@@ -6209,6 +6209,29 @@ struct ggml_tensor * ggml_gated_delta_net_l2(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_fused_gates(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * alpha_raw,
+        struct ggml_tensor  * beta_raw,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * dt_bias,
+        struct ggml_tensor  * ssm_a,
+        float                 l2_norm_eps) {
+    // Build the base op with raw alpha/beta in the g/beta slots
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, alpha_raw, beta_raw, state);
+    // op_params[0] = l2_norm_eps, op_params[1] = fuse_gates flag
+    memcpy(result->op_params, &l2_norm_eps, sizeof(float));
+    float fuse_flag = 1.0f;
+    memcpy((char *)result->op_params + sizeof(float), &fuse_flag, sizeof(float));
+    // Additional sources for gate constants
+    result->src[6] = dt_bias;
+    result->src[7] = ssm_a;
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {

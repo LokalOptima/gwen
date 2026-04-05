@@ -1,6 +1,6 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA, bool L2_NORM>
+template <int S_v, bool KDA, bool L2_NORM, bool FUSE_GATES>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -24,7 +24,9 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
                                      float         scale,
-                                     float         l2_eps) {
+                                     float         l2_eps,
+                                     const float * dt_bias,
+                                     const float * ssm_a) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -68,7 +70,23 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        float beta_val, g_val_precomputed;
+        if constexpr (FUSE_GATES) {
+            // Fused gate computation: apply sigmoid/softplus/exp inline
+            // g_t contains raw alpha (ssm_alpha @ hidden), beta_t contains raw beta (ssm_beta @ hidden)
+            const float alpha_raw = *g_t;
+            const float beta_raw  = *beta_t;
+
+            // sigmoid(beta_raw)
+            beta_val = 1.0f / (1.0f + expf(-beta_raw));
+
+            // exp(softplus(alpha_raw + dt_bias) * ssm_a)
+            const float alpha_biased = alpha_raw + dt_bias[h_idx];
+            const float sp = alpha_biased > 20.0f ? alpha_biased : logf(1.0f + expf(alpha_biased));
+            g_val_precomputed = expf(sp * ssm_a[h_idx]);
+        } else {
+            beta_val = *beta_t;
+        }
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -102,7 +120,7 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = FUSE_GATES ? g_val_precomputed : expf(*g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -180,7 +198,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <bool KDA, bool L2_NORM>
+template <bool KDA, bool L2_NORM, bool FUSE_GATES>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -190,7 +208,9 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, float l2_eps, cudaStream_t stream) {
+        float scale, float l2_eps,
+        const float * dt_bias_d, const float * ssm_a_d,
+        cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -200,35 +220,22 @@ static void launch_gated_delta_net(
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
+    #define LAUNCH_GDN(SV) \
+        gated_delta_net_cuda<SV, KDA, L2_NORM, FUSE_GATES><<<grid_dims, block_dims, 0, stream>>>( \
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, \
+            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
+            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps, \
+            dt_bias_d, ssm_a_d)
+
     switch (S_v) {
-        case 16:
-            gated_delta_net_cuda<16, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
-            break;
-        case 32:
-            gated_delta_net_cuda<32, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
-            break;
-        case 64:
-            gated_delta_net_cuda<64, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
-            break;
-        case 128:
-            gated_delta_net_cuda<128, KDA, L2_NORM><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, l2_eps);
-            break;
-        default:
-            GGML_ABORT("fatal error");
-            break;
+        case 16:  LAUNCH_GDN(16);  break;
+        case 32:  LAUNCH_GDN(32);  break;
+        case 64:  LAUNCH_GDN(64);  break;
+        case 128: LAUNCH_GDN(128); break;
+        default:  GGML_ABORT("fatal error"); break;
     }
+
+    #undef LAUNCH_GDN
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -295,23 +302,50 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     memcpy(&l2_eps, dst->op_params, sizeof(float));
     const bool l2_norm = (l2_eps != 0.0f);
 
+    // Check op_params[1] for fused gate computation
+    float fuse_gates_flag = 0.0f;
+    memcpy(&fuse_gates_flag, (char *)dst->op_params + sizeof(float), sizeof(float));
+    const bool fuse_gates = (fuse_gates_flag != 0.0f);
+
+    // When fuse_gates: src[6] = dt_bias, src[7] = ssm_a
+    const float * dt_bias_d = nullptr;
+    const float * ssm_a_d   = nullptr;
+    if (fuse_gates) {
+        GGML_ASSERT(dst->src[6] != nullptr && dst->src[7] != nullptr);
+        dt_bias_d = (const float *) dst->src[6]->data;
+        ssm_a_d   = (const float *) dst->src[7]->data;
+    }
+
     cudaStream_t stream = ctx.stream();
 
-    if (kda && l2_norm) {
-        launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, l2_eps, stream);
-    } else if (kda) {
-        launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, 0.0f, stream);
-    } else if (l2_norm) {
-        launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, l2_eps, stream);
+    // Dispatch on KDA × L2_NORM × FUSE_GATES (only instantiate used combinations)
+    #define DISPATCH_GDN(kda_v, l2_v, fg_v) \
+        launch_gated_delta_net<kda_v, l2_v, fg_v>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, \
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
+            sb1, sb2, sb3, neqk1, rq3, scale, l2_eps, dt_bias_d, ssm_a_d, stream)
+
+    if (fuse_gates) {
+        // Fused gates path (Qwen3.5: always !KDA, always L2_NORM)
+        if (kda && l2_norm) {
+            DISPATCH_GDN(true, true, true);
+        } else if (kda) {
+            DISPATCH_GDN(true, false, true);
+        } else if (l2_norm) {
+            DISPATCH_GDN(false, true, true);
+        } else {
+            DISPATCH_GDN(false, false, true);
+        }
     } else {
-        launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
-            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1, rq3, scale, 0.0f, stream);
+        if (kda && l2_norm) {
+            DISPATCH_GDN(true, true, false);
+        } else if (kda) {
+            DISPATCH_GDN(true, false, false);
+        } else if (l2_norm) {
+            DISPATCH_GDN(false, true, false);
+        } else {
+            DISPATCH_GDN(false, false, false);
+        }
     }
+
+    #undef DISPATCH_GDN
 }

@@ -377,7 +377,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * b,
         ggml_tensor * s,
         int           il,
-        float         l2_norm_eps) {
+        float         l2_norm_eps,
+        ggml_tensor * dt_bias,
+        ggml_tensor * ssm_a) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -399,7 +401,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     ggml_tensor * result;
-    if (l2_norm_eps > 0.0f) {
+    if (dt_bias && ssm_a) {
+        // Fused gate computation: kernel applies sigmoid(beta), exp(softplus(alpha+dt_bias)*ssm_a)
+        result = ggml_gated_delta_net_fused_gates(ctx0, q, k, v, g, b, s, dt_bias, ssm_a, l2_norm_eps);
+    } else if (l2_norm_eps > 0.0f) {
         result = ggml_gated_delta_net_l2(ctx0, q, k, v, g, b, s, l2_norm_eps);
     } else {
         result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
@@ -434,18 +439,20 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * b,
         ggml_tensor * s,
         int           il,
-        float         l2_norm_eps) {
+        float         l2_norm_eps,
+        ggml_tensor * dt_bias,
+        ggml_tensor * ssm_a) {
     const int64_t n_seq_tokens = q->ne[2];
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
-            return build_delta_net_fused(q, k, v, g, b, s, il, l2_norm_eps);
+            return build_delta_net_fused(q, k, v, g, b, s, il, l2_norm_eps, dt_bias, ssm_a);
         }
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
     }
 
     if (cparams.fused_gdn_ch) {
-        return build_delta_net_fused(q, k, v, g, b, s, il, l2_norm_eps);
+        return build_delta_net_fused(q, k, v, g, b, s, il, l2_norm_eps, dt_bias, ssm_a);
     }
 
     return build_delta_net_chunking(q, k, v, g, b, s, il);

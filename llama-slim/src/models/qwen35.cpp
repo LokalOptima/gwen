@@ -233,29 +233,48 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
+    // Determine if fused GDN will be used (needed early for gate fusion decision)
+    const bool will_use_fused = (n_seq_tokens == 1) ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
+
     // Input projections
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
-    cb(beta, "beta", il);
+    ggml_tensor * beta_raw = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    beta_raw = ggml_reshape_4d(ctx0, beta_raw, 1, num_v_heads, n_seq_tokens, n_seqs);
+    cb(beta_raw, "beta_raw", il);
 
-    beta = ggml_sigmoid(ctx0, beta);
+    ggml_tensor * alpha_raw = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    alpha_raw = ggml_reshape_4d(ctx0, alpha_raw, 1, num_v_heads, n_seq_tokens, n_seqs);
+    cb(alpha_raw, "alpha_raw", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
-    cb(alpha, "alpha", il);
+    // When fused GDN is active, skip element-wise ops — kernel applies sigmoid/softplus/exp inline
+    ggml_tensor * gate;
+    ggml_tensor * beta;
+    ggml_tensor * fuse_dt_bias = nullptr;
+    ggml_tensor * fuse_ssm_a  = nullptr;
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
+    if (will_use_fused) {
+        // Pass raw values; kernel fuses sigmoid(beta), exp(softplus(alpha+dt_bias)*ssm_a)
+        gate = alpha_raw;
+        beta = beta_raw;
+        fuse_dt_bias = model.layers[il].ssm_dt;
+        fuse_ssm_a   = model.layers[il].ssm_a;
+    } else {
+        // Non-fused path: compute element-wise ops as separate graph nodes
+        beta = ggml_sigmoid(ctx0, beta_raw);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
-    cb(gate, "gate", il);
+        ggml_tensor * alpha_3d = ggml_reshape_3d(ctx0, alpha_raw, num_v_heads, n_seq_tokens, n_seqs);
+        ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha_3d, model.layers[il].ssm_dt);
+        ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+        cb(alpha_softplus, "a_softplus", il);
 
-    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+        gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);
+        cb(gate, "gate", il);
+
+        gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     // Get convolution states from cache
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
@@ -334,9 +353,6 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    // Determine if fused GDN will be used (to decide whether to fuse L2 norm)
-    const bool will_use_fused = (n_seq_tokens == 1) ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
-
     if (!will_use_fused) {
         // Non-fused path: L2 norm as separate kernels
         q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
@@ -355,9 +371,10 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // Pass L2 norm eps to fused kernel (0 = no L2 norm, >0 = fuse L2 norm)
+    // Pass L2 norm eps and gate fusion params to fused kernel
     auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il,
-                                     will_use_fused ? eps_norm : 0.0f);
+                                     will_use_fused ? eps_norm : 0.0f,
+                                     fuse_dt_bias, fuse_ssm_a);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;

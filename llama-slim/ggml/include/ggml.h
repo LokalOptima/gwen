@@ -2492,6 +2492,21 @@ extern "C" {
             struct ggml_tensor  * state,
             float                 l2_norm_eps);
 
+    // Variant with fused gate computation: sigmoid(beta), exp(softplus(alpha+dt_bias)*ssm_a)
+    // g = raw alpha (ssm_alpha @ hidden), beta = raw beta (ssm_beta @ hidden)
+    // Eliminates separate sigmoid/softplus/add/mul kernel launches
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_fused_gates(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * alpha_raw,
+            struct ggml_tensor  * beta_raw,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * ssm_a,
+            float                 l2_norm_eps);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
