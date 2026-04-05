@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
-BUILD_DIR="$SCRIPT_DIR/../llama-slim/build"
+BUILD_DIR="$SCRIPT_DIR/../build"
 COMPLETION="$BUILD_DIR/bin/llama-completion"
 N=200
 
@@ -94,7 +94,7 @@ for HEAD_K in "${HEAD_SIZES[@]}"; do
         label="${LABELS[$i]}"
         cat="${CATEGORIES[$i]}"
 
-        stats=$(flock --exclusive /tmp/gpu.lock "$COMPLETION" --no-conversation \
+        stats=$("$COMPLETION" --no-conversation \
             -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$N" --temp 0 2>&1 1>/dev/null \
             | grep "MTP_STATS" || echo "")
 

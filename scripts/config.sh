@@ -1,4 +1,4 @@
-# scripts/config.sh — shared model path defaults for llama-slim scripts
+# scripts/config.sh — shared model path defaults
 # Source this at the top of any script that needs model paths.
 # All variables respect env var overrides.
 

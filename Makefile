@@ -1,35 +1,35 @@
-# ── Paths ────────────────────────────────────────────────────────────
-PROMPT    ?= The meaning of life is
-N         ?= 100
-
-# ── Build ────────────────────────────────────────────────────────────
+# Convenience targets for the llama.cpp-based build
 BUILD_DIR := build
 
-.PHONY: all clean run bench bench-quick info test
+.PHONY: all clean completion bench server test bench-decode bench-mtp
 
-all: $(BUILD_DIR)/gwen
+all: $(BUILD_DIR)/bin/llama-completion
 
-$(BUILD_DIR)/gwen: CMakeLists.txt $(wildcard src/*.cu src/*.cpp src/kernels/*.cu include/gwen/*.h)
-	@cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
-	@cmake --build $(BUILD_DIR) -j$$(nproc) 2>&1 | grep -E "error|warning:|^make" || true
+$(BUILD_DIR)/bin/llama-completion: CMakeLists.txt $(wildcard src/*.cpp src/*.h src/models/*.cpp)
+	cmake -S . -B $(BUILD_DIR) -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+	cmake --build $(BUILD_DIR) --target llama-completion -j$$(nproc)
+
+completion: $(BUILD_DIR)/bin/llama-completion
+
+bench: $(BUILD_DIR)/bin/llama-bench
+$(BUILD_DIR)/bin/llama-bench: CMakeLists.txt
+	cmake -S . -B $(BUILD_DIR) -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+	cmake --build $(BUILD_DIR) --target llama-bench -j$$(nproc)
+
+server: $(BUILD_DIR)/bin/llama-server
+$(BUILD_DIR)/bin/llama-server: CMakeLists.txt
+	cmake -S . -B $(BUILD_DIR) -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+	cmake --build $(BUILD_DIR) --target llama-server -j$$(nproc)
 
 clean:
 	rm -rf $(BUILD_DIR)
 
-# ── Run (weights auto-downloaded to ~/.cache/gwen/) ─────────────────
-run: $(BUILD_DIR)/gwen
-	$(BUILD_DIR)/gwen "$(PROMPT)" --max-predict $(N) --greedy
-
-# ── Benchmark ────────────────────────────────────────────────────────
-bench: $(BUILD_DIR)/gwen
-	./scripts/bench.sh
-
-bench-quick: $(BUILD_DIR)/gwen
-	./scripts/bench.sh --quick
-
-# ── Utility ──────────────────────────────────────────────────────────
-info: $(BUILD_DIR)/gwen
-	$(BUILD_DIR)/gwen --info
-
-test: $(BUILD_DIR)/gwen
+# --- Test / Benchmark shortcuts ---
+test: $(BUILD_DIR)/bin/llama-completion
 	./scripts/test_correctness.sh
+
+bench-decode: $(BUILD_DIR)/bin/llama-completion $(BUILD_DIR)/bin/llama-bench
+	./scripts/bench_decode.sh
+
+bench-mtp: $(BUILD_DIR)/bin/llama-completion
+	./scripts/bench_mtp_llama.sh

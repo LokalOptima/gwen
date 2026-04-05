@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
-BUILD_DIR="$SCRIPT_DIR/../llama-slim/build"
+BUILD_DIR="$SCRIPT_DIR/../build"
 COMPLETION="$BUILD_DIR/bin/llama-completion"
 BENCH="$BUILD_DIR/bin/llama-bench"
 N=${1:-200}
@@ -57,7 +57,7 @@ declare -a LABELS=(
 )
 
 echo "================================================================"
-echo "  llama-slim Decode Benchmark"
+echo "  Decode Benchmark"
 echo "  Base: $(basename $MODEL_BASE)"
 echo "  MTP:  $(basename $MODEL_MTP)"
 echo "  Tokens: $N per prompt"
@@ -66,10 +66,10 @@ echo ""
 
 # --- Baseline: llama-bench ---
 echo "=== Baseline (llama-bench tg64, FA off, 5 reps) ==="
-flock --exclusive /tmp/gpu.lock "$BENCH" -m "$MODEL_BASE" -p 0 -n 64 -r 5 -fa 0 2>&1 | tail -3
+"$BENCH" -m "$MODEL_BASE" -p 0 -n 64 -r 5 -fa 0 2>&1 | tail -3
 echo ""
 echo "=== MTP model single-token (llama-bench tg64, FA off, 5 reps) ==="
-flock --exclusive /tmp/gpu.lock "$BENCH" -m "$MODEL_MTP" -p 0 -n 64 -r 5 -fa 0 2>&1 | tail -3
+"$BENCH" -m "$MODEL_MTP" -p 0 -n 64 -r 5 -fa 0 2>&1 | tail -3
 echo ""
 
 # --- MTP speculative decode ---
@@ -85,7 +85,7 @@ for i in "${!PROMPTS[@]}"; do
     label="${LABELS[$i]}"
 
     # Run MTP, capture stderr for stats
-    stats=$(flock --exclusive /tmp/gpu.lock "$COMPLETION" --no-conversation \
+    stats=$("$COMPLETION" --no-conversation \
         -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$N" --temp 0 2>&1 1>/dev/null \
         | grep "MTP_STATS" || echo "")
 

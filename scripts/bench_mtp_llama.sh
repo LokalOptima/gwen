@@ -1,5 +1,5 @@
 #!/bin/bash
-# MTP speculative decoding benchmark for llama-slim
+# MTP speculative decoding benchmark
 # Tests diverse prompts at realistic lengths, measures acceptance and throughput.
 #
 # Usage: ./scripts/bench_mtp_llama.sh [n_tokens] [--restricted]
@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
-BUILD_DIR="$SCRIPT_DIR/../llama-slim/build"
+BUILD_DIR="$SCRIPT_DIR/../build"
 COMPLETION="$BUILD_DIR/bin/llama-completion"
 LM_HEAD="$HOME/.cache/gwen/lm_head_top50000.bin"
 
@@ -20,7 +20,7 @@ fi
 
 if [ ! -x "$COMPLETION" ]; then
     echo "Error: llama-completion not found at $COMPLETION" >&2
-    echo "Run: cd llama-slim/build && cmake --build . --target llama-completion" >&2
+    echo "Run: cd build && cmake --build . --target llama-completion" >&2
     exit 1
 fi
 
@@ -65,7 +65,7 @@ declare -a LABELS=(
 )
 
 echo "================================================================"
-echo "  llama-slim MTP Speculative Decode Benchmark"
+echo "  MTP Speculative Decode Benchmark"
 echo "  Model: $(basename $MODEL_MTP)"
 if [ $RESTRICTED -eq 1 ]; then
     echo "  LM Head: restricted 50K ($(basename $LM_HEAD))"
@@ -82,7 +82,7 @@ echo ""
 echo "Generating baseline (non-MTP)..."
 BASELINE_DIR=$(mktemp -d)
 for i in "${!PROMPTS[@]}"; do
-    flock --shared /tmp/gpu.lock "$COMPLETION" --no-conversation \
+    "$COMPLETION" --no-conversation \
         -m "$MODEL_BASE" -p "${PROMPTS[$i]}" -n "$N" --temp 0 -fa off 2>/dev/null \
         > "$BASELINE_DIR/$i.txt"
 done
@@ -105,10 +105,10 @@ for i in "${!PROMPTS[@]}"; do
     label="${LABELS[$i]}"
 
     # Run MTP decode, capture stderr for stats and stdout for text
-    MTP_OUT=$(flock --exclusive /tmp/gpu.lock "$COMPLETION" --no-conversation \
+    MTP_OUT=$("$COMPLETION" --no-conversation \
         -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 2>/dev/null)
 
-    MTP_STATS=$(flock --exclusive /tmp/gpu.lock "$COMPLETION" --no-conversation \
+    MTP_STATS=$("$COMPLETION" --no-conversation \
         -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 2>&1 >/dev/null \
         | grep "speculative" || echo "")
 
@@ -132,7 +132,7 @@ for i in "${!PROMPTS[@]}"; do
 
     # Use time-based measurement for tok/s
     t_start=$(date +%s%N)
-    flock --exclusive /tmp/gpu.lock "$COMPLETION" --no-conversation \
+    "$COMPLETION" --no-conversation \
         -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 > /dev/null 2>&1
     t_end=$(date +%s%N)
     ms=$(( (t_end - t_start) / 1000000 ))
