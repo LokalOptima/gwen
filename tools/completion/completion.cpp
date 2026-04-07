@@ -6,15 +6,19 @@
 #include "llama.h"
 #include "chat.h"
 
+#include <algorithm>
 #include <chrono>
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static llama_token greedy_argmax(const float * logits, int n_vocab) {
@@ -29,12 +33,182 @@ static llama_token greedy_argmax(const float * logits, int n_vocab) {
     return best;
 }
 
+// Fast sampling for MTP loop: does top_k BEFORE penalties so we only apply
+// penalties to K_WIDE candidates instead of the full 248K vocabulary.
+// The standard sampler chain does penalties(248K) → top_k(20), causing 248K
+// hash lookups per sample. This does top_k(64) → penalties(64) → top_k(20).
+//
+// If probe_token >= 0, also computes its probability in the final distribution
+// and writes it to *probe_p (0.0 if probe_token is not in the top-k).
+static llama_token fast_sample(
+        const float * logits, int n_vocab,
+        const std::vector<llama_token> & output_tokens,
+        const common_params_sampling & sparams,
+        std::mt19937 & rng,
+        llama_token probe_token = -1,
+        float * probe_p = nullptr) {
+
+    const int K_WIDE = 64;  // pre-penalty top-k (wider to absorb penalty shifts)
+    const int top_k  = std::max(1, sparams.top_k);
+    const float temp = sparams.temp;
+
+    // Step 1: Find top K_WIDE from raw logits using a min-heap
+    struct Candidate { llama_token id; float logit; };
+    const int k_init = std::min(K_WIDE, n_vocab);
+    std::vector<Candidate> top(k_init);
+
+    for (int i = 0; i < k_init; i++) {
+        top[i] = {(llama_token)i, logits[i]};
+    }
+    auto cmp_min = [](const Candidate & a, const Candidate & b) { return a.logit > b.logit; };
+    std::make_heap(top.begin(), top.end(), cmp_min);
+
+    for (int i = k_init; i < n_vocab; i++) {
+        if (logits[i] > top[0].logit) {
+            std::pop_heap(top.begin(), top.end(), cmp_min);
+            top.back() = {(llama_token)i, logits[i]};
+            std::push_heap(top.begin(), top.end(), cmp_min);
+        }
+    }
+
+    // Step 2: Apply penalties to K_WIDE candidates (not 248K)
+    const bool has_penalty = (sparams.penalty_last_n != 0) &&
+        (sparams.penalty_repeat != 1.0f || sparams.penalty_freq != 0.0f || sparams.penalty_present != 0.0f);
+
+    if (has_penalty) {
+        // Build frequency map from recent tokens
+        const int window = (sparams.penalty_last_n < 0)
+            ? (int)output_tokens.size()
+            : std::min((int)output_tokens.size(), sparams.penalty_last_n);
+        std::unordered_map<llama_token, int> token_count;
+        for (int j = (int)output_tokens.size() - window; j < (int)output_tokens.size(); j++) {
+            token_count[output_tokens[j]]++;
+        }
+
+        for (auto & c : top) {
+            auto it = token_count.find(c.id);
+            if (it == token_count.end()) continue;
+            const int count = it->second;
+            // Same logic as llama_sampler_penalties_apply
+            if (c.logit <= 0) {
+                c.logit *= sparams.penalty_repeat;
+            } else {
+                c.logit /= sparams.penalty_repeat;
+            }
+            c.logit -= float(count) * sparams.penalty_freq + float(count > 0) * sparams.penalty_present;
+        }
+    }
+
+    // Step 3: Sort descending, take final top_k
+    std::sort(top.begin(), top.end(), [](const Candidate & a, const Candidate & b) { return a.logit > b.logit; });
+    const int k = std::min(top_k, (int)top.size());
+
+    // Step 4: Temperature + softmax + sample
+    const float max_l = top[0].logit;
+    float sum = 0.0f;
+    std::vector<float> probs(k);
+    for (int i = 0; i < k; i++) {
+        probs[i] = expf((top[i].logit - max_l) / temp);
+        sum += probs[i];
+    }
+    for (int i = 0; i < k; i++) {
+        probs[i] /= sum;
+    }
+
+    // Probe: find p(probe_token) in the final distribution
+    if (probe_p) {
+        *probe_p = 0.0f;
+        if (probe_token >= 0) {
+            for (int i = 0; i < k; i++) {
+                if (top[i].id == probe_token) {
+                    *probe_p = probs[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    // Sample
+    std::uniform_real_distribution<float> udist(0.0f, 1.0f);
+    float r = udist(rng);
+    float cum = 0.0f;
+    for (int i = 0; i < k; i++) {
+        cum += probs[i];
+        if (r <= cum) return top[i].id;
+    }
+    return top[k - 1].id;
+}
+
+// Compute q(draft) = penalized softmax probability of draft token under the MTP distribution.
+// Uses a prebuilt reverse map (full_vocab_id → mtp_index) for O(1) penalty lookups.
+static float compute_mtp_q_draft(
+        llama_context * ctx,
+        llama_token draft,
+        const std::vector<llama_token> & output_tokens,
+        const common_params_sampling & sparams,
+        const std::unordered_map<int32_t, int> & reverse_map) {
+
+    int mtp_n = 0;
+    const float * mtp_logits = llama_mtp_get_logits(ctx, &mtp_n);
+    if (!mtp_logits || mtp_n == 0) return 1.0f;
+
+    // Find draft's MTP index
+    int draft_idx = -1;
+    auto it_draft = reverse_map.find(draft);
+    if (it_draft != reverse_map.end()) {
+        draft_idx = it_draft->second;
+    } else if (reverse_map.empty() && draft >= 0 && draft < mtp_n) {
+        draft_idx = draft;
+    }
+    if (draft_idx < 0) return 1.0f;
+
+    // Copy MTP logits and apply penalties to only the ~64 affected entries in-place.
+    // This avoids 100K hash lookups from the previous per-element penalize() approach.
+    thread_local std::vector<float> adj;
+    adj.assign(mtp_logits, mtp_logits + mtp_n);
+
+    const bool has_penalty = (sparams.penalty_last_n != 0) &&
+        (sparams.penalty_repeat != 1.0f || sparams.penalty_freq != 0.0f || sparams.penalty_present != 0.0f);
+    if (has_penalty) {
+        const int window = (sparams.penalty_last_n < 0)
+            ? (int)output_tokens.size()
+            : std::min((int)output_tokens.size(), sparams.penalty_last_n);
+        // Count penalized tokens and map to MTP indices
+        std::unordered_map<int, int> pen_count;
+        for (int j = (int)output_tokens.size() - window; j < (int)output_tokens.size(); j++) {
+            auto it = reverse_map.find(output_tokens[j]);
+            if (it != reverse_map.end()) pen_count[it->second]++;
+        }
+        // Apply penalties to only those entries
+        for (auto & [idx, cnt] : pen_count) {
+            float & l = adj[idx];
+            if (l <= 0) l *= sparams.penalty_repeat;
+            else l /= sparams.penalty_repeat;
+            l -= float(cnt) * sparams.penalty_freq + sparams.penalty_present;
+        }
+    }
+
+    // Two clean passes — no function calls, no hash lookups, vectorizable
+    float max_l = adj[0];
+    for (int j = 1; j < mtp_n; j++) {
+        if (adj[j] > max_l) max_l = adj[j];
+    }
+    float sum_exp = 0.0f;
+    for (int j = 0; j < mtp_n; j++) {
+        sum_exp += expf(adj[j] - max_l);
+    }
+    return expf(adj[draft_idx] - max_l) / sum_exp;
+}
+
 // MTP speculative decode: generates tokens using proven logic from test_mtp_speculative.
 // Returns tokens and updates n_past. Prints tokens as generated.
+// When greedy (temp==0): uses argmax fast path (GPU-side argmax, no logit transfer).
+// When stochastic (temp>0): uses full sampler chain so sampling params are respected.
 static void generate_mtp(
         llama_context * ctx,
         const llama_vocab * vocab,
         common_sampler * smpl,
+        const common_params_sampling & sparams,
         int & n_past,
         int & n_remain,
         int & mtp_accepted,
@@ -47,9 +221,33 @@ static void generate_mtp(
     const int initial_output_size = (int)output_tokens.size();
     double mtp_draft_ms_total = 0.0;
     double main_decode_ms_total = 0.0;
+    const bool greedy = (sparams.temp < 1e-6f);
+    std::mt19937 rng(common_sampler_get_seed(smpl));
+    std::uniform_real_distribution<float> coin(0.0f, 1.0f);
+
+    // Enable MTP logit extraction for speculative sampling in stochastic mode
+    // Build reverse map (full_vocab_id → mtp_index) once for fast penalty lookups
+    std::unordered_map<int32_t, int> mtp_reverse_map;
+    if (!greedy) {
+        llama_mtp_set_extract_logits(ctx, true);
+        int map_n = 0;
+        const int32_t * token_map = llama_mtp_get_token_map(ctx, &map_n);
+        if (token_map && map_n > 0) {
+            mtp_reverse_map.reserve(map_n);
+            for (int i = 0; i < map_n; i++) {
+                mtp_reverse_map[token_map[i]] = i;
+            }
+        }
+    }
 
     // Sample first accepted from prefill/previous decode logits
-    llama_token accepted = greedy_argmax(llama_get_logits(ctx), n_vocab);
+    llama_token accepted;
+    if (greedy) {
+        accepted = greedy_argmax(llama_get_logits(ctx), n_vocab);
+    } else {
+        llama_synchronize(ctx);
+        accepted = fast_sample(llama_get_logits(ctx), n_vocab, output_tokens, sparams, rng);
+    }
     common_sampler_accept(smpl, accepted, true);
     output_tokens.push_back(accepted);
     output_ss << common_token_to_piece(ctx, accepted, special);
@@ -68,9 +266,11 @@ static void generate_mtp(
         mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
     }
 
-    // Enable argmax-only mode: decode() extracts GPU-computed argmax (8 bytes)
-    // instead of transferring full logits (2MB) per cycle.
-    llama_set_argmax_only(ctx, true);
+    // Greedy: enable argmax-only mode (8 bytes per decode instead of 2MB logits).
+    // Stochastic: need full logits for the sampler chain.
+    if (greedy) {
+        llama_set_argmax_only(ctx, true);
+    }
 
     auto t_decode_start = std::chrono::high_resolution_clock::now();
 
@@ -89,7 +289,12 @@ static void generate_mtp(
             }
             llama_batch_free(batch);
 
-            accepted = llama_get_argmax_ith(ctx, 0);
+            if (greedy) {
+                accepted = llama_get_argmax_ith(ctx, 0);
+            } else {
+                llama_synchronize(ctx);
+                accepted = fast_sample(llama_get_logits_ith(ctx, 0), n_vocab, output_tokens, sparams, rng);
+            }
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
@@ -126,18 +331,46 @@ static void generate_mtp(
             llama_batch_free(batch);
         }
 
-        const llama_token pred = llama_get_argmax_ith(ctx, 0);
+        // --- Accept/reject decision ---
+        // Greedy: exact argmax match (fast path).
+        // Stochastic: speculative sampling — accept draft with prob min(1, p(draft)/q(draft)),
+        // where p = main model probability, q = MTP draft probability.
+        bool do_accept;
+        llama_token fallback = -1;  // sampled token for rejection case
 
-        if (pred == draft) {
+        if (greedy) {
+            do_accept = (llama_get_argmax_ith(ctx, 0) == draft);
+        } else {
+            llama_synchronize(ctx);
+
+            // Compute p(draft) from main model (with penalties applied)
+            float p_draft = 0.0f;
+            fallback = fast_sample(llama_get_logits_ith(ctx, 0), n_vocab, output_tokens, sparams, rng, draft, &p_draft);
+
+            // Compute q(draft) from MTP logits (with SAME penalties for consistency with p)
+            float q_draft = compute_mtp_q_draft(ctx, draft, output_tokens, sparams, mtp_reverse_map);
+
+            float accept_prob = std::min(1.0f, p_draft / std::max(q_draft, 1e-10f));
+            do_accept = (coin(rng) < accept_prob);
+        }
+
+        if (do_accept) {
             // ACCEPT — both tokens are in KV cache and DeltaNet state
             mtp_accepted++;
             n_past += 2;
 
-            const llama_token pred_after_draft = llama_get_argmax_ith(ctx, 1);
-
+            // Accept accepted+draft into state BEFORE sampling position 1,
+            // so presence_penalty sees them in the history.
             common_sampler_accept(smpl, accepted, true);
             common_sampler_accept(smpl, draft, true);
             output_tokens.push_back(draft);
+
+            llama_token pred_after_draft;
+            if (greedy) {
+                pred_after_draft = llama_get_argmax_ith(ctx, 1);
+            } else {
+                pred_after_draft = fast_sample(llama_get_logits_ith(ctx, 1), n_vocab, output_tokens, sparams, rng);
+            }
             output_ss << common_token_to_piece(ctx, draft, special);
             --n_remain;
 
@@ -166,7 +399,8 @@ static void generate_mtp(
             llama_mtp_reject_fixup(ctx, n_past);
             n_past++;
 
-            accepted = pred;
+            // Greedy: use main model argmax. Stochastic: use the token already sampled by fast_sample.
+            accepted = greedy ? llama_get_argmax_ith(ctx, 0) : fallback;
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
@@ -198,8 +432,12 @@ static void generate_mtp(
         mtp_accepted, mtp_rejected,
         (mtp_accepted + mtp_rejected) > 0 ? 100.0 * mtp_accepted / (mtp_accepted + mtp_rejected) : 0.0);
 
-    // Restore normal logits extraction for non-MTP callers
-    llama_set_argmax_only(ctx, false);
+    // Restore normal state for non-MTP callers
+    if (greedy) {
+        llama_set_argmax_only(ctx, false);
+    } else {
+        llama_mtp_set_extract_logits(ctx, false);
+    }
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
@@ -909,7 +1147,7 @@ int main(int argc, char ** argv) {
             if (use_mtp) {
                 // MTP speculative decode: run the entire generation loop
                 std::ostringstream mtp_ss;
-                generate_mtp(ctx, vocab, smpl, n_past, n_remain, mtp_accepted, mtp_rejected,
+                generate_mtp(ctx, vocab, smpl, sparams, n_past, n_remain, mtp_accepted, mtp_rejected,
                              output_tokens, mtp_ss, params.special);
 
                 // Print all generated text

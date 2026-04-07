@@ -154,6 +154,11 @@ struct llama_context {
     // GPU-side argmax result from the last decode_mtp call
     llama_token get_mtp_argmax() const { return mtp_last_argmax; }
 
+    // MTP logit extraction for speculative sampling
+    void set_mtp_extract_logits(bool v) { mtp_extract_logits = v; }
+    const float * get_mtp_logits(int * n) const { if (n) *n = mtp_logits_n; return mtp_logits_cpu.data(); }
+    const std::vector<int32_t> & get_mtp_token_map() const { return mtp_token_ids; }
+
     // GPU-side argmax from the last decode() call (main model).
     // When argmax_only mode is active, decode() extracts argmax instead of full logits.
     void set_argmax_only(bool v) { argmax_only = v; }
@@ -373,6 +378,9 @@ private:
     ggml_tensor *           mtp_v_cache = nullptr;  // [n_embd_v_gqa, n_ctx] F16
     int32_t                 mtp_kv_pos  = 0;        // next write position
     int32_t                 mtp_last_argmax = -1;   // GPU-side argmax result from last decode_mtp
+    std::vector<float>      mtp_logits_cpu;          // MTP logits on CPU (for speculative sampling q computation)
+    int32_t                 mtp_logits_n = 0;        // size of last MTP logits extraction
+    bool                    mtp_extract_logits = false; // when true, decode_mtp transfers logits to CPU
 
     // argmax-only mode: when true, decode() extracts GPU argmax (8-12 bytes) instead of full logits (2MB)
     bool                    argmax_only = false;

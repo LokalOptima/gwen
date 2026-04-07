@@ -1657,6 +1657,19 @@ int llama_context::decode_mtp(llama_token token, llama_pos pos, int32_t hidden_i
         } else {
             mtp_last_argmax = argmax_result;
         }
+
+        // Transfer MTP logits to CPU for speculative sampling q(draft) computation.
+        // The caller applies penalties consistently before computing q(draft).
+        if (mtp_extract_logits) {
+            auto * t_logits = res->get_logits();
+            if (t_logits) {
+                mtp_logits_n = (int)t_logits->ne[0];
+                mtp_logits_cpu.resize(mtp_logits_n);
+                ggml_backend_tensor_get(t_logits, mtp_logits_cpu.data(), 0, mtp_logits_n * sizeof(float));
+            } else {
+                mtp_logits_n = 0;
+            }
+        }
     } else {
         // Fallback: extract full logits (legacy path)
         auto * t_logits = res->get_logits();
@@ -4162,6 +4175,20 @@ int32_t llama_decode_mtp(
 
 llama_token llama_mtp_get_argmax(llama_context * ctx) {
     return ctx->get_mtp_argmax();
+}
+
+void llama_mtp_set_extract_logits(llama_context * ctx, bool v) {
+    ctx->set_mtp_extract_logits(v);
+}
+
+const float * llama_mtp_get_logits(llama_context * ctx, int * n) {
+    return ctx->get_mtp_logits(n);
+}
+
+const int32_t * llama_mtp_get_token_map(llama_context * ctx, int * n) {
+    auto & map = ctx->get_mtp_token_map();
+    if (n) *n = (int)map.size();
+    return map.empty() ? nullptr : map.data();
 }
 
 void llama_set_argmax_only(llama_context * ctx, bool v) {

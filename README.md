@@ -106,6 +106,12 @@ make bench-mtp
 
 ---
 
+## Acknowledgments
+
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** and **[ggml](https://github.com/ggml-org/ggml)** by the ggml authors — this project is a stripped-down fork of llama.cpp (MIT License, Copyright 2023-2026 The ggml authors; see [LICENSE.llama-cpp](LICENSE.llama-cpp))
+- **[Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)** by the Qwen Team, Alibaba Group — the model architecture and weights (Apache 2.0 License)
+- **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA GEMM templates, used as a git submodule (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
+
 ## License
 
 MIT. llama.cpp portions licensed separately — see [LICENSE.llama-cpp](LICENSE.llama-cpp).

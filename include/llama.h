@@ -962,6 +962,12 @@ extern "C" {
     // Returns the token ID (greedy draft), or -1 if not available.
     LLAMA_API llama_token llama_mtp_get_argmax(struct llama_context * ctx);
 
+    // MTP logit extraction for speculative sampling.
+    // When enabled, decode_mtp() transfers MTP logits to CPU (50K×4=200KB for restricted vocab).
+    LLAMA_API void           llama_mtp_set_extract_logits(struct llama_context * ctx, bool v);
+    LLAMA_API const float *  llama_mtp_get_logits(struct llama_context * ctx, int * n_vocab);
+    LLAMA_API const int32_t * llama_mtp_get_token_map(struct llama_context * ctx, int * n); // restricted→full vocab
+
     // Argmax-only mode: decode() extracts GPU-computed argmax (n_outputs × 4 bytes)
     // instead of full logits (n_outputs × n_vocab × 4 bytes). Use llama_get_argmax_ith().
     LLAMA_API void llama_set_argmax_only(struct llama_context * ctx, bool v);
