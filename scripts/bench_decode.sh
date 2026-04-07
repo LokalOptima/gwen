@@ -86,7 +86,7 @@ for i in "${!PROMPTS[@]}"; do
 
     # Run MTP, capture stderr for stats
     stats=$("$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$N" --temp 0 2>&1 1>/dev/null \
+        -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$N" --temp 0 --presence-penalty 0 2>&1 1>/dev/null \
         | grep "MTP_STATS" || echo "")
 
     if [ -z "$stats" ]; then

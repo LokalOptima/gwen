@@ -83,7 +83,7 @@ echo "Generating baseline (non-MTP)..."
 BASELINE_DIR=$(mktemp -d)
 for i in "${!PROMPTS[@]}"; do
     "$COMPLETION" --no-conversation \
-        -m "$MODEL_BASE" -p "${PROMPTS[$i]}" -n "$N" --temp 0 -fa off 2>/dev/null \
+        -m "$MODEL_BASE" -p "${PROMPTS[$i]}" -n "$N" --temp 0 --presence-penalty 0 -fa off 2>/dev/null \
         > "$BASELINE_DIR/$i.txt"
 done
 echo "Baseline generated."
@@ -106,10 +106,10 @@ for i in "${!PROMPTS[@]}"; do
 
     # Run MTP decode, capture stderr for stats and stdout for text
     MTP_OUT=$("$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 2>/dev/null)
+        -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 --presence-penalty 0 2>/dev/null)
 
     MTP_STATS=$("$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 2>&1 >/dev/null \
+        -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 --presence-penalty 0 2>&1 >/dev/null \
         | grep "speculative" || echo "")
 
     # Parse stats
@@ -133,7 +133,7 @@ for i in "${!PROMPTS[@]}"; do
     # Use time-based measurement for tok/s
     t_start=$(date +%s%N)
     "$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 > /dev/null 2>&1
+        -m "$MODEL_MTP" -p "$prompt" -n "$N" --temp 0 --presence-penalty 0 > /dev/null 2>&1
     t_end=$(date +%s%N)
     ms=$(( (t_end - t_start) / 1000000 ))
     # Subtract ~800ms for model loading
