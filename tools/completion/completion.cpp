@@ -139,8 +139,18 @@ static llama_token fast_sample(
     return top[k - 1].id;
 }
 
+// Fast exp approximation (Schraudolph 1999). ~2% max relative error.
+// Fine for softmax denominator in speculative sampling acceptance.
+static inline float fast_expf(float x) {
+    if (x < -87.0f) return 0.0f;
+    union { float f; int32_t i; } v;
+    v.i = (int32_t)(12102203.0f * x) + 1065353216;
+    return v.f;
+}
+
 // Compute q(draft) = penalized softmax probability of draft token under the MTP distribution.
-// Uses a prebuilt reverse map (full_vocab_id → mtp_index) for O(1) penalty lookups.
+// Copy-free: scans original MTP logits read-only, then corrects for ~64 penalized entries.
+// Single-pass fused max+sum with fast_expf. Corrections use standard expf for accuracy.
 static float compute_mtp_q_draft(
         llama_context * ctx,
         llama_token draft,
@@ -149,8 +159,8 @@ static float compute_mtp_q_draft(
         const std::unordered_map<int32_t, int> & reverse_map) {
 
     int mtp_n = 0;
-    const float * mtp_logits = llama_mtp_get_logits(ctx, &mtp_n);
-    if (!mtp_logits || mtp_n == 0) return 1.0f;
+    const float * logits = llama_mtp_get_logits(ctx, &mtp_n);
+    if (!logits || mtp_n == 0) return 1.0f;
 
     // Find draft's MTP index
     int draft_idx = -1;
@@ -162,10 +172,10 @@ static float compute_mtp_q_draft(
     }
     if (draft_idx < 0) return 1.0f;
 
-    // Copy MTP logits and apply penalties to only the ~64 affected entries in-place.
-    // This avoids 100K hash lookups from the previous per-element penalize() approach.
-    thread_local std::vector<float> adj;
-    adj.assign(mtp_logits, mtp_logits + mtp_n);
+    // Build penalty corrections: mtp_idx → (raw_logit, penalized_logit)
+    struct PenCorr { int idx; float raw; float pen; };
+    thread_local std::vector<PenCorr> corrections;
+    corrections.clear();
 
     const bool has_penalty = (sparams.penalty_last_n != 0) &&
         (sparams.penalty_repeat != 1.0f || sparams.penalty_freq != 0.0f || sparams.penalty_present != 0.0f);
@@ -173,31 +183,52 @@ static float compute_mtp_q_draft(
         const int window = (sparams.penalty_last_n < 0)
             ? (int)output_tokens.size()
             : std::min((int)output_tokens.size(), sparams.penalty_last_n);
-        // Count penalized tokens and map to MTP indices
         std::unordered_map<int, int> pen_count;
         for (int j = (int)output_tokens.size() - window; j < (int)output_tokens.size(); j++) {
             auto it = reverse_map.find(output_tokens[j]);
             if (it != reverse_map.end()) pen_count[it->second]++;
         }
-        // Apply penalties to only those entries
+        corrections.reserve(pen_count.size());
         for (auto & [idx, cnt] : pen_count) {
-            float & l = adj[idx];
-            if (l <= 0) l *= sparams.penalty_repeat;
-            else l /= sparams.penalty_repeat;
-            l -= float(cnt) * sparams.penalty_freq + sparams.penalty_present;
+            float raw = logits[idx];
+            float pen = raw;
+            if (pen <= 0) pen *= sparams.penalty_repeat;
+            else pen /= sparams.penalty_repeat;
+            pen -= float(cnt) * sparams.penalty_freq + sparams.penalty_present;
+            corrections.push_back({idx, raw, pen});
         }
     }
 
-    // Two clean passes — no function calls, no hash lookups, vectorizable
-    float max_l = adj[0];
+    // Single fused pass: max + sum_exp over raw logits (read-only, one 200KB scan).
+    // Online max tracking: when a new max is found, rescale the running sum.
+    // Uses fast_expf (~2% error, 3-5x faster than expf) — fine for the denominator.
+    float max_l = logits[0];
+    float sum_exp = 1.0f;
     for (int j = 1; j < mtp_n; j++) {
-        if (adj[j] > max_l) max_l = adj[j];
+        const float l = logits[j];
+        if (l > max_l) {
+            sum_exp *= fast_expf(max_l - l);  // rescale accumulated sum to new max
+            sum_exp += 1.0f;
+            max_l = l;
+        } else {
+            sum_exp += fast_expf(l - max_l);
+        }
     }
-    float sum_exp = 0.0f;
-    for (int j = 0; j < mtp_n; j++) {
-        sum_exp += expf(adj[j] - max_l);
+
+    // Correct sum_exp for the ~64 penalized entries:
+    // subtract their raw contribution, add penalized contribution
+    for (const auto & c : corrections) {
+        sum_exp -= expf(c.raw - max_l);
+        sum_exp += expf(c.pen - max_l);
     }
-    return expf(adj[draft_idx] - max_l) / sum_exp;
+
+    // Draft logit: check if it was penalized
+    float draft_logit = logits[draft_idx];
+    for (const auto & c : corrections) {
+        if (c.idx == draft_idx) { draft_logit = c.pen; break; }
+    }
+
+    return expf(draft_logit - max_l) / sum_exp;
 }
 
 // MTP speculative decode: generates tokens using proven logic from test_mtp_speculative.
@@ -221,6 +252,11 @@ static void generate_mtp(
     const int initial_output_size = (int)output_tokens.size();
     double mtp_draft_ms_total = 0.0;
     double main_decode_ms_total = 0.0;
+    double sync_ms_total = 0.0;
+    double fast_sample_ms_total = 0.0;
+    double q_draft_ms_total = 0.0;
+    double reject_fixup_ms_total = 0.0;
+    int n_sync = 0, n_fast_sample = 0, n_q_draft = 0, n_fixup = 0;
     const bool greedy = (sparams.temp < 1e-6f);
     std::mt19937 rng(common_sampler_get_seed(smpl));
     std::uniform_real_distribution<float> coin(0.0f, 1.0f);
@@ -273,94 +309,114 @@ static void generate_mtp(
     }
 
     auto t_decode_start = std::chrono::high_resolution_clock::now();
+    int cycle = 0;
+
+    // Per-cycle timing with microsecond precision
+    auto us = [](std::chrono::high_resolution_clock::time_point a,
+                 std::chrono::high_resolution_clock::time_point b) -> int {
+        return (int)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
 
     while (n_remain > 0) {
         if (llama_vocab_is_eog(vocab, accepted)) break;
+        auto t_cycle_start = std::chrono::high_resolution_clock::now();
 
         if (draft < 0 || draft == accepted) {
             // No valid draft — single token decode
             llama_batch batch = llama_batch_init(1, 0, 1);
             common_batch_add(batch, accepted, n_past++, {0}, true);
-            {
-                auto t0 = std::chrono::high_resolution_clock::now();
-                llama_decode(ctx, batch);
-                auto t1 = std::chrono::high_resolution_clock::now();
-                main_decode_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            }
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            llama_decode(ctx, batch);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            main_decode_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
             llama_batch_free(batch);
 
+            int us_sync = 0, us_fs = 0;
             if (greedy) {
                 accepted = llama_get_argmax_ith(ctx, 0);
             } else {
+                auto ts0 = std::chrono::high_resolution_clock::now();
                 llama_synchronize(ctx);
+                auto ts1 = std::chrono::high_resolution_clock::now();
+                us_sync = us(ts0, ts1);
+                sync_ms_total += us_sync / 1000.0; n_sync++;
+
+                auto tf0 = std::chrono::high_resolution_clock::now();
                 accepted = fast_sample(llama_get_logits_ith(ctx, 0), n_vocab, output_tokens, sparams, rng);
+                auto tf1 = std::chrono::high_resolution_clock::now();
+                us_fs = us(tf0, tf1);
+                fast_sample_ms_total += us_fs / 1000.0; n_fast_sample++;
             }
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
             --n_remain;
 
-            {
-                auto t0 = std::chrono::high_resolution_clock::now();
-                if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-                    draft = llama_mtp_get_argmax(ctx);
-                } else {
-                    draft = -1;
-                }
-                auto t1 = std::chrono::high_resolution_clock::now();
-                mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            auto td0 = std::chrono::high_resolution_clock::now();
+            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+                draft = llama_mtp_get_argmax(ctx);
+            } else {
+                draft = -1;
+            }
+            auto td1 = std::chrono::high_resolution_clock::now();
+            int us_draft = us(td0, td1);
+            mtp_draft_ms_total += us_draft / 1000.0;
+
+            if (!greedy) {
+                fprintf(stderr, "CYCLE %3d: SINGLE  dispatch=%4d sync=%4d fsamp=%3d draft=%3d total=%4d us\n",
+                    cycle++, us(t_cycle_start, t0),
+                    us_sync, us_fs, us_draft, us(t_cycle_start, td1));
             }
             continue;
         }
 
         // --- Speculative path (2-token verify) ---
-        // Note: mtp_intermediate_prefill() removed — the fused DeltaNet kernel
-        // already saves post-token-0 intermediate state as part of the compute graph
-        // (gated_delta_net_cuda writes istate, graph copies to mtp_intermediate_s/r).
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        common_batch_add(batch, accepted, n_past, {0}, true);
+        common_batch_add(batch, draft, n_past + 1, {0}, true);
 
-        {
-            llama_batch batch = llama_batch_init(2, 0, 1);
-            common_batch_add(batch, accepted, n_past, {0}, true);
-            common_batch_add(batch, draft, n_past + 1, {0}, true);
-            {
-                auto t0 = std::chrono::high_resolution_clock::now();
-                llama_decode(ctx, batch);
-                auto t1 = std::chrono::high_resolution_clock::now();
-                main_decode_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
-            }
-            llama_batch_free(batch);
-        }
+        auto t_dispatch0 = std::chrono::high_resolution_clock::now();
+        llama_decode(ctx, batch);
+        auto t_dispatch1 = std::chrono::high_resolution_clock::now();
+        int us_dispatch = us(t_dispatch0, t_dispatch1);
+        main_decode_ms_total += us_dispatch / 1000.0;
+        llama_batch_free(batch);
 
-        // --- Accept/reject decision ---
-        // Greedy: exact argmax match (fast path).
-        // Stochastic: speculative sampling — accept draft with prob min(1, p(draft)/q(draft)),
-        // where p = main model probability, q = MTP draft probability.
         bool do_accept;
-        llama_token fallback = -1;  // sampled token for rejection case
+        llama_token fallback = -1;
+        int us_sync = 0, us_fs = 0, us_qd = 0, us_fs2 = 0, us_fixup = 0;
 
         if (greedy) {
             do_accept = (llama_get_argmax_ith(ctx, 0) == draft);
         } else {
+            auto ts0 = std::chrono::high_resolution_clock::now();
             llama_synchronize(ctx);
+            auto ts1 = std::chrono::high_resolution_clock::now();
+            us_sync = us(ts0, ts1);
+            sync_ms_total += us_sync / 1000.0; n_sync++;
 
-            // Compute p(draft) from main model (with penalties applied)
             float p_draft = 0.0f;
+            auto tf0 = std::chrono::high_resolution_clock::now();
             fallback = fast_sample(llama_get_logits_ith(ctx, 0), n_vocab, output_tokens, sparams, rng, draft, &p_draft);
+            auto tf1 = std::chrono::high_resolution_clock::now();
+            us_fs = us(tf0, tf1);
+            fast_sample_ms_total += us_fs / 1000.0; n_fast_sample++;
 
-            // Compute q(draft) from MTP logits (with SAME penalties for consistency with p)
+            auto tq0 = std::chrono::high_resolution_clock::now();
             float q_draft = compute_mtp_q_draft(ctx, draft, output_tokens, sparams, mtp_reverse_map);
+            auto tq1 = std::chrono::high_resolution_clock::now();
+            us_qd = us(tq0, tq1);
+            q_draft_ms_total += us_qd / 1000.0; n_q_draft++;
 
             float accept_prob = std::min(1.0f, p_draft / std::max(q_draft, 1e-10f));
             do_accept = (coin(rng) < accept_prob);
         }
 
         if (do_accept) {
-            // ACCEPT — both tokens are in KV cache and DeltaNet state
             mtp_accepted++;
             n_past += 2;
 
-            // Accept accepted+draft into state BEFORE sampling position 1,
-            // so presence_penalty sees them in the history.
             common_sampler_accept(smpl, accepted, true);
             common_sampler_accept(smpl, draft, true);
             output_tokens.push_back(draft);
@@ -369,7 +425,11 @@ static void generate_mtp(
             if (greedy) {
                 pred_after_draft = llama_get_argmax_ith(ctx, 1);
             } else {
+                auto tf0 = std::chrono::high_resolution_clock::now();
                 pred_after_draft = fast_sample(llama_get_logits_ith(ctx, 1), n_vocab, output_tokens, sparams, rng);
+                auto tf1 = std::chrono::high_resolution_clock::now();
+                us_fs2 = us(tf0, tf1);
+                fast_sample_ms_total += us_fs2 / 1000.0; n_fast_sample++;
             }
             output_ss << common_token_to_piece(ctx, draft, special);
             --n_remain;
@@ -382,39 +442,49 @@ static void generate_mtp(
             }
 
             accepted = pred_after_draft;
-            {
-                auto t0 = std::chrono::high_resolution_clock::now();
-                if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
-                    draft = llama_mtp_get_argmax(ctx);
-                } else {
-                    draft = -1;
-                }
-                auto t1 = std::chrono::high_resolution_clock::now();
-                mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            auto td0 = std::chrono::high_resolution_clock::now();
+            if (llama_decode_mtp(ctx, accepted, n_past) == 0) {
+                draft = llama_mtp_get_argmax(ctx);
+            } else {
+                draft = -1;
+            }
+            auto td1 = std::chrono::high_resolution_clock::now();
+            int us_draft = us(td0, td1);
+            mtp_draft_ms_total += us_draft / 1000.0;
+
+            if (!greedy) {
+                fprintf(stderr, "CYCLE %3d: ACCEPT  dispatch=%4d sync=%4d fsamp=%3d qdraft=%3d fsamp2=%3d draft=%3d total=%4d us\n",
+                    cycle++, us_dispatch, us_sync, us_fs, us_qd, us_fs2, us_draft, us(t_cycle_start, td1));
             }
         } else {
-            // REJECT — restore intermediate state (after accepted, before draft)
             mtp_rejected++;
 
+            auto tr0 = std::chrono::high_resolution_clock::now();
             llama_mtp_reject_fixup(ctx, n_past);
+            auto tr1 = std::chrono::high_resolution_clock::now();
+            us_fixup = us(tr0, tr1);
+            reject_fixup_ms_total += us_fixup / 1000.0; n_fixup++;
             n_past++;
 
-            // Greedy: use main model argmax. Stochastic: use the token already sampled by fast_sample.
             accepted = greedy ? llama_get_argmax_ith(ctx, 0) : fallback;
             common_sampler_accept(smpl, accepted, true);
             output_tokens.push_back(accepted);
             output_ss << common_token_to_piece(ctx, accepted, special);
             --n_remain;
 
-            {
-                auto t0 = std::chrono::high_resolution_clock::now();
-                if (llama_decode_mtp(ctx, accepted, n_past, 0) == 0) {
-                    draft = llama_mtp_get_argmax(ctx);
-                } else {
-                    draft = -1;
-                }
-                auto t1 = std::chrono::high_resolution_clock::now();
-                mtp_draft_ms_total += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            auto td0 = std::chrono::high_resolution_clock::now();
+            if (llama_decode_mtp(ctx, accepted, n_past, 0) == 0) {
+                draft = llama_mtp_get_argmax(ctx);
+            } else {
+                draft = -1;
+            }
+            auto td1 = std::chrono::high_resolution_clock::now();
+            int us_draft = us(td0, td1);
+            mtp_draft_ms_total += us_draft / 1000.0;
+
+            if (!greedy) {
+                fprintf(stderr, "CYCLE %3d: REJECT  dispatch=%4d sync=%4d fsamp=%3d qdraft=%3d fixup=%3d draft=%3d total=%4d us\n",
+                    cycle++, us_dispatch, us_sync, us_fs, us_qd, us_fixup, us_draft, us(t_cycle_start, td1));
             }
         }
     }
@@ -431,6 +501,28 @@ static void generate_mtp(
         main_decode_ms_total,
         mtp_accepted, mtp_rejected,
         (mtp_accepted + mtp_rejected) > 0 ? 100.0 * mtp_accepted / (mtp_accepted + mtp_rejected) : 0.0);
+
+    if (!greedy) {
+        double accounted = sync_ms_total + fast_sample_ms_total + q_draft_ms_total
+                         + mtp_draft_ms_total + main_decode_ms_total + reject_fixup_ms_total;
+        fprintf(stderr, "MTP_PROFILE: {"
+            "\"sync_ms\": %.1f (%d calls, %.2f avg), "
+            "\"fast_sample_ms\": %.1f (%d calls, %.2f avg), "
+            "\"q_draft_ms\": %.1f (%d calls, %.2f avg), "
+            "\"mtp_draft_ms\": %.1f, "
+            "\"main_decode_ms\": %.1f, "
+            "\"reject_fixup_ms\": %.1f (%d), "
+            "\"accounted_ms\": %.1f, "
+            "\"total_ms\": %.1f, "
+            "\"unaccounted_ms\": %.1f}\n",
+            sync_ms_total, n_sync, n_sync > 0 ? sync_ms_total / n_sync : 0.0,
+            fast_sample_ms_total, n_fast_sample, n_fast_sample > 0 ? fast_sample_ms_total / n_fast_sample : 0.0,
+            q_draft_ms_total, n_q_draft, n_q_draft > 0 ? q_draft_ms_total / n_q_draft : 0.0,
+            mtp_draft_ms_total,
+            main_decode_ms_total,
+            reject_fixup_ms_total, n_fixup,
+            accounted, decode_ms, decode_ms - accounted);
+    }
 
     // Restore normal state for non-MTP callers
     if (greedy) {

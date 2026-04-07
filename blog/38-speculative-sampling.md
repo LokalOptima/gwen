@@ -132,7 +132,7 @@ All benchmarks: 12 diverse prompts, 200 tokens each, RTX 5070 Ti.
 |---|---|---|
 | Base (no MTP, llama-bench tg64) | 491 | -- |
 | MTP greedy (temp=0) | 637 | 83.4% |
-| MTP stochastic, speculative | 527 | 75.2% |
+| MTP stochastic, speculative | 555 | 75% |
 
 ### Development progression
 
@@ -142,39 +142,86 @@ All benchmarks: 12 diverse prompts, 200 tokens each, RTX 5070 Ti.
 | fast_sample (top_k before penalties) | 454 | 44% | Reordered chain, 64 lookups not 248K |
 | Speculative v1 (q with per-element hash) | 427 | 72% | Correct p/q ratio but q overhead killed gains |
 | Speculative v2 (penalty consistency fix) | 501 | 78% | Consistent penalties, still 100K hash lookups |
-| Speculative v3 (in-place penalty, no hash scan) | 527 | 75% | Copy + patch + scan, final version |
+| Speculative v3 (in-place penalty, no hash scan) | 527 | 75% | Copy + patch + scan |
+| Speculative v4 (copy-free + fast_expf) | 555 | 75% | No copy, fused single-pass, Schraudolph exp |
 
-### Per-prompt stochastic breakdown (final)
+### Per-prompt stochastic breakdown (v4)
 
 | Prompt | tok/s | Accept % |
 |---|---|---|
-| AI history | 512 | 68.6% |
-| Narrative | 530 | 76.8% |
-| Business | 547 | 80.2% |
-| TCP/UDP | 511 | 68.6% |
-| Quantum | 499 | 68.4% |
-| Transformer | 530 | 74.6% |
-| Python sort | 534 | 76.1% |
-| Python class | 463 | 55.1% |
-| Math word | 546 | 79.3% |
-| Fibonacci | 540 | 87.3% |
-| Fox repeat | 515 | 70.7% |
-| Counting | 594 | 97.0% |
+| AI history | 547 | 77.7% |
+| Narrative | 556 | 75.4% |
+| Business | 558 | 76.8% |
+| TCP/UDP | 534 | 69.2% |
+| Quantum | 570 | 78.6% |
+| Transformer | 555 | 74.6% |
+| Python sort | 569 | 78.6% |
+| Python class | 532 | 68.1% |
+| Math word | 593 | 86.9% |
+| Fibonacci | 545 | 76.4% |
+| Fox repeat | 539 | 74.3% |
+| Counting | 595 | 91.3% |
 
 ---
 
-## Remaining overhead analysis
+## Optimizing compute_mtp_q_draft
 
-The gap between greedy (637) and stochastic (527) is ~17%, entirely CPU:
+### v3 → v4: copy-free + fast_expf
 
-1. **fast_sample**: min-heap scan over 248K logits (~0.2ms/cycle)
-2. **compute_mtp_q_draft**: 50K exp + sum for softmax (~0.5ms/cycle)
-3. **Logit transfer**: 1MB main model + 200KB MTP per cycle (~negligible)
+The v3 q_draft computation copied 200KB of MTP logits, patched ~64 penalized
+entries, then scanned twice (max + sum_exp). Two optimizations:
 
-With ~112 decode cycles per 200-token generation, the CPU overhead totals
-~78ms on top of ~312ms GPU compute. Future optimization: compute q(draft) on
-GPU as part of the MTP graph (single float transfer instead of 50K softmax on
-CPU).
+**Copy-free correction**: Instead of copying 50K floats to apply ~64 penalties,
+scan the original read-only buffer for max and sum_exp, then correct the sum
+for only the penalized entries:
+
+```
+sum_exp_penalized = sum_exp_raw
+                  - Σ exp(raw[i] - max)          // remove raw contributions
+                  + Σ exp(penalized[i] - max)     // add penalized contributions
+```
+
+This eliminates the 200KB memcpy and keeps the scan cache-friendly (read-only).
+
+**Fused single-pass with fast_expf**: Instead of two passes (max, then sum_exp),
+fuse into one pass with online max tracking — when a new max is found, rescale
+the running sum via `sum *= exp(old_max - new_max)`. Uses Schraudolph (1999)
+fast exp approximation (~2% relative error, 3-5x faster than `expf`). The
+~64 penalty corrections still use standard `expf` for ratio accuracy.
+
+Result: q_draft dropped from 0.16ms → 0.04ms per call (4x speedup).
+
+---
+
+## Per-cycle profiling
+
+Per-cycle trace of a typical ACCEPT cycle (stochastic path):
+
+```
+dispatch=155  sync=2438  fsamp=108  qdraft=41  fsamp2=107  draft=258  total=3110 us
+```
+
+| Component | us | % of cycle |
+|---|---|---|
+| sync (GPU wait) | 2438 | 78.4% |
+| draft (MTP GPU) | 258 | 8.3% |
+| dispatch (async) | 155 | 5.0% |
+| fsamp (main logits) | 108 | 3.5% |
+| fsamp2 (pos 1) | 107 | 3.4% |
+| qdraft | 41 | 1.3% |
+
+The sync time IS the GPU forward pass — identical to the greedy path's ~2.44ms.
+The entire greedy-vs-stochastic gap comes from the ~0.41ms of CPU work
+(fsamp + qdraft + fsamp2) that the GPU sits idle for.
+
+### Next target: GPU-side top-k
+
+The 108us `fast_sample` is a 248K min-heap scan on CPU. Adding `ggml_top_k(64)`
+to the main model compute graph would let the GPU find top-64 candidates as
+part of the forward pass, transferring only 512 bytes (64 IDs + 64 logits)
+instead of 2MB. CPU work drops to O(64) penalty + softmax + sample ≈ 5us.
+Combined with the draft overlap optimization (fsamp2 parallel with draft GPU),
+this would reduce CPU overhead from ~410us to ~50us per cycle.
 
 ---
 
