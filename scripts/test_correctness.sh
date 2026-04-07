@@ -83,7 +83,7 @@ for len in "${LENGTHS[@]}"; do
     # Generate baselines for this length
     for i in "${!PROMPTS[@]}"; do
         "$COMPLETION" --no-conversation \
-            -m "$MODEL_BASE" -p "${PROMPTS[$i]}" -n "$len" --temp 0 -fa off \
+            -m "$MODEL_BASE" -p "${PROMPTS[$i]}" -n "$len" --temp 0 --presence-penalty 0 -fa off \
             2>/dev/null > "$BASELINE_DIR/${i}_${len}.txt"
     done
 
@@ -93,7 +93,7 @@ for len in "${LENGTHS[@]}"; do
         n_tests=$((n_tests + 1))
 
         "$COMPLETION" --no-conversation \
-            -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$len" --temp 0 \
+            -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$len" --temp 0 --presence-penalty 0 \
             2>/dev/null > "$MTP_DIR/${i}_${len}.txt"
 
         # Normalize before comparing: strip [end of text] markers and trailing whitespace/newlines

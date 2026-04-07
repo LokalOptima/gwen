@@ -495,6 +495,7 @@ int main(int argc, char ** argv) {
                 inputs.messages = chat_msgs;
                 inputs.add_generation_prompt = !params.prompt.empty();
                 inputs.force_pure_content = params.force_pure_content_parser;
+                inputs.enable_thinking = params.enable_reasoning != 0;
 
                 prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
             }

@@ -224,19 +224,21 @@ struct common_params_sampling {
     int32_t n_prev             = 64;     // number of previous tokens to remember
     int32_t n_probs            = 0;      // if greater than 0, output the probabilities of top n_probs tokens.
     int32_t min_keep           = 0;      // 0 = disabled, otherwise samplers should return at least min_keep tokens
-    int32_t top_k              = 40;     // <= 0 to use vocab size
-    float   top_p              = 0.95f;  // 1.0 = disabled
-    float   min_p              = 0.05f;  // 0.0 = disabled
+    // Qwen3.5-0.8B recommended sampling (non-thinking, text tasks)
+    // Source: https://huggingface.co/Qwen/Qwen3.5-0.8B
+    int32_t top_k              = 20;     // <= 0 to use vocab size
+    float   top_p              = 1.00f;  // 1.0 = disabled
+    float   min_p              = 0.00f;  // 0.0 = disabled
     float   xtc_probability    = 0.00f;  // 0.0 = disabled
     float   xtc_threshold      = 0.10f;  // > 0.5 disables XTC
     float   typ_p              = 1.00f;  // typical_p, 1.0 = disabled
-    float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
+    float   temp               = 1.00f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
     int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled
-    float   penalty_present    = 0.00f;  // 0.0 = disabled
+    float   penalty_present    = 2.00f;  // Qwen3.5 non-thinking text recommended
     float   dry_multiplier     = 0.0f;   // 0.0 = disabled;      DRY repetition penalty for tokens extending repetition:
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
@@ -590,7 +592,7 @@ struct common_params {
     bool enable_chat_template = true;
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
-    int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+    int enable_reasoning = 0; // 0 = disable (Qwen3.5-0.8B default: non-thinking mode)
     int reasoning_budget = -1;
     std::string reasoning_budget_message; // message injected before end tag when budget exhausted
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
