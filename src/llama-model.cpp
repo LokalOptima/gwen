@@ -13,6 +13,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-cpp.h"
+#include "gguf.h"
 
 #include "models/models.h"
 
@@ -1466,6 +1467,176 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     }
 
     return res;
+}
+
+int llama_model::load_mtp_sidecar(const std::string & path) {
+    LLAMA_LOG_INFO("%s: loading MTP sidecar from %s\n", __func__, path.c_str());
+
+    // 1. Open sidecar GGUF (metadata only, no tensor data yet)
+    ggml_context * sidecar_ctx = nullptr;
+    struct gguf_init_params gguf_params = { /*.no_alloc =*/ true, /*.ctx =*/ &sidecar_ctx };
+    struct gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
+    if (!gguf_ctx) {
+        LLAMA_LOG_ERROR("%s: failed to open MTP sidecar: %s\n", __func__, path.c_str());
+        return -1;
+    }
+
+    const int64_t n_tensors = gguf_get_n_tensors(gguf_ctx);
+    LLAMA_LOG_INFO("%s: sidecar has %lld tensors\n", __func__, (long long)n_tensors);
+
+    // 2. Set hparams for MTP layer
+    const uint32_t mtp_il = hparams.n_layer;
+    hparams.nextn_predict_layers = 1;
+    hparams.n_head_arr[mtp_il]          = hparams.n_head_arr[0];
+    hparams.n_head_kv_arr[mtp_il]       = hparams.n_head_kv_arr[0];
+    hparams.n_ff_arr[mtp_il]            = hparams.n_ff_arr[0];
+    hparams.recurrent_layer_arr[mtp_il] = false;
+
+    // 3. Extend layers and dev_layer
+    layers.resize(mtp_il + 1);
+    pimpl->dev_layer.resize(mtp_il + 1);
+    pimpl->dev_layer[mtp_il] = pimpl->dev_layer[mtp_il - 1];
+
+    // 4. Allocate sidecar tensors on GPU
+    auto * dev = pimpl->dev_layer[mtp_il].dev;
+    auto * buft = ggml_backend_dev_buffer_type(dev);
+    auto * buf = ggml_backend_alloc_ctx_tensors_from_buft(sidecar_ctx, buft);
+    if (!buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate GPU buffer for MTP sidecar\n", __func__);
+        gguf_free(gguf_ctx);
+        ggml_free(sidecar_ctx);
+        return -1;
+    }
+
+    // 5. Upload tensor data from sidecar file
+    {
+        FILE * f = fopen(path.c_str(), "rb");
+        if (!f) {
+            LLAMA_LOG_ERROR("%s: failed to open sidecar for reading: %s\n", __func__, path.c_str());
+            gguf_free(gguf_ctx);
+            return -1;
+        }
+
+        const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+        for (int64_t i = 0; i < n_tensors; i++) {
+            const char * name   = gguf_get_tensor_name(gguf_ctx, i);
+            const size_t offset = gguf_get_tensor_offset(gguf_ctx, i);
+            const size_t size   = gguf_get_tensor_size(gguf_ctx, i);
+
+            auto * tensor = ggml_get_tensor(sidecar_ctx, name);
+            if (!tensor) {
+                LLAMA_LOG_WARN("%s: tensor '%s' not found in sidecar context\n", __func__, name);
+                continue;
+            }
+
+            std::vector<uint8_t> tmp(size);
+            fseek(f, data_offset + offset, SEEK_SET);
+            if (fread(tmp.data(), 1, size, f) != size) {
+                LLAMA_LOG_ERROR("%s: failed to read tensor '%s' (%zu bytes)\n", __func__, name, size);
+                fclose(f);
+                gguf_free(gguf_ctx);
+                return -1;
+            }
+            ggml_backend_tensor_set(tensor, tmp.data(), 0, size);
+            LLAMA_LOG_DEBUG("%s: loaded tensor '%s' (%zu bytes)\n", __func__, name, size);
+        }
+        fclose(f);
+    }
+
+    // 6. Wire up MTP layer fields
+    auto & layer = layers[mtp_il];
+    auto find = [&](const char * name) -> ggml_tensor * {
+        auto * t = ggml_get_tensor(sidecar_ctx, name);
+        if (!t) {
+            LLAMA_LOG_WARN("%s: missing tensor '%s' in sidecar\n", __func__, name);
+        }
+        return t;
+    };
+
+    // MTP-specific tensors
+    layer.nextn.eh_proj          = find("blk.24.nextn.eh_proj.weight");
+    layer.nextn.enorm            = find("blk.24.nextn.enorm.weight");
+    layer.nextn.hnorm            = find("blk.24.nextn.hnorm.weight");
+    layer.nextn.shared_head_norm = find("blk.24.nextn.shared_head_norm.weight");
+
+    // Attention
+    layer.attn_norm      = find("blk.24.attn_norm.weight");
+    layer.attn_post_norm = find("blk.24.post_attention_norm.weight");
+    layer.wq             = find("blk.24.attn_q.weight");
+    layer.wk             = find("blk.24.attn_k.weight");
+    layer.wv             = find("blk.24.attn_v.weight");
+    layer.wo             = find("blk.24.attn_output.weight");
+    layer.attn_q_norm    = find("blk.24.attn_q_norm.weight");
+    layer.attn_k_norm    = find("blk.24.attn_k_norm.weight");
+
+    // FFN
+    layer.ffn_gate = find("blk.24.ffn_gate.weight");
+    layer.ffn_down = find("blk.24.ffn_down.weight");
+    layer.ffn_up   = find("blk.24.ffn_up.weight");
+
+    // Restricted LM head (optional)
+    mtp_sidecar_lm_head = ggml_get_tensor(sidecar_ctx, "mtp_lm_head");
+
+    // 7. Read token ID mapping from metadata
+    {
+        int64_t key_id = gguf_find_key(gguf_ctx, "gwen.mtp_token_ids");
+        if (key_id >= 0) {
+            size_t n = gguf_get_arr_n(gguf_ctx, key_id);
+            const int32_t * data = (const int32_t *)gguf_get_arr_data(gguf_ctx, key_id);
+            mtp_sidecar_token_ids.assign(data, data + n);
+            LLAMA_LOG_INFO("%s: loaded %zu MTP token IDs\n", __func__, n);
+        }
+    }
+
+    // 8. Copy tok_embd to GPU for CUDA graph capture
+    //    When loading from stock GGUF, tok_embd is on CPU. MTP needs it on GPU
+    //    so the MTP graph stays on a single backend (enabling CUDA graph capture).
+    if (tok_embd && ggml_backend_buffer_get_type(tok_embd->buffer) != buft) {
+        LLAMA_LOG_INFO("%s: copying tok_embd to GPU for MTP (%zu MiB)\n", __func__,
+            ggml_nbytes(tok_embd) / 1024 / 1024);
+
+        struct ggml_init_params embd_params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        auto * embd_ctx = ggml_init(embd_params);
+        auto * tok_embd_gpu = ggml_new_tensor(embd_ctx, tok_embd->type,
+            ggml_n_dims(tok_embd), tok_embd->ne);
+        ggml_format_name(tok_embd_gpu, "%s", tok_embd->name);
+
+        auto * embd_buf = ggml_backend_alloc_ctx_tensors_from_buft(embd_ctx, buft);
+        if (embd_buf) {
+            ggml_backend_tensor_copy(tok_embd, tok_embd_gpu);
+            tok_embd = tok_embd_gpu;
+
+            // Store for cleanup
+            ggml_context_ptr embd_ctx_ptr(embd_ctx);
+            std::vector<ggml_backend_buffer_ptr> embd_bufs;
+            embd_bufs.emplace_back(embd_buf);
+            pimpl->ctxs_bufs.emplace_back(std::move(embd_ctx_ptr), std::move(embd_bufs));
+        } else {
+            LLAMA_LOG_WARN("%s: failed to allocate GPU buffer for tok_embd, "
+                "MTP will work but without CUDA graph capture\n", __func__);
+            ggml_free(embd_ctx);
+        }
+    }
+
+    // 9. Store sidecar context/buffer for cleanup
+    {
+        ggml_context_ptr ctx_ptr(sidecar_ctx);
+        std::vector<ggml_backend_buffer_ptr> bufs;
+        bufs.emplace_back(buf);
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+    }
+
+    gguf_free(gguf_ctx);
+
+    size_t total_bytes = ggml_backend_buffer_get_size(buf);
+    LLAMA_LOG_INFO("%s: MTP sidecar loaded: %d tensors, %.1f MiB on GPU\n",
+        __func__, (int)n_tensors, total_bytes / 1024.0 / 1024.0);
+
+    return 0;
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {

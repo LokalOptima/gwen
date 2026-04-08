@@ -545,6 +545,13 @@ struct llama_model {
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
 
+    // Load MTP weights from a sidecar GGUF (enables MTP on a stock base model)
+    int load_mtp_sidecar(const std::string & path);
+
+    // MTP sidecar state (populated by load_mtp_sidecar, used by context)
+    struct ggml_tensor *       mtp_sidecar_lm_head = nullptr;  // restricted LM head from sidecar
+    std::vector<int32_t>       mtp_sidecar_token_ids;          // restricted vocab mapping
+
     std::string arch_name() const;
     std::string type_name() const;
 

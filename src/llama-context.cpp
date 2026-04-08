@@ -335,72 +335,77 @@ llama_context::llama_context(
             ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
 
         // Load restricted LM head for MTP draft (reduced vocab → faster argmax)
-        // Try env var first, then default path
-        const char * lm_head_path = getenv("LLAMA_MTP_LM_HEAD");
-        std::string lm_head_default;
-        if (!lm_head_path) {
-            const char * home = getenv("HOME");
-            if (home) {
-                lm_head_default = std::string(home) + "/.cache/gwen/lm_head_top50000.bin";
-                if (access(lm_head_default.c_str(), R_OK) == 0) {
-                    lm_head_path = lm_head_default.c_str();
-                    LLAMA_LOG_INFO("%s: using default MTP LM head: %s\n", __func__, lm_head_path);
+        // Priority: 1) sidecar GGUF (already loaded by model), 2) GWRL binary
+        if (model.mtp_sidecar_lm_head && !model.mtp_sidecar_token_ids.empty()) {
+            // Use sidecar LM head (already on GPU, owned by model)
+            mtp_lm_head = model.mtp_sidecar_lm_head;
+            mtp_token_ids = model.mtp_sidecar_token_ids;
+            LLAMA_LOG_INFO("%s: MTP restricted LM head from sidecar: %zu tokens\n",
+                __func__, mtp_token_ids.size());
+        } else {
+            // Fallback: load from GWRL binary
+            const char * lm_head_path = getenv("LLAMA_MTP_LM_HEAD");
+            std::string lm_head_default;
+            if (!lm_head_path) {
+                const char * home = getenv("HOME");
+                if (home) {
+                    lm_head_default = std::string(home) + "/.cache/gwen/lm_head_top50000.bin";
+                    if (access(lm_head_default.c_str(), R_OK) == 0) {
+                        lm_head_path = lm_head_default.c_str();
+                        LLAMA_LOG_INFO("%s: using default MTP LM head: %s\n", __func__, lm_head_path);
+                    }
                 }
             }
-        }
-        if (lm_head_path) {
-            FILE * f = fopen(lm_head_path, "rb");
-            if (!f) {
-                LLAMA_LOG_WARN("%s: could not open MTP LM head: %s\n", __func__, lm_head_path);
-            } else {
-                char magic[4];
-                uint32_t version, K, n_embed, gtype, row_bytes;
-                fread(magic, 1, 4, f);
-                fread(&version, 4, 1, f);
-                fread(&K, 4, 1, f);
-                fread(&n_embed, 4, 1, f);
-                fread(&gtype, 4, 1, f);
-                fread(&row_bytes, 4, 1, f);
-
-                if (memcmp(magic, "GWRL", 4) != 0 || version != 1) {
-                    LLAMA_LOG_WARN("%s: invalid MTP LM head file format\n", __func__);
-                    fclose(f);
-                } else if (n_embed != hparams.n_embd) {
-                    LLAMA_LOG_WARN("%s: MTP LM head n_embed mismatch: %u vs %u\n", __func__, n_embed, hparams.n_embd);
-                    fclose(f);
+            if (lm_head_path) {
+                FILE * f = fopen(lm_head_path, "rb");
+                if (!f) {
+                    LLAMA_LOG_WARN("%s: could not open MTP LM head: %s\n", __func__, lm_head_path);
                 } else {
-                    // Read token ID mapping
-                    mtp_token_ids.resize(K);
-                    fread(mtp_token_ids.data(), sizeof(int32_t), K, f);
+                    char magic[4];
+                    uint32_t version, K, n_embed, gtype, row_bytes;
+                    fread(magic, 1, 4, f);
+                    fread(&version, 4, 1, f);
+                    fread(&K, 4, 1, f);
+                    fread(&n_embed, 4, 1, f);
+                    fread(&gtype, 4, 1, f);
+                    fread(&row_bytes, 4, 1, f);
 
-                    // Create tensor for restricted weights
-                    struct ggml_init_params params_lm = {
-                        /*.mem_size   =*/ ggml_tensor_overhead(),
-                        /*.mem_buffer =*/ nullptr,
-                        /*.no_alloc   =*/ true,
-                    };
-                    mtp_lm_ctx.reset(ggml_init(params_lm));
-
-                    // Q6_K tensor: [n_embed, K] — same layout as model.output but fewer rows
-                    mtp_lm_head = ggml_new_tensor_2d(mtp_lm_ctx.get(), (ggml_type)gtype, n_embed, K);
-                    ggml_format_name(mtp_lm_head, "mtp_lm_head");
-
-                    auto * lm_buf = ggml_backend_alloc_ctx_tensors_from_buft(mtp_lm_ctx.get(), buft);
-                    if (!lm_buf) {
-                        LLAMA_LOG_WARN("%s: failed to allocate MTP LM head buffer\n", __func__);
-                        mtp_lm_head = nullptr;
-                        mtp_token_ids.clear();
+                    if (memcmp(magic, "GWRL", 4) != 0 || version != 1) {
+                        LLAMA_LOG_WARN("%s: invalid MTP LM head file format\n", __func__);
+                        fclose(f);
+                    } else if (n_embed != hparams.n_embd) {
+                        LLAMA_LOG_WARN("%s: MTP LM head n_embed mismatch: %u vs %u\n", __func__, n_embed, hparams.n_embd);
+                        fclose(f);
                     } else {
-                        // Read Q6_K weight data and upload to GPU
-                        std::vector<uint8_t> weight_data(K * row_bytes);
-                        fread(weight_data.data(), 1, K * row_bytes, f);
-                        ggml_backend_tensor_set(mtp_lm_head, weight_data.data(), 0, K * row_bytes);
-                        mtp_lm_buf.reset(lm_buf);
+                        mtp_token_ids.resize(K);
+                        fread(mtp_token_ids.data(), sizeof(int32_t), K, f);
 
-                        LLAMA_LOG_INFO("%s: MTP restricted LM head: %u tokens, %.1f MiB\n",
-                            __func__, K, ggml_backend_buffer_get_size(lm_buf) / 1024.0 / 1024.0);
+                        struct ggml_init_params params_lm = {
+                            /*.mem_size   =*/ ggml_tensor_overhead(),
+                            /*.mem_buffer =*/ nullptr,
+                            /*.no_alloc   =*/ true,
+                        };
+                        mtp_lm_ctx.reset(ggml_init(params_lm));
+
+                        mtp_lm_head = ggml_new_tensor_2d(mtp_lm_ctx.get(), (ggml_type)gtype, n_embed, K);
+                        ggml_format_name(mtp_lm_head, "mtp_lm_head");
+
+                        auto * lm_buf = ggml_backend_alloc_ctx_tensors_from_buft(mtp_lm_ctx.get(), buft);
+                        if (!lm_buf) {
+                            LLAMA_LOG_WARN("%s: failed to allocate MTP LM head buffer\n", __func__);
+                            mtp_lm_head = nullptr;
+                            mtp_token_ids.clear();
+                        } else {
+                            std::vector<uint8_t> weight_data(K * row_bytes);
+                            fread(weight_data.data(), 1, K * row_bytes, f);
+                            ggml_backend_tensor_set(mtp_lm_head, weight_data.data(), 0, K * row_bytes);
+                            mtp_lm_buf.reset(lm_buf);
+
+                            LLAMA_LOG_INFO("%s: MTP restricted LM head: %u tokens, %.1f MiB\n",
+                                __func__, K, ggml_backend_buffer_get_size(lm_buf) / 1024.0 / 1024.0);
+                        }
+                        fclose(f);
                     }
-                    fclose(f);
                 }
             }
         }

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <unistd.h>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -1022,6 +1023,35 @@ static struct llama_model * llama_model_load_from_file_impl(
 
         llama_model_free(model);
         return nullptr;
+    }
+
+    // Check for MTP sidecar GGUF if the model doesn't have MTP baked in
+    // Skip during no_alloc probe loads (e.g. llama_params_fit memory estimation)
+    if (!params.vocab_only && !params.no_alloc && model->hparams.nextn_predict_layers == 0 && !path_model.empty()) {
+        // Check env var first
+        std::string sidecar_path;
+        const char * env = getenv("LLAMA_MTP_GGUF");
+        if (env && access(env, R_OK) == 0) {
+            sidecar_path = env;
+        } else {
+            // Convention: same directory, model name + "-mtp.gguf"
+            // e.g. Qwen3.5-0.8B-Q8_0.gguf → Qwen3.5-0.8B-Q8_0-mtp.gguf
+            std::string base = path_model;
+            size_t ext = base.rfind(".gguf");
+            if (ext != std::string::npos) {
+                std::string candidate = base.substr(0, ext) + "-mtp.gguf";
+                if (access(candidate.c_str(), R_OK) == 0) {
+                    sidecar_path = candidate;
+                }
+            }
+        }
+
+        if (!sidecar_path.empty()) {
+            int rc = model->load_mtp_sidecar(sidecar_path);
+            if (rc != 0) {
+                LLAMA_LOG_WARN("%s: failed to load MTP sidecar (continuing without MTP)\n", __func__);
+            }
+        }
     }
 
     return model;
