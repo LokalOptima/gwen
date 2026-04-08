@@ -5,6 +5,7 @@
 
 #include "gwen.h"
 #include "common.h"
+#include "log.h"
 #include "sampling.h"
 #include "llama.h"
 
@@ -455,15 +456,6 @@ static void generate_mtp(
 
         auto t_decode_end = std::chrono::high_resolution_clock::now();
         out_decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
-        int n_generated = (int)output_tokens.size() - initial_output_size;
-        fprintf(stderr, "MTP_STATS: {\"n_tokens\": %d, \"decode_ms\": %.1f, \"tok_per_s\": %.1f, "
-            "\"mtp_draft_ms\": %.1f, \"mtp_draft_avg_ms\": %.2f, \"main_decode_ms\": %.1f, "
-            "\"accepted\": %d, \"rejected\": %d, \"accept_rate\": %.1f}\n",
-            n_generated, out_decode_ms, n_generated > 0 ? n_generated * 1000.0 / out_decode_ms : 0.0,
-            mtp_draft_ms_total, (mtp_accepted + mtp_rejected) > 0 ? mtp_draft_ms_total / (mtp_accepted + mtp_rejected) : 0.0,
-            main_decode_ms_total,
-            mtp_accepted, mtp_rejected,
-            (mtp_accepted + mtp_rejected) > 0 ? 100.0 * mtp_accepted / (mtp_accepted + mtp_rejected) : 0.0);
     }
 
 done:
@@ -497,11 +489,19 @@ struct Context::Impl {
         params.model.path = model_path;
         params.n_gpu_layers = 999;
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;  // required for 2-token MTP verify
+        params.fit_params = false;  // skip probe load — model always fits on 16GB GPU
+        params.warmup = false;     // skip warmup — first real decode warms up anyway
+        params.verbosity = -1;
+
+        // Suppress all log output from llama.cpp and common
+        llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+        common_log_set_verbosity_thold(-1);
 
         llama_backend_init();
         llama_numa_init(params.numa);
 
         init_result = common_init_from_params(params);
+
         if (!init_result) return false;
 
         model = init_result->model();
