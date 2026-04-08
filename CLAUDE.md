@@ -53,22 +53,18 @@ full_attention_interval = 4
 
 ### Building & Running
 ```bash
+make download-models     # download GGUF + MTP sidecar from GitHub release
 make completion          # build llama-completion
 make bench               # build llama-bench
 make server              # build llama-server
 
-# Inference
+# Inference (MTP sidecar auto-discovered from *-mtp.gguf next to model)
 ./build/bin/llama-completion --no-conversation \
     -m ~/.cache/gwen/Qwen3.5-0.8B-Q8_0.gguf \
     -p "prompt" -n 100 --temp 0
 
-# MTP speculative decoding (draft head baked into GGUF)
-./build/bin/llama-completion --no-conversation \
-    -m ~/.cache/gwen/Qwen3.5-0.8B-mtp-Q8_0.gguf \
-    -p "prompt" -n 100 --temp 0
-
 # Server (OpenAI-compatible API + web UI at http://localhost:8080)
-./build/bin/llama-server -m ~/.cache/gwen/Qwen3.5-0.8B-mtp-Q8_0.gguf --port 8080
+./build/bin/llama-server -m ~/.cache/gwen/Qwen3.5-0.8B-Q8_0.gguf --port 8080
 ```
 
 ### Project Structure
