@@ -62,7 +62,7 @@ for quant in BF16 Q8_0 Q6_K Q4_K_M; do
     t_start=$(date +%s%N)
 
     "$COMPLETION" --no-conversation \
-        -m "$model" -p "$PROMPT" -n 4096 --temp 0 \
+        -m "$model" -p "$PROMPT" -n 4096 --greedy \
         2>/dev/null > "$outfile"
 
     t_end=$(date +%s%N)

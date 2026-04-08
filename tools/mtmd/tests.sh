@@ -150,7 +150,7 @@ for i in "${!arr_hf[@]}"; do
     cmd="$(printf %q "$PROJ_ROOT/build/bin/$bin") \
         -hf $(printf %q "$hf") \
         --image $(printf %q "$SCRIPT_DIR/$inp_file") \
-        --temp 0 -n 128 \
+        --greedy -n 128 \
         --flash-attn $(printf %q "$FLASH_ATTN") \
         ${extra_args}"
 

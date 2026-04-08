@@ -290,8 +290,8 @@ static float compute_mtp_q_draft(
 
 // MTP speculative decode: generates tokens using proven logic from test_mtp_speculative.
 // Returns tokens and updates n_past. Prints tokens as generated.
-// When greedy (temp==0): uses argmax fast path (GPU-side argmax, no logit transfer).
-// When stochastic (temp>0): uses full sampler chain so sampling params are respected.
+// Greedy (temp==0): GPU-side argmax, no logit transfer.
+// Stochastic (temp>0): full sampler chain.
 static void generate_mtp(
         llama_context * ctx,
         const llama_vocab * vocab,

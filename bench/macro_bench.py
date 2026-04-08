@@ -78,7 +78,7 @@ def bench_llamacpp(prompt: str, n_predict: int, warmup_runs: int = 1, bench_runs
         "-p", prompt,
         "-n", str(n_predict),
         "--no-conversation",
-        "--temp", "0",
+        "--greedy",
         "-ngl", "999",  # offload all layers to GPU
         "--no-warmup",
     ]

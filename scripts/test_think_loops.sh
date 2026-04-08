@@ -17,7 +17,7 @@ ANALYZER="$SCRIPT_DIR/analyze_think_loops.py"
 # Defaults — instruct Q8_0 model, 8192 tokens
 MODEL="${MODEL:-$HOME/models/gguf/Qwen3.5-0.8B-Q8_0.gguf}"
 N_TOKENS=8192
-SAMPLING="--temp 0"
+SAMPLING="--greedy"
 
 # Parse args
 while [[ $# -gt 0 ]]; do

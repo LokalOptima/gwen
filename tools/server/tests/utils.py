@@ -133,10 +133,7 @@ class ServerProcess:
             self.server_host,
             "--port",
             self.server_port,
-            "--temp",
-            self.temperature,
-            "--seed",
-            self.seed,
+            "--greedy",
         ]
         if self.offline:
             server_args.append("--offline")
