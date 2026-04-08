@@ -21,6 +21,58 @@
 #include <unordered_map>
 #include <vector>
 
+struct top_k_candidate { llama_token id; float logit; };
+
+static inline void top_k_insert(top_k_candidate * top, int k, int idx, float val, float & threshold) {
+    int lo = 0, hi = k - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (top[mid].logit > val) lo = mid + 1; else hi = mid;
+    }
+    memmove(&top[lo + 1], &top[lo], (k - 1 - lo) * sizeof(top_k_candidate));
+    top[lo] = {(llama_token)idx, val};
+    threshold = top[k - 1].logit;
+}
+
+static void top_k_scan_scalar(const float * logits, int n_vocab, int k,
+                               top_k_candidate * top, float & threshold, int start = -1) {
+    if (start < 0) start = k;
+    for (int i = start; i < n_vocab; i++) {
+        if (logits[i] > threshold) {
+            top_k_insert(top, k, i, logits[i], threshold);
+        }
+    }
+}
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#include <immintrin.h>
+
+__attribute__((target("avx2")))
+static void top_k_scan_avx2(const float * logits, int n_vocab, int k,
+                              top_k_candidate * top, float & threshold) {
+    __m256 thresh_v = _mm256_set1_ps(threshold);
+    const int n_simd_end = k + ((n_vocab - k) & ~7);
+    for (int i = k; i < n_simd_end; i += 8) {
+        __m256 v = _mm256_loadu_ps(&logits[i]);
+        int mask = _mm256_movemask_ps(_mm256_cmp_ps(v, thresh_v, _CMP_GT_OS));
+        if (!mask) continue;
+        while (mask) {
+            int bit = __builtin_ctz(mask);
+            top_k_insert(top, k, i + bit, logits[i + bit], threshold);
+            thresh_v = _mm256_set1_ps(threshold);
+            mask &= mask - 1;
+        }
+    }
+    top_k_scan_scalar(logits, n_vocab, k, top, threshold, n_simd_end);
+}
+
+static bool cpu_has_avx2() {
+    static const bool v = __builtin_cpu_supports("avx2");
+    return v;
+}
+#define HAS_AVX2_DISPATCH
+#endif
+
 static llama_token greedy_argmax(const float * logits, int n_vocab) {
     llama_token best = 0;
     float best_val = logits[0];
@@ -48,28 +100,32 @@ static llama_token fast_sample(
         llama_token probe_token = -1,
         float * probe_p = nullptr) {
 
-    const int K_WIDE = 64;  // pre-penalty top-k (wider to absorb penalty shifts)
+    constexpr int K_WIDE = 64;  // pre-penalty top-k (wider to absorb penalty shifts)
     const int top_k  = std::max(1, sparams.top_k);
     const float temp = sparams.temp;
 
-    // Step 1: Find top K_WIDE from raw logits using a min-heap
-    struct Candidate { llama_token id; float logit; };
+    // Step 1: Top-K_WIDE scan (sorted array + threshold, AVX2 when available)
+    top_k_candidate top[K_WIDE];
     const int k_init = std::min(K_WIDE, n_vocab);
-    std::vector<Candidate> top(k_init);
 
     for (int i = 0; i < k_init; i++) {
         top[i] = {(llama_token)i, logits[i]};
     }
-    auto cmp_min = [](const Candidate & a, const Candidate & b) { return a.logit > b.logit; };
-    std::make_heap(top.begin(), top.end(), cmp_min);
+    std::sort(top, top + k_init, [](const top_k_candidate & a, const top_k_candidate & b) {
+        return a.logit > b.logit;
+    });
+    float threshold = top[k_init - 1].logit;
 
-    for (int i = k_init; i < n_vocab; i++) {
-        if (logits[i] > top[0].logit) {
-            std::pop_heap(top.begin(), top.end(), cmp_min);
-            top.back() = {(llama_token)i, logits[i]};
-            std::push_heap(top.begin(), top.end(), cmp_min);
-        }
+#ifdef HAS_AVX2_DISPATCH
+    if (cpu_has_avx2()) {
+        top_k_scan_avx2(logits, n_vocab, k_init, top, threshold);
+    } else
+#endif
+    {
+        top_k_scan_scalar(logits, n_vocab, k_init, top, threshold);
     }
+
+    // top[] is already sorted descending — no need to re-sort
 
     // Step 2: Apply penalties to K_WIDE candidates (not 248K)
     const bool has_penalty = (sparams.penalty_last_n != 0) &&
@@ -85,7 +141,8 @@ static llama_token fast_sample(
             token_count[output_tokens[j]]++;
         }
 
-        for (auto & c : top) {
+        for (int ci = 0; ci < k_init; ci++) {
+            auto & c = top[ci];
             auto it = token_count.find(c.id);
             if (it == token_count.end()) continue;
             const int count = it->second;
@@ -99,14 +156,14 @@ static llama_token fast_sample(
         }
     }
 
-    // Step 3: Sort descending, take final top_k
-    std::sort(top.begin(), top.end(), [](const Candidate & a, const Candidate & b) { return a.logit > b.logit; });
-    const int k = std::min(top_k, (int)top.size());
+    // Step 3: Re-sort after penalties, take final top_k
+    std::sort(top, top + k_init, [](const top_k_candidate & a, const top_k_candidate & b) { return a.logit > b.logit; });
+    const int k = std::min(top_k, k_init);
 
     // Step 4: Temperature + softmax + sample
     const float max_l = top[0].logit;
     float sum = 0.0f;
-    std::vector<float> probs(k);
+    float probs[K_WIDE];
     for (int i = 0; i < k; i++) {
         probs[i] = expf((top[i].logit - max_l) / temp);
         sum += probs[i];
