@@ -58,7 +58,7 @@ declare -a HEAD_SIZES=(${MTP_HEAD_SIZES:-0 4000 10000 20000 30000 50000})
 
 echo "================================================================"
 echo "  MTP Restricted LM Head Size Comparison"
-echo "  Model: $(basename $MODEL_MTP)"
+echo "  Model: $(basename $MODEL)"
 echo "  Tokens: $N per prompt, 12 prompts"
 echo "================================================================"
 echo ""
@@ -95,7 +95,7 @@ for HEAD_K in "${HEAD_SIZES[@]}"; do
         cat="${CATEGORIES[$i]}"
 
         stats=$("$COMPLETION" --no-conversation \
-            -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$N" --greedy 2>&1 1>/dev/null \
+            -m "$MODEL" -p "${PROMPTS[$i]}" -n "$N" --greedy 2>&1 1>/dev/null \
             | grep "MTP_STATS" || echo "")
 
         if [ -z "$stats" ]; then

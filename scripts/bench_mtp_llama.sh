@@ -1,6 +1,6 @@
 #!/bin/bash
-# MTP speculative decoding benchmark
-# Tests diverse prompts at realistic lengths, measures acceptance and throughput.
+# MTP speculative decoding benchmark with correctness check
+# Baseline: upstream llama.cpp (same GGUF, no MTP sidecar)
 #
 # Usage: ./scripts/bench_mtp_llama.sh [n_tokens] [--restricted]
 set -euo pipefail
@@ -20,7 +20,13 @@ fi
 
 if [ ! -x "$COMPLETION" ]; then
     echo "Error: llama-completion not found at $COMPLETION" >&2
-    echo "Run: cd build && cmake --build . --target llama-completion" >&2
+    echo "Run: make completion" >&2
+    exit 1
+fi
+
+if [ ! -x "$LLAMA_COMPLETION" ]; then
+    echo "Error: upstream llama-completion not found at $LLAMA_COMPLETION" >&2
+    echo "Build upstream llama.cpp or set LLAMA_COMPLETION=/path/to/llama-completion" >&2
     exit 1
 fi
 
@@ -66,7 +72,7 @@ declare -a LABELS=(
 
 echo "================================================================"
 echo "  MTP Speculative Decode Benchmark"
-echo "  Model: $(basename $MODEL_MTP)"
+echo "  Model: $(basename $MODEL)"
 if [ $RESTRICTED -eq 1 ]; then
     echo "  LM Head: restricted 50K ($(basename $LM_HEAD))"
     export LLAMA_MTP_LM_HEAD="$LM_HEAD"
@@ -75,15 +81,16 @@ else
     unset LLAMA_MTP_LM_HEAD 2>/dev/null || true
 fi
 echo "  Tokens: $N per prompt"
+echo "  Baseline: upstream llama.cpp"
 echo "================================================================"
 echo ""
 
-# Step 1: Generate baseline (non-MTP) for correctness comparison
-echo "Generating baseline (non-MTP)..."
+# Step 1: Generate baseline with upstream llama.cpp
+echo "Generating baseline (upstream llama.cpp)..."
 BASELINE_DIR=$(mktemp -d)
 for i in "${!PROMPTS[@]}"; do
-    "$COMPLETION" --no-conversation \
-        -m "$MODEL_BASE" -p "${PROMPTS[$i]}" -n "$N" --greedy -fa off 2>/dev/null \
+    "$LLAMA_COMPLETION" --no-conversation \
+        -m "$MODEL" -p "${PROMPTS[$i]}" -n "$N" --temp 0 --presence-penalty 0 -fa off 2>/dev/null \
         > "$BASELINE_DIR/$i.txt"
 done
 echo "Baseline generated."
@@ -106,10 +113,10 @@ for i in "${!PROMPTS[@]}"; do
 
     # Run MTP decode, capture stderr for stats and stdout for text
     MTP_OUT=$("$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "$prompt" -n "$N" --greedy 2>/dev/null)
+        -m "$MODEL" -p "$prompt" -n "$N" --greedy 2>/dev/null)
 
     MTP_STATS=$("$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "$prompt" -n "$N" --greedy 2>&1 >/dev/null \
+        -m "$MODEL" -p "$prompt" -n "$N" --greedy 2>&1 >/dev/null \
         | grep "speculative" || echo "")
 
     # Parse stats
@@ -133,7 +140,7 @@ for i in "${!PROMPTS[@]}"; do
     # Use time-based measurement for tok/s
     t_start=$(date +%s%N)
     "$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "$prompt" -n "$N" --greedy > /dev/null 2>&1
+        -m "$MODEL" -p "$prompt" -n "$N" --greedy > /dev/null 2>&1
     t_end=$(date +%s%N)
     ms=$(( (t_end - t_start) / 1000000 ))
     # Subtract ~800ms for model loading
@@ -160,7 +167,7 @@ echo "  Summary"
 echo "  Total accepted: $total_accept  rejected: $total_reject  rate: ${total_rate}%"
 echo "  Correct: $n_correct / $n_prompts"
 if [ $n_correct -eq $n_prompts ]; then
-    echo "  ALL OUTPUTS MATCH BASELINE"
+    echo "  ALL OUTPUTS MATCH UPSTREAM LLAMA.CPP"
 else
     echo "  WARNING: SOME OUTPUTS DIVERGED"
 fi

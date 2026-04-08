@@ -3,7 +3,7 @@ BUILD_DIR := build
 GWEN_CACHE := $(HOME)/.cache/gwen
 RELEASE_URL := https://github.com/LokalOptima/gwen/releases/download/v2.0.0
 
-MODEL_BASE := $(GWEN_CACHE)/Qwen3.5-0.8B-Q8_0.gguf
+MODEL      := $(GWEN_CACHE)/Qwen3.5-0.8B-Q8_0.gguf
 MODEL_MTP  := $(GWEN_CACHE)/Qwen3.5-0.8B-Q8_0-mtp.gguf
 MD5_BASE   := d8872c3399f15f172026776e33a0f918
 MD5_MTP    := 8e48e160b3c42237a007923a90b8e3e5
@@ -42,9 +42,9 @@ bench-mtp: $(BUILD_DIR)/bin/llama-completion
 	./scripts/bench_mtp_llama.sh
 
 # --- Model download ---
-download-models: $(MODEL_BASE) $(MODEL_MTP)
+download-models: $(MODEL) $(MODEL_MTP)
 
-$(MODEL_BASE):
+$(MODEL):
 	@mkdir -p $(GWEN_CACHE)
 	@echo "Downloading $(notdir $@) (775 MiB)..."
 	curl -L -o $@ $(RELEASE_URL)/$(notdir $@)

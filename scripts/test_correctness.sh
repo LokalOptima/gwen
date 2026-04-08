@@ -1,7 +1,10 @@
 #!/bin/bash
 # MTP correctness regression test
 # Tests 12 prompts × 3 lengths (50, 200, 500) = 36 cases
-# Base model generates reference; MTP model must match bit-for-bit.
+# Baseline: upstream llama.cpp (same GGUF, no MTP sidecar)
+# Test:     gwen with MTP speculative decode
+#
+# Both use greedy decoding — outputs must match bit-for-bit.
 #
 # Usage: ./scripts/test_correctness.sh [--quick]
 #   --quick: only test 50-token length (12 tests instead of 36)
@@ -10,25 +13,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 BUILD_DIR="$SCRIPT_DIR/../build"
-COMPLETION="$BUILD_DIR/bin/llama-completion"
+GWEN_COMPLETION="$BUILD_DIR/bin/llama-completion"
 
 QUICK=0
 if [[ "${1:-}" == "--quick" ]]; then
     QUICK=1
 fi
 
-if [ ! -x "$COMPLETION" ]; then
-    echo "ERROR: llama-completion not found at $COMPLETION" >&2
-    echo "Run: cd build && cmake --build . --target llama-completion -j\$(nproc)" >&2
+if [ ! -x "$GWEN_COMPLETION" ]; then
+    echo "ERROR: gwen llama-completion not found at $GWEN_COMPLETION" >&2
+    echo "Run: make completion" >&2
     exit 1
 fi
 
-for f in "$MODEL_BASE" "$MODEL_MTP"; do
-    if [ ! -f "$f" ]; then
-        echo "ERROR: model not found: $f" >&2
-        exit 1
-    fi
-done
+if [ ! -x "$LLAMA_COMPLETION" ]; then
+    echo "ERROR: upstream llama-completion not found at $LLAMA_COMPLETION" >&2
+    echo "Build upstream llama.cpp or set LLAMA_COMPLETION=/path/to/llama-completion" >&2
+    exit 1
+fi
+
+if [ ! -f "$MODEL" ]; then
+    echo "ERROR: model not found: $MODEL" >&2
+    exit 1
+fi
 
 declare -a PROMPTS=(
     "The history of artificial intelligence begins in the 1950s when Alan Turing proposed"
@@ -67,6 +74,9 @@ else
     LENGTHS=(50 200 500)
     echo "=== MTP Correctness Test (full: 12 prompts × 3 lengths) ==="
 fi
+echo "  Baseline: upstream llama.cpp ($(basename "$LLAMA_COMPLETION"))"
+echo "  Test:     gwen MTP ($(basename "$GWEN_COMPLETION"))"
+echo "  Model:    $(basename "$MODEL")"
 
 BASELINE_DIR=$(mktemp -d)
 MTP_DIR=$(mktemp -d)
@@ -80,24 +90,23 @@ for len in "${LENGTHS[@]}"; do
     echo ""
     echo "--- Length: $len tokens ---"
 
-    # Generate baselines for this length
+    # Generate baselines with upstream llama.cpp (no MTP sidecar)
     for i in "${!PROMPTS[@]}"; do
-        "$COMPLETION" --no-conversation \
-            -m "$MODEL_BASE" -p "${PROMPTS[$i]}" -n "$len" --greedy -fa off \
+        "$LLAMA_COMPLETION" --no-conversation \
+            -m "$MODEL" -p "${PROMPTS[$i]}" -n "$len" --temp 0 --presence-penalty 0 -fa off \
             2>/dev/null > "$BASELINE_DIR/${i}_${len}.txt"
     done
 
-    # Run MTP and compare
+    # Run gwen MTP and compare
     for i in "${!PROMPTS[@]}"; do
         label="${LABELS[$i]}"
         n_tests=$((n_tests + 1))
 
-        "$COMPLETION" --no-conversation \
-            -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$len" --greedy \
+        "$GWEN_COMPLETION" --no-conversation \
+            -m "$MODEL" -p "${PROMPTS[$i]}" -n "$len" --greedy \
             2>/dev/null > "$MTP_DIR/${i}_${len}.txt"
 
         # Normalize before comparing: strip [end of text] markers and trailing whitespace/newlines
-        # (base model prints EOG token, MTP speculation loop handles EOG differently)
         normalize() { sed 's/\[end of text\]//g' "$1" | sed 's/[[:space:]]*$//' | sed '/^$/d'; }
         if diff -q <(normalize "$BASELINE_DIR/${i}_${len}.txt") <(normalize "$MTP_DIR/${i}_${len}.txt") > /dev/null 2>&1; then
             printf "  PASS: %-14s @ %d tokens\n" "$label" "$len"
@@ -114,14 +123,13 @@ echo ""
 echo "================================================================"
 echo "  Result: $n_pass / $n_tests correct ($n_fail failures)"
 if [ $n_fail -eq 0 ]; then
-    echo "  ALL OUTPUTS MATCH BASELINE"
+    echo "  ALL OUTPUTS MATCH UPSTREAM LLAMA.CPP"
     echo "================================================================"
     exit 0
 else
     # 500-token failures are known (2-token batch precision accumulation)
     # Only exit 1 if there are failures at 50 or 200 tokens
     n_critical=0
-    # Re-check: run through results looking for non-500 failures
     for len in "${LENGTHS[@]}"; do
         [ "$len" -eq 500 ] && continue
         for i in "${!PROMPTS[@]}"; do

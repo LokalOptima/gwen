@@ -19,12 +19,10 @@ for f in "$COMPLETION" "$BENCH"; do
         exit 1
     fi
 done
-for f in "$MODEL_BASE" "$MODEL_MTP"; do
-    if [ ! -f "$f" ]; then
-        echo "ERROR: model not found: $f" >&2
-        exit 1
-    fi
-done
+if [ ! -f "$MODEL" ]; then
+    echo "ERROR: model not found: $MODEL" >&2
+    exit 1
+fi
 
 declare -a PROMPTS=(
     "The history of artificial intelligence begins in the 1950s when Alan Turing proposed"
@@ -58,18 +56,14 @@ declare -a LABELS=(
 
 echo "================================================================"
 echo "  Decode Benchmark"
-echo "  Base: $(basename $MODEL_BASE)"
-echo "  MTP:  $(basename $MODEL_MTP)"
+echo "  Model: $(basename $MODEL)"
 echo "  Tokens: $N per prompt"
 echo "================================================================"
 echo ""
 
 # --- Baseline: llama-bench ---
 echo "=== Baseline (llama-bench tg64, FA off, 5 reps) ==="
-"$BENCH" -m "$MODEL_BASE" -p 0 -n 64 -r 5 -fa 0 2>&1 | tail -3
-echo ""
-echo "=== MTP model single-token (llama-bench tg64, FA off, 5 reps) ==="
-"$BENCH" -m "$MODEL_MTP" -p 0 -n 64 -r 5 -fa 0 2>&1 | tail -3
+"$BENCH" -m "$MODEL" -p 0 -n 64 -r 5 -fa 0 2>&1 | tail -3
 echo ""
 
 # --- MTP speculative decode ---
@@ -86,7 +80,7 @@ for i in "${!PROMPTS[@]}"; do
 
     # Run MTP, capture stderr for stats
     stats=$("$COMPLETION" --no-conversation \
-        -m "$MODEL_MTP" -p "${PROMPTS[$i]}" -n "$N" --greedy 2>&1 1>/dev/null \
+        -m "$MODEL" -p "${PROMPTS[$i]}" -n "$N" --greedy 2>&1 1>/dev/null \
         | grep "MTP_STATS" || echo "")
 
     if [ -z "$stats" ]; then

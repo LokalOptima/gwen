@@ -612,8 +612,6 @@ static common_params            * g_params;
 static std::vector<llama_token> * g_input_tokens;
 static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
-static bool is_interacting  = false;
-static bool need_insert_eot = false;
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -639,20 +637,14 @@ static bool file_is_empty(const std::string & path) {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
 static void sigint_handler(int signo) {
     if (signo == SIGINT) {
-        if (!is_interacting && g_params->interactive) {
-            is_interacting  = true;
-            need_insert_eot = true;
-        } else {
-            console::cleanup();
-            LOG("\n");
-            common_perf_print(*g_ctx, *g_smpl);
+        console::cleanup();
+        LOG("\n");
+        common_perf_print(*g_ctx, *g_smpl);
 
-            // make sure all logs are flushed
-            LOG("Interrupted by user\n");
-            common_log_pause(common_log_main());
+        LOG("Interrupted by user\n");
+        common_log_pause(common_log_main());
 
-            _exit(130);
-        }
+        _exit(130);
     }
 }
 #endif
@@ -723,6 +715,12 @@ int main(int argc, char ** argv) {
 
     if (ctx == NULL) {
         LOG_ERR("%s: error: unable to create context\n", __func__);
+        return 1;
+    }
+
+    if (!llama_model_has_mtp(model)) {
+        LOG_ERR("%s: error: model has no MTP sidecar — gwen requires MTP\n", __func__);
+        LOG_ERR("%s: ensure *-mtp.gguf is next to the model or set LLAMA_MTP_GGUF\n", __func__);
         return 1;
     }
 
@@ -850,7 +848,6 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> embd_inp;
 
-    bool waiting_for_first_input = false;
     auto chat_add_and_format = [&chat_msgs, &chat_templates](const std::string & role, const std::string & content) {
         common_chat_msg new_msg;
         new_msg.role = role;
@@ -865,15 +862,10 @@ int main(int argc, char ** argv) {
     {
         if (params.conversation_mode && params.enable_chat_template) {
             if (!params.system_prompt.empty()) {
-                // format the system prompt (will use template default if empty)
                 chat_add_and_format("system", params.system_prompt);
             }
-
             if (!params.prompt.empty()) {
-                // format and append the user prompt
                 chat_add_and_format("user", params.prompt);
-            } else {
-                waiting_for_first_input = true;
             }
 
             if (!params.system_prompt.empty() || !params.prompt.empty()) {
@@ -887,11 +879,10 @@ int main(int argc, char ** argv) {
                 prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
             }
         } else {
-            // otherwise use the prompt as is
             prompt = params.prompt;
         }
 
-        if (params.interactive_first || !prompt.empty() || session_tokens.empty()) {
+        if (!prompt.empty() || session_tokens.empty()) {
             LOG_DBG("tokenize the prompt\n");
             embd_inp = common_tokenize(ctx, prompt, true, true);
         } else {
@@ -903,8 +894,7 @@ int main(int argc, char ** argv) {
         LOG_DBG("tokens: %s\n", string_from(ctx, embd_inp).c_str());
     }
 
-    // Should not run without any tokens
-    if (!waiting_for_first_input && embd_inp.empty()) {
+    if (embd_inp.empty()) {
         if (add_bos) {
             embd_inp.push_back(llama_vocab_bos(vocab));
             LOG_WRN("embd_inp was considered empty and bos was added: %s\n", string_from(ctx, embd_inp).c_str());
@@ -985,20 +975,6 @@ int main(int argc, char ** argv) {
         params.n_keep += add_bos; // always keep the BOS token
     }
 
-    if (params.conversation_mode) {
-        if (params.single_turn && !params.prompt.empty()) {
-            params.interactive = false;
-            params.interactive_first = false;
-        } else {
-            params.interactive_first = true;
-        }
-    }
-
-    // enable interactive mode if interactive start is specified
-    if (params.interactive_first) {
-        params.interactive = true;
-    }
-
     if (params.verbose_prompt) {
         LOG_INF("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
         LOG_INF("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
@@ -1032,46 +1008,6 @@ int main(int argc, char ** argv) {
 #endif
     }
 
-    if (params.interactive) {
-        LOG_INF("%s: interactive mode on.\n", __func__);
-
-        if (!params.antiprompt.empty()) {
-            for (const auto & antiprompt : params.antiprompt) {
-                LOG_INF("Reverse prompt: '%s'\n", antiprompt.c_str());
-                if (params.verbose_prompt) {
-                    auto tmp = common_tokenize(ctx, antiprompt, false, true);
-                    for (int i = 0; i < (int) tmp.size(); i++) {
-                        LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx, tmp[i]).c_str());
-                    }
-                }
-            }
-        }
-
-        if (params.input_prefix_bos) {
-            LOG_INF("Input prefix with BOS\n");
-        }
-
-        if (!params.input_prefix.empty()) {
-            LOG_INF("Input prefix: '%s'\n", params.input_prefix.c_str());
-            if (params.verbose_prompt) {
-                auto tmp = common_tokenize(ctx, params.input_prefix, true, true);
-                for (int i = 0; i < (int) tmp.size(); i++) {
-                    LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx, tmp[i]).c_str());
-                }
-            }
-        }
-
-        if (!params.input_suffix.empty()) {
-            LOG_INF("Input suffix: '%s'\n", params.input_suffix.c_str());
-            if (params.verbose_prompt) {
-                auto tmp = common_tokenize(ctx, params.input_suffix, false, true);
-                for (int i = 0; i < (int) tmp.size(); i++) {
-                    LOG_INF("%6d -> '%s'\n", tmp[i], common_token_to_piece(ctx, tmp[i]).c_str());
-                }
-            }
-        }
-    }
-
     LOG_INF("sampler seed: %u\n",     common_sampler_get_seed(smpl));
     LOG_INF("sampler params: \n%s\n", sparams.print().c_str());
     LOG_INF("sampler chain: %s\n",    common_sampler_print(smpl).c_str());
@@ -1094,86 +1030,27 @@ int main(int argc, char ** argv) {
     }
     LOG_INF("\n");
 
-    if (params.interactive) {
-        const char * control_message;
-        if (params.multiline_input) {
-            control_message = " - To return control to the AI, end your input with '\\'.\n"
-                              " - To return control without starting a new line, end your input with '/'.\n";
-        } else {
-            control_message = " - Press Return to return control to the AI.\n"
-                              " - To return control without starting a new line, end your input with '/'.\n"
-                              " - If you want to submit another line, end your input with '\\'.\n";
-        }
-        LOG_INF("== Running in interactive mode. ==\n");
-#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
-        LOG_INF(       " - Press Ctrl+C to interject at any time.\n");
-#endif
-        LOG_INF(       "%s", control_message);
-        if (params.conversation_mode && params.enable_chat_template && params.system_prompt.empty()) {
-            LOG_INF(   " - Not using system message. To change it, set a different value via -sys PROMPT\n");
-        }
-        LOG_INF("\n");
-
-        is_interacting = params.interactive_first;
-    }
-
-    bool is_antiprompt = false;
-    bool input_echo    = true;
-    bool display       = true;
+    bool display       = params.display_prompt;
 
     int n_past             = 0;
     int n_remain           = params.n_predict;
     int n_consumed         = 0;
 
-    // MTP speculative decode state
-    const bool use_mtp = llama_model_has_mtp(model) && !params.interactive && !getenv("LLAMA_NO_MTP");
     int mtp_accepted = 0;
     int mtp_rejected = 0;
-    bool mtp_skip_decode = false;
     int n_session_consumed = 0;
 
     std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
     std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
     std::ostringstream output_ss;     g_output_ss     = &output_ss;
-    std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
 
-    // the first thing we will do is to output the prompt, so set color accordingly
     console::set_display(DISPLAY_TYPE_PROMPT);
-    display = params.display_prompt;
 
     std::vector<llama_token> embd;
 
-    // single-token antiprompts
-    std::vector<llama_token> antiprompt_token;
-
-    for (const std::string & antiprompt : params.antiprompt) {
-        auto ids = ::common_tokenize(ctx, antiprompt, false, true);
-        if (ids.size() == 1) {
-            antiprompt_token.push_back(ids[0]);
-        }
-    }
-
-    if (llama_model_has_encoder(model)) {
-        int enc_input_size = embd_inp.size();
-        llama_token * enc_input_buf = embd_inp.data();
-
-        if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size))) {
-            LOG_ERR("%s : failed to eval\n", __func__);
-            return 1;
-        }
-
-        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
-        if (decoder_start_token_id == LLAMA_TOKEN_NULL) {
-            decoder_start_token_id = llama_vocab_bos(vocab);
-        }
-
-        embd_inp.clear();
-        embd_inp.push_back(decoder_start_token_id);
-    }
-
-    while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+    while (n_remain != 0) {
         // predict
-        if (!embd.empty() && !mtp_skip_decode) {
+        if (!embd.empty()) {
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
             // --prompt or --file which uses the same value.
             int max_embd_size = n_ctx - 4;
@@ -1287,52 +1164,24 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-        mtp_skip_decode = false;
-
         embd.clear();
 
-        if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
+        if ((int) embd_inp.size() <= n_consumed) {
+            // All input consumed — generate via MTP speculative decode
+            std::ostringstream mtp_ss;
+            generate_mtp(ctx, vocab, smpl, sparams, n_past, n_remain, mtp_accepted, mtp_rejected,
+                         output_tokens, mtp_ss, params.special);
 
-            if (use_mtp) {
-                // MTP speculative decode: run the entire generation loop
-                std::ostringstream mtp_ss;
-                generate_mtp(ctx, vocab, smpl, sparams, n_past, n_remain, mtp_accepted, mtp_rejected,
-                             output_tokens, mtp_ss, params.special);
+            const std::string mtp_text = mtp_ss.str();
+            LOG("%s", mtp_text.c_str());
 
-                // Print all generated text
-                const std::string mtp_text = mtp_ss.str();
-                LOG("%s", mtp_text.c_str());
-
-                if (params.conversation_mode && !waiting_for_first_input) {
-                    assistant_ss << mtp_text;
-                }
-
-                break;  // generation complete
-            }
-
-            const llama_token id = common_sampler_sample(smpl, ctx, -1);
-            common_sampler_accept(smpl, id, true);
-            embd.push_back(id);
-            --n_remain;
-
-            if (params.conversation_mode && !waiting_for_first_input && !llama_vocab_is_eog(vocab, id)) {
-                assistant_ss << common_token_to_piece(ctx, id, false);
-            }
-
-            // echo this to console
-            input_echo = true;
-
-            LOG_DBG("n_remain: %d\n", n_remain);
+            break;
         } else {
-            // some user input remains from prompt or interaction, forward it to processing
+            // Feed prompt tokens in batches
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
             while ((int) embd_inp.size() > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
-
-                // push the prompt in the sampling context in order to apply repetition penalties later
-                // for the prompt, we don't apply grammar rules
                 common_sampler_accept(smpl, embd_inp[n_consumed], /* accept_grammar= */ false);
-
                 ++n_consumed;
                 if ((int) embd.size() == params.n_batch) {
                     break;
@@ -1340,241 +1189,17 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // display text
-        if (input_echo && display) {
+        // Echo prompt tokens
+        if (display) {
             for (auto id : embd) {
                 const std::string token_str = common_token_to_piece(ctx, id, params.special);
-
-                // Console/Stream Output
                 LOG("%s", token_str.c_str());
-
-                // Record Displayed Tokens To Log
-                // Note: Generated tokens are created one by one hence this check
-                if (embd.size() > 1) {
-                    // Incoming Requested Tokens
-                    input_tokens.push_back(id);
-                } else {
-                    // Outgoing Generated Tokens
-                    output_tokens.push_back(id);
-                    output_ss << token_str;
-                }
+                input_tokens.push_back(id);
             }
         }
 
-        // reset color to default if there is no pending user input
-        if (input_echo && (int) embd_inp.size() == n_consumed) {
+        if ((int) embd_inp.size() == n_consumed) {
             console::set_display(DISPLAY_TYPE_RESET);
-            display = true;
-        }
-
-        // if not currently processing queued inputs;
-        if ((int) embd_inp.size() <= n_consumed) {
-            // check for reverse prompt in the last n_prev tokens
-            if (!params.antiprompt.empty()) {
-                const int n_prev = 32;
-                const std::string last_output = common_sampler_prev_str(smpl, ctx, n_prev);
-
-                is_antiprompt = false;
-                // Check if each of the reverse prompts appears at the end of the output.
-                // If we're not running interactively, the reverse prompt might be tokenized with some following characters
-                // so we'll compensate for that by widening the search window a bit.
-                for (std::string & antiprompt : params.antiprompt) {
-                    size_t extra_padding = params.interactive ? 0 : 2;
-                    size_t search_start_pos = last_output.length() > static_cast<size_t>(antiprompt.length() + extra_padding)
-                        ? last_output.length() - static_cast<size_t>(antiprompt.length() + extra_padding)
-                        : 0;
-
-                    if (last_output.find(antiprompt, search_start_pos) != std::string::npos) {
-                        if (params.interactive) {
-                            is_interacting = true;
-                        }
-                        is_antiprompt = true;
-                        break;
-                    }
-                }
-
-                // check for reverse prompt using special tokens
-                // avoid calling common_sampler_last() if last_output is empty
-                if (!last_output.empty()) {
-                    llama_token last_token = common_sampler_last(smpl);
-                    for (auto token : antiprompt_token) {
-                        if (token == last_token) {
-                            if (params.interactive) {
-                                is_interacting = true;
-                            }
-                            is_antiprompt = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (is_antiprompt) {
-                    LOG_DBG("found antiprompt: %s\n", last_output.c_str());
-                }
-            }
-
-            // deal with end of generation tokens in interactive mode
-            if (!waiting_for_first_input && llama_vocab_is_eog(vocab, common_sampler_last(smpl))) {
-                LOG_DBG("found an EOG token\n");
-
-                if (params.interactive) {
-                    if (!params.antiprompt.empty()) {
-                        // tokenize and inject first reverse prompt
-                        const auto first_antiprompt = common_tokenize(ctx, params.antiprompt.front(), false, true);
-                        embd_inp.insert(embd_inp.end(), first_antiprompt.begin(), first_antiprompt.end());
-                        is_antiprompt = true;
-                    }
-
-                    if (params.enable_chat_template) {
-                        chat_add_and_format("assistant", assistant_ss.str());
-                    }
-                    is_interacting = true;
-                    LOG("\n");
-                }
-            }
-
-            if (params.conversation_mode && !waiting_for_first_input) {
-                if (!prompt.empty()) {
-                    prompt.clear();
-                    is_interacting = false;
-                }
-            }
-
-            if ((n_past > 0 || waiting_for_first_input) && is_interacting) {
-                LOG_DBG("waiting for user input\n");
-
-                if (params.conversation_mode) {
-                    LOG("\n> ");
-                }
-
-                if (params.input_prefix_bos) {
-                    LOG_DBG("adding input prefix BOS token\n");
-                    embd_inp.push_back(llama_vocab_bos(vocab));
-                }
-
-                std::string buffer;
-                if (!params.input_prefix.empty() && !params.conversation_mode) {
-                    LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
-                    LOG("%s", params.input_prefix.c_str());
-                }
-
-                // color user input only
-                console::set_display(DISPLAY_TYPE_USER_INPUT);
-                display = params.display_prompt;
-
-                std::string line;
-                bool another_line = true;
-                do {
-                    another_line = console::readline(line, params.multiline_input);
-                    buffer += line;
-                } while (another_line);
-
-                // done taking input, reset color
-                console::set_display(DISPLAY_TYPE_RESET);
-                display = true;
-
-                if (buffer.empty()) { // Ctrl+D on empty line exits
-                    LOG("EOF by user\n");
-                    break;
-                }
-
-                if (buffer.back() == '\n') {
-                    // Implement #587:
-                    // If the user wants the text to end in a newline,
-                    // this should be accomplished by explicitly adding a newline by using \ followed by return,
-                    // then returning control by pressing return again.
-                    buffer.pop_back();
-                }
-
-                if (buffer.empty()) { // Enter key on empty line lets the user pass control back
-                    LOG_DBG("empty line, passing control back\n");
-                } else { // Add tokens to embd only if the input buffer is non-empty
-                    // append input suffix if any
-                    if (!params.input_suffix.empty() && !params.conversation_mode) {
-                        LOG_DBG("appending input suffix: '%s'\n", params.input_suffix.c_str());
-                        LOG("%s", params.input_suffix.c_str());
-                    }
-
-                    LOG_DBG("buffer: '%s'\n", buffer.c_str());
-
-                    const size_t original_size = embd_inp.size();
-
-                    if (params.escape) {
-                        string_process_escapes(buffer);
-                    }
-
-                    bool format_chat = params.conversation_mode && params.enable_chat_template;
-                    std::string user_inp = format_chat
-                        ? chat_add_and_format("user", std::move(buffer))
-                        : std::move(buffer);
-                    // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
-                    const auto line_pfx = common_tokenize(ctx, params.input_prefix, false, true);
-                    const auto line_inp = common_tokenize(ctx, user_inp,            false, format_chat);
-                    const auto line_sfx = common_tokenize(ctx, params.input_suffix, false, true);
-
-                    LOG_DBG("input tokens: %s\n", string_from(ctx, line_inp).c_str());
-
-                    // if user stop generation mid-way, we must add EOT to finish model's last response
-                    if (need_insert_eot && format_chat) {
-                        llama_token eot = llama_vocab_eot(vocab);
-                        embd_inp.push_back(eot == LLAMA_TOKEN_NULL ? llama_vocab_eos(vocab) : eot);
-                        need_insert_eot = false;
-                    }
-
-                    embd_inp.insert(embd_inp.end(), line_pfx.begin(), line_pfx.end());
-                    embd_inp.insert(embd_inp.end(), line_inp.begin(), line_inp.end());
-                    embd_inp.insert(embd_inp.end(), line_sfx.begin(), line_sfx.end());
-
-                    if (params.verbose_prompt) {
-                        LOG_INF("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size() - original_size);
-                    }
-
-                    for (size_t i = original_size; i < embd_inp.size(); ++i) {
-                        const llama_token token = embd_inp[i];
-                        const std::string token_str = common_token_to_piece(ctx, token);
-                        output_tokens.push_back(token);
-                        output_ss << token_str;
-
-                        if (params.verbose_prompt) {
-                            LOG_INF("%6d -> '%s'\n", token, token_str.c_str());
-                        }
-                    }
-
-                    // reset assistant message
-                    assistant_ss.str("");
-
-                    n_remain -= line_inp.size();
-                    LOG_DBG("n_remain: %d\n", n_remain);
-                }
-
-                input_echo = false; // do not echo this again
-            }
-
-            if (n_past > 0 || waiting_for_first_input) {
-                if (is_interacting) {
-                    common_sampler_reset(smpl);
-                }
-                is_interacting = false;
-
-                if (waiting_for_first_input && params.single_turn) {
-                    params.interactive = false;
-                    params.interactive_first = false;
-                }
-                waiting_for_first_input = false;
-            }
-        }
-
-        // end of generation
-        if (!embd.empty() && llama_vocab_is_eog(vocab, embd.back()) && !(params.interactive)) {
-            LOG(" [end of text]\n");
-            break;
-        }
-
-        // In interactive mode, respect the maximum number of tokens and drop back to user input when reached.
-        // We skip this logic when n_predict == -1 (infinite) or -2 (stop at context size).
-        if (params.interactive && n_remain <= 0 && params.n_predict >= 0) {
-            n_remain = params.n_predict;
-            is_interacting = true;
         }
     }
 
@@ -1586,7 +1211,7 @@ int main(int argc, char ** argv) {
     LOG("\n\n");
     common_perf_print(ctx, smpl);
 
-    if (use_mtp && (mtp_accepted + mtp_rejected) > 0) {
+    if ((mtp_accepted + mtp_rejected) > 0) {
         LOG_INF("MTP speculative decode: accepted %d, rejected %d, rate %.1f%%\n",
             mtp_accepted, mtp_rejected,
             100.0 * mtp_accepted / (mtp_accepted + mtp_rejected));
