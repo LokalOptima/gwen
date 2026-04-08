@@ -103,6 +103,9 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
+# gwen library
+option(GWEN_BUILD_LIB_ONLY "gwen: only build the library, skip executables" OFF)
+
 # extra artifacts
 option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
@@ -195,13 +198,25 @@ add_subdirectory(src)
 # utils, programs, examples and tests
 #
 
-if (LLAMA_BUILD_COMMON)
-    add_subdirectory(common)
+if (LLAMA_BUILD_COMMON OR GWEN_BUILD_LIB_ONLY)
+    if (NOT TARGET common)
+        add_subdirectory(common)
+    endif()
+endif()
+
+if (LLAMA_BUILD_COMMON AND NOT GWEN_BUILD_LIB_ONLY)
     add_subdirectory(vendor/cpp-httplib)
 endif()
 
+#
+# gwen library (thin wrapper: model loading + MTP speculative decode)
+#
+add_library(gwen_lib STATIC src/gwen.cpp src/gwen.h)
+target_include_directories(gwen_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(gwen_lib PUBLIC llama common)
+target_compile_features(gwen_lib PRIVATE cxx_std_17)
 
-if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
+if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND NOT GWEN_BUILD_LIB_ONLY)
     add_subdirectory(tools)
 endif()
 
