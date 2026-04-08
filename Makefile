@@ -8,9 +8,15 @@ MODEL_MTP  := $(GWEN_CACHE)/Qwen3.5-0.8B-Q8_0-mtp.gguf
 MD5_BASE   := d8872c3399f15f172026776e33a0f918
 MD5_MTP    := 8e48e160b3c42237a007923a90b8e3e5
 
-.PHONY: all clean completion bench server test bench-decode bench-mtp download-models
+.PHONY: all clean gwen completion bench server test bench-decode bench-mtp download-models
 
-all: $(BUILD_DIR)/bin/llama-completion
+all: $(BUILD_DIR)/bin/gwen
+
+$(BUILD_DIR)/bin/gwen: CMakeLists.txt $(wildcard src/*.cpp src/*.h src/models/*.cpp tools/gwen/*.cpp)
+	cmake -S . -B $(BUILD_DIR) -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+	cmake --build $(BUILD_DIR) --target gwen -j$$(nproc)
+
+gwen: $(BUILD_DIR)/bin/gwen
 
 $(BUILD_DIR)/bin/llama-completion: CMakeLists.txt $(wildcard src/*.cpp src/*.h src/models/*.cpp)
 	cmake -S . -B $(BUILD_DIR) -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
