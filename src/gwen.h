@@ -27,6 +27,18 @@ struct Stats {
     double tok_per_s   = 0;
 };
 
+struct ToolCall {
+    std::string name;       // e.g. "brave_search", "spotify_play"
+    std::string arguments;  // raw JSON object string
+};
+
+struct ChatResult {
+    std::string text;       // raw model output (after thinking)
+    ToolCall    tool_call;  // populated if model emitted <tool_call>
+
+    bool has_tool_call() const { return !tool_call.name.empty(); }
+};
+
 struct Context {
     Context();
     ~Context();
@@ -37,7 +49,7 @@ struct Context {
     // Returns false on failure.
     bool init(const std::string& model_path);
 
-    // Generate text from prompt.
+    // Generate text from raw prompt string.
     // greedy=true: deterministic argmax, no penalties (fast path).
     // greedy=false: stochastic with Qwen3.5 recommended params.
     // on_token: optional callback per token, return false to stop early.
@@ -45,7 +57,15 @@ struct Context {
     std::string generate(const std::string& prompt, int n_predict = 100,
                          bool greedy = true, TokenCallback on_token = nullptr);
 
-    // Stats from last generate() call.
+    // Chat with ChatML formatting. Handles system/user roles and optional
+    // Qwen3 tool definitions. Parses <tool_call> from output if present.
+    // tools_json: tool definitions (JSON objects, one per line) or empty.
+    ChatResult chat(const std::string& system, const std::string& user,
+                    const std::string& tools_json = "",
+                    int n_predict = 500, bool greedy = true,
+                    TokenCallback on_token = nullptr);
+
+    // Stats from last generate()/chat() call.
     Stats last_stats() const;
 
     void destroy();

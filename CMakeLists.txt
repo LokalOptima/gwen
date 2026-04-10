@@ -204,16 +204,16 @@ if (LLAMA_BUILD_COMMON OR GWEN_BUILD_LIB_ONLY)
     endif()
 endif()
 
-if (LLAMA_BUILD_COMMON AND NOT GWEN_BUILD_LIB_ONLY)
+if (LLAMA_BUILD_COMMON OR GWEN_BUILD_LIB_ONLY)
     add_subdirectory(vendor/cpp-httplib)
 endif()
 
 #
-# gwen library (thin wrapper: model loading + MTP speculative decode)
+# gwen library (inference + chat + tool calling + brave search)
 #
-add_library(gwen_lib STATIC src/gwen.cpp src/gwen.h)
+add_library(gwen_lib STATIC src/gwen.cpp src/gwen.h src/brave_search.cpp src/brave_search.h)
 target_include_directories(gwen_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(gwen_lib PUBLIC llama common)
+target_link_libraries(gwen_lib PUBLIC llama common cpp-httplib)
 target_compile_features(gwen_lib PRIVATE cxx_std_17)
 
 if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND NOT GWEN_BUILD_LIB_ONLY)

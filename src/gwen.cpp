@@ -9,6 +9,8 @@
 #include "sampling.h"
 #include "llama.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -466,6 +468,54 @@ done:
     }
 }
 
+// ---------------------------------------------------------------------------
+// ChatML formatting + tool_call parsing
+// ---------------------------------------------------------------------------
+
+static std::string format_chat(const std::string & system, const std::string & user,
+                                const std::string & tools_json) {
+    std::string p;
+    p += "<|im_start|>system\n";
+    if (!tools_json.empty()) {
+        p += system;
+        p += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+             "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n";
+        p += tools_json;
+        p += "\n</tools>\n\n"
+             "For each function call, return a json object with function name and arguments within "
+             "<tool_call></tool_call> XML tags:\n<tool_call>\n"
+             "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+             "</tool_call>";
+    } else {
+        p += system;
+    }
+    p += "<|im_end|>\n<|im_start|>user\n";
+    p += user;
+    p += "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n";
+    return p;
+}
+
+static bool parse_tool_call(const std::string & text, gwen::ToolCall & tc) {
+    constexpr const char * TAG_OPEN  = "<tool_call>";
+    constexpr size_t       TAG_LEN   = 11;
+
+    auto s = text.find(TAG_OPEN);
+    if (s == std::string::npos) return false;
+    auto e = text.find("</tool_call>", s);
+    if (e == std::string::npos) return false;
+
+    std::string body = text.substr(s + TAG_LEN, e - s - TAG_LEN);
+
+    try {
+        auto j = nlohmann::json::parse(body);
+        tc.name      = j.at("name").get<std::string>();
+        tc.arguments = j.at("arguments").dump();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -597,6 +647,18 @@ struct Context::Impl {
         return text_ss.str();
     }
 
+    ChatResult chat(const std::string & system, const std::string & user,
+                    const std::string & tools_json, int n_predict, bool greedy,
+                    TokenCallback on_token) {
+        std::string prompt = format_chat(system, user, tools_json);
+        std::string raw = generate(prompt, n_predict, greedy, on_token);
+
+        ChatResult result;
+        result.text = raw;
+        parse_tool_call(raw, result.tool_call);
+        return result;
+    }
+
     void destroy() {
         if (init_result) {
             init_result.reset();
@@ -619,6 +681,12 @@ bool Context::init(const std::string & model_path) {
 std::string Context::generate(const std::string & prompt, int n_predict,
                                bool greedy, TokenCallback on_token) {
     return impl->generate(prompt, n_predict, greedy, on_token);
+}
+
+ChatResult Context::chat(const std::string & system, const std::string & user,
+                          const std::string & tools_json, int n_predict,
+                          bool greedy, TokenCallback on_token) {
+    return impl->chat(system, user, tools_json, n_predict, greedy, on_token);
 }
 
 Stats Context::last_stats() const {
