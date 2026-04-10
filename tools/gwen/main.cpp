@@ -8,8 +8,6 @@
 //   gwen --agent "Play Bohemian Rhapsody by Queen"
 
 #include "gwen.h"
-#include "brave_search.h"
-#include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,88 +23,6 @@ static std::string find_model() {
     if (home) return std::string(home) + "/.cache/gwen/Qwen3.5-0.8B-Q8_0.gguf";
 
     return "";
-}
-
-// ---------------------------------------------------------------------------
-// Agent mode: dispatcher + tool execution
-// ---------------------------------------------------------------------------
-
-static const char * DISPATCH_SYSTEM =
-    "You are a voice assistant router. Route the user's request to the correct tool. "
-    "Do not answer questions directly — always use a tool.";
-
-static const char * DISPATCH_TOOLS =
-    R"({"type":"function","function":{"name":"brave_search","description":"Search the web for information, facts, current events, weather, or any question","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}}}
-{"type":"function","function":{"name":"spotify_play","description":"Play a song or music on Spotify","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Song and/or artist to play"}},"required":["query"]}}})";
-
-static const char * ANSWER_SYSTEM =
-    "You are a voice assistant. Answer the user's question using ONLY the search results below. "
-    "Respond in plain spoken English — one or two sentences, no markdown, no bullet points, "
-    "no URLs. Be concise and natural, as if speaking aloud.";
-
-static std::string extract_query(const std::string & args_json) {
-    try {
-        return nlohmann::json::parse(args_json).at("query").get<std::string>();
-    } catch (...) {
-        return "";
-    }
-}
-
-static int run_agent(gwen::Context & ctx, const std::string & input, int n_predict) {
-    // Step 1: dispatch — classify input via tool calling
-    fprintf(stderr, "[agent] dispatching: %s\n", input.c_str());
-    auto dispatch = ctx.chat(DISPATCH_SYSTEM, input, DISPATCH_TOOLS, 200, true);
-
-    if (!dispatch.has_tool_call()) {
-        fprintf(stderr, "[agent] no tool call detected, unknown request\n");
-        printf("Sorry, I'm not sure how to help with that.\n");
-        return 0;
-    }
-
-    const auto & tc = dispatch.tool_call;
-    fprintf(stderr, "[agent] tool: %s, args: %s\n", tc.name.c_str(), tc.arguments.c_str());
-
-    if (tc.name == "brave_search") {
-        std::string query = extract_query(tc.arguments);
-        if (query.empty()) {
-            printf("Sorry, I couldn't understand your question.\n");
-            return 1;
-        }
-
-        // Step 2: search Brave
-        fprintf(stderr, "[agent] searching: %s\n", query.c_str());
-        auto results = brave::search(query);
-        if (results.empty()) {
-            printf("Sorry, I couldn't find anything about that.\n");
-            return 1;
-        }
-        std::string context = brave::format_results(results);
-        fprintf(stderr, "[agent] got %zu results, extracting answer...\n", results.size());
-
-        // Step 3: extract answer from search results
-        std::string user_msg = "Question: " + input + "\n\nSearch results:\n" + context;
-        ctx.chat(ANSWER_SYSTEM, user_msg, "", n_predict, true,
-            [](const char * piece, int) -> bool {
-                printf("%s", piece);
-                fflush(stdout);
-                return true;
-            });
-        printf("\n");
-
-    } else if (tc.name == "spotify_play") {
-        std::string query = extract_query(tc.arguments);
-        if (query.empty()) {
-            printf("Sorry, I couldn't understand what to play.\n");
-            return 1;
-        }
-        printf("Now playing: %s\n", query.c_str());
-
-    } else {
-        fprintf(stderr, "[agent] unknown tool: %s\n", tc.name.c_str());
-        printf("Sorry, I'm not sure how to help with that.\n");
-    }
-
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +80,11 @@ int main(int argc, char ** argv) {
     }
 
     if (agent_mode) {
-        return run_agent(ctx, question, n_predict);
+        auto result = ctx.agent(question, n_predict);
+        if (!result.tool_used.empty())
+            fprintf(stderr, "[agent] tool: %s\n", result.tool_used.c_str());
+        printf("%s\n", result.text.c_str());
+        return 0;
     }
 
     // Direct chat mode

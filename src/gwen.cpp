@@ -4,6 +4,7 @@
 // All sampling helpers and the generate_mtp loop are self-contained here.
 
 #include "gwen.h"
+#include "brave_search.h"
 #include "common.h"
 #include "log.h"
 #include "sampling.h"
@@ -516,6 +517,31 @@ static bool parse_tool_call(const std::string & text, gwen::ToolCall & tc) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Agent constants (moved from tools/gwen/main.cpp)
+// ---------------------------------------------------------------------------
+
+static const char * DISPATCH_SYSTEM =
+    "You are a voice assistant router. Route the user's request to the correct tool. "
+    "Do not answer questions directly — always use a tool.";
+
+static const char * DISPATCH_TOOLS =
+    R"({"type":"function","function":{"name":"brave_search","description":"Search the web for information, facts, current events, weather, or any question","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}}}
+{"type":"function","function":{"name":"spotify_play","description":"Play a song or music on Spotify","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Song and/or artist to play"}},"required":["query"]}}})";
+
+static const char * ANSWER_SYSTEM =
+    "You are a voice assistant. Answer the user's question using ONLY the search results below. "
+    "Respond in plain spoken English — one or two sentences, no markdown, no bullet points, "
+    "no URLs. Be concise and natural, as if speaking aloud.";
+
+static std::string extract_query(const std::string & args_json) {
+    try {
+        return nlohmann::json::parse(args_json).at("query").get<std::string>();
+    } catch (...) {
+        return "";
+    }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -659,6 +685,60 @@ struct Context::Impl {
         return result;
     }
 
+    AgentResult agent(const std::string & user_input, int n_predict) {
+        AgentResult result;
+
+        // Stage 1: dispatch — classify input via tool calling
+        auto dispatch = chat(DISPATCH_SYSTEM, user_input, DISPATCH_TOOLS, 200, true, nullptr);
+
+        std::string query;
+        if (dispatch.has_tool_call()) {
+            result.tool_used = dispatch.tool_call.name;
+            query = extract_query(dispatch.tool_call.arguments);
+        } else {
+            fprintf(stderr, "  dispatch raw: \"%s\"\n", dispatch.text.c_str());
+        }
+
+        // Fallback: 0.8B often fails to emit a valid tool call — default to search
+        if (result.tool_used.empty()) {
+            result.tool_used = "brave_search";
+            query = user_input;
+        }
+
+        if (result.tool_used == "brave_search") {
+            if (query.empty()) query = user_input;
+
+            // Stage 2: search
+            auto results = brave::search(query);
+            fprintf(stderr, "  brave_search(%zu): \"%s\"\n",
+                    results.size(), query.c_str());
+            if (results.empty()) {
+                result.text = "Sorry, I couldn't find anything about that.";
+                return result;
+            }
+            std::string context = brave::format_results(results);
+            fprintf(stderr, "%s\n", context.c_str());
+
+            // Stage 3: synthesize answer from search results
+            std::string user_msg = "Question: " + user_input + "\n\nSearch results:\n" + context;
+            auto answer = chat(ANSWER_SYSTEM, user_msg, "", n_predict, true, nullptr);
+            result.text = answer.text;
+
+
+        } else if (result.tool_used == "spotify_play") {
+            if (query.empty()) {
+                result.text = "Sorry, I couldn't understand what to play.";
+                return result;
+            }
+            result.text = "Now playing: " + query;
+
+        } else {
+            result.text = "Sorry, I'm not sure how to help with that.";
+        }
+
+        return result;
+    }
+
     void destroy() {
         if (init_result) {
             init_result.reset();
@@ -687,6 +767,10 @@ ChatResult Context::chat(const std::string & system, const std::string & user,
                           const std::string & tools_json, int n_predict,
                           bool greedy, TokenCallback on_token) {
     return impl->chat(system, user, tools_json, n_predict, greedy, on_token);
+}
+
+AgentResult Context::agent(const std::string & user_input, int n_predict) {
+    return impl->agent(user_input, n_predict);
 }
 
 Stats Context::last_stats() const {

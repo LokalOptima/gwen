@@ -39,6 +39,11 @@ struct ChatResult {
     bool has_tool_call() const { return !tool_call.name.empty(); }
 };
 
+struct AgentResult {
+    std::string text;       // final spoken answer
+    std::string tool_used;  // "brave_search", "spotify_play", or ""
+};
+
 struct Context {
     Context();
     ~Context();
@@ -67,6 +72,10 @@ struct Context {
 
     // Stats from last generate()/chat() call.
     Stats last_stats() const;
+
+    // Run the full agent pipeline: dispatch → tool → synthesize.
+    // Returns the spoken answer text. Blocks during web search.
+    AgentResult agent(const std::string& user_input, int n_predict = 500);
 
     void destroy();
 
